@@ -1,0 +1,42 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Databases
+*.db
+
+# Large data files
+static/icd10cm.txt
+
+# UV lock file
+uv.lock
+
+# Environment/secrets
+.env
+.env.*
+
+# Node.js (frontend)
+node_modules/
+
+# Frontend build output
+frontend/dist/
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
