@@ -1,4 +1,4 @@
-"""MapStates classes for parallel ICD-10-CM traversal.
+"""MapStates classes for parallel ICD-10-CM traversal
 
 SpawnParallelBatches: Multi-batch fan-out for children + metadata relationships
 SpawnSevenChr: Sequential 7th character selection at leaf nodes
@@ -116,12 +116,13 @@ class SpawnParallelBatches(MapStates):
                 continue
 
             # Determine sevenChrDef authority for this child (paused task handoff)
-            child_authority = current_authority  # Default: inherit from parent
-
-            # If spawning a children batch, check if THIS node or ANY ANCESTOR has sevenChrDef
-            # This handles "self-activation" for nodes reached via lateral jumps (codeFirst, etc.)
-            # where the ancestor's sevenChrDef applies to descendants
+            # For children batches: always determine authority fresh based on node's own hierarchy
+            # For lateral batches: inherit from parent (they don't need sevenChrDef processing)
             if batch_type == "children":
+                # Start fresh for children batches - don't inherit from parent
+                # This fixes nodes reached via lateral jumps from different hierarchies
+                child_authority = None
+
                 # First check if the node itself has sevenChrDef
                 if node_id in ICD_INDEX:
                     metadata = ICD_INDEX[node_id].get("metadata", {})
@@ -133,8 +134,8 @@ class SpawnParallelBatches(MapStates):
                         print(f"[7CHR PAUSED] Task created at {node_id} "
                               f"(will resume at descendant|sevenChrDef when depth 6→7)")
 
-                # If no direct sevenChrDef and no inherited authority, check ancestry
-                # This "self-activates" nodes like T88.7 whose ancestor T88 has sevenChrDef
+                # If no direct sevenChrDef, check ancestry (self-activation)
+                # This handles nodes like T81.44 whose ancestor T81 has sevenChrDef
                 if child_authority is None:
                     seven_chr_result = get_seventh_char_def(node_id, ICD_INDEX)
                     if seven_chr_result is not None:
@@ -144,6 +145,9 @@ class SpawnParallelBatches(MapStates):
                             "resolution_pattern": "sevenChrDef"
                         }
                         print(f"[7CHR SELF-ACTIVATE] {node_id} inherits paused task from ancestor {ancestor_with_def}")
+            else:
+                # Non-children batches (codeFirst, codeAlso, etc.) inherit from parent
+                child_authority = current_authority
 
             # Determine parent_id for edge creation
             if current_batch_id == "ROOT":
@@ -316,11 +320,19 @@ class SpawnParallelBatches(MapStates):
         return ["batch_data", "halted_by_exception", "final_nodes"]
 
     def state_persister(self, **kwargs):
-        """Disable persistence for parallel branches (SQLite compatibility)."""
+        """Disable persistence for parallel branches.
+
+        Parallel batch persistence causes SQLite UNIQUE constraint conflicts.
+        Cross-run caching is handled at the ROOT app level in build_app().
+        """
         return None
 
     def state_initializer(self, **kwargs):
-        """Disable state loading for parallel branches."""
+        """Disable state loading for parallel branches.
+
+        State initialization for parallel batches is handled via the states() generator.
+        Cross-run caching is handled at the ROOT app level in build_app().
+        """
         return None
 
 
@@ -403,8 +415,9 @@ class SpawnSevenChr(MapStates):
                 return
 
             # Calculate depth from code structure (more reliable than tracked depth)
-            # depth = category(3) + dot(1) + subcategory_length + new_X(1)
-            placeholder_depth = 3 + 1 + len(subcategory) + 1
+            # depth = category(3) + subcategory_length + new_X(1)
+            # Note: dot doesn't count in ICD depth
+            placeholder_depth = 4 + len(subcategory)
 
             child_batch_data = batch_data.copy()
             child_batch_data[placeholder_batch_id] = {
@@ -429,15 +442,25 @@ class SpawnSevenChr(MapStates):
             # Subcategory has 3+ chars OR node has real children - spawn sevenChrDef
             seven_chr_batch_id = f"{base_node_id}|sevenChrDef"
 
-            # CYCLE DETECTION
+            # CYCLE DETECTION - Only skip if sevenChrDef batch was fully completed
             if seven_chr_batch_id in batch_data:
+                existing = batch_data[seven_chr_batch_id]
+                # Only skip if this specific sevenChrDef batch completed its processing
+                if existing.get("status") == "completed_seven_chr":
+                    print(f"\n{'=' * 60}")
+                    print(
+                        f"[{current_batch_id}] -> Skipping already-completed "
+                        f"sevenChrDef batch: {seven_chr_batch_id}"
+                    )
+                    print(f"{'=' * 60}\n")
+                    return
+                # Batch exists but not completed - allow this path to continue
                 print(f"\n{'=' * 60}")
                 print(
-                    f"[{current_batch_id}] -> Skipping duplicate sevenChrDef batch: "
-                    f"{seven_chr_batch_id}"
+                    f"[{current_batch_id}] -> Batch {seven_chr_batch_id} exists but "
+                    f"not completed (status={existing.get('status')}) - proceeding"
                 )
                 print(f"{'=' * 60}\n")
-                return
 
             child_batch_data = batch_data.copy()
             child_batch_data[seven_chr_batch_id] = {
@@ -581,7 +604,9 @@ class SpawnSevenChr(MapStates):
         return ["batch_data", "final_nodes"]
 
     def state_persister(self, **kwargs):
+        """Disable persistence for SevenChr branches."""
         return None
 
     def state_initializer(self, **kwargs):
+        """Disable state loading for SevenChr branches."""
         return None

@@ -1,4 +1,4 @@
-"""Agent orchestration module for ICD-10-CM traversal.
+"""Agent orchestration module for ICD-10-CM traversal
 
 Provides Burr-based orchestration replacing the previous Pydantic-AI implementation.
 Supports multi-batch parallel fan-out for children + metadata relationships,
@@ -45,12 +45,22 @@ from .actions import (
 from .parallel import SpawnParallelBatches, SpawnSevenChr
 from .state_types import CandidateDecision, DecisionPoint, TraversalState
 from .traversal import (
+    PARTITION_KEY,
     PERSISTER,
     build_app,
     cleanup_persister,
+    generate_traversal_cache_key,
     initialize_persister,
     retry_node,
     run_traversal,
+)
+from .zero_shot import (
+    ZERO_SHOT_PERSISTER,
+    build_zero_shot_app,
+    cleanup_zero_shot_persister,
+    generate_zero_shot_cache_key,
+    initialize_zero_shot_persister,
+    run_zero_shot,
 )
 
 __all__ = [
@@ -76,5 +86,14 @@ __all__ = [
     "run_traversal",
     "initialize_persister",
     "cleanup_persister",
+    "generate_traversal_cache_key",
     "PERSISTER",
+    "PARTITION_KEY",
+    # Zero-shot
+    "build_zero_shot_app",
+    "run_zero_shot",
+    "generate_zero_shot_cache_key",
+    "initialize_zero_shot_persister",
+    "cleanup_zero_shot_persister",
+    "ZERO_SHOT_PERSISTER",
 ]

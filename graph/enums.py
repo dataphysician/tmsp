@@ -1,4 +1,4 @@
-"""Graph enums for the ICD-10-CM traversal system.
+"""Graph enums for the ICD-10-CM traversal system
 
 Provides enums used for graph nodes, edges, and traversal status.
 These are shared between server and client (Pyodide) deployments.

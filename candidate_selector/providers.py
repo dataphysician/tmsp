@@ -1,4 +1,4 @@
-"""Provider presets for OpenAI-compatible LLM APIs.
+"""Provider presets for OpenAI-compatible LLM APIs
 
 Each provider has specific configurations:
 - OpenAI: strict=true (100% schema accuracy)
@@ -15,6 +15,7 @@ PROVIDER_URLS = {
     "cerebras": "https://api.cerebras.ai/v1",
     "sambanova": "https://api.sambanova.ai/v1",
     "anthropic": "https://api.anthropic.com/v1",
+    "vertexai": "",  # Dynamic URL constructed from location/project_id
     "other": "",  # User must provide base URL
 }
 
@@ -24,6 +25,7 @@ PROVIDER_MODELS = {
     "cerebras": "gpt-oss-120b",
     "sambanova": "Meta-Llama-3.1-8B-Instruct",
     "anthropic": "claude-opus-4-5",
+    "vertexai": "gemini-2.5-flash",
     "other": "",  # User must provide model name
 }
 
@@ -32,6 +34,9 @@ STRICT_MODE_PROVIDERS = {"openai", "cerebras"}
 
 # Providers that use non-OpenAI-compatible API format
 ANTHROPIC_STYLE_PROVIDERS = {"anthropic"}
+
+# Providers that use Vertex AI API format
+VERTEX_AI_STYLE_PROVIDERS = {"vertexai"}
 
 
 def openai_config(
@@ -163,6 +168,71 @@ def anthropic_config(
     )
 
 
+def vertexai_config(
+    api_key: str,
+    model: str = "gemini-2.5-flash",
+    temperature: float = 0.0,
+    max_completion_tokens: int = 64000,
+    timeout: float = 180.0,
+    extra: dict[str, str] | None = None,
+) -> LLMConfig:
+    """Create Vertex AI configuration.
+
+    Supports two authentication modes (controlled by extra.auth_type):
+    - API Key mode (default): Simple Gemini API endpoint, just needs API key
+    - ADC mode: Full Vertex AI endpoint, requires location/project_id and OAuth token
+
+    Args:
+        api_key: API key (for api_key mode) or access token (for ADC mode)
+        model: Model identifier (default: gemini-2.5-flash)
+        temperature: Sampling temperature (default: 0.0 for deterministic output)
+        max_completion_tokens: Max tokens to generate (default: 64000)
+        timeout: Request timeout in seconds (default: 180.0)
+        extra: Provider-specific config:
+               - "auth_type": "api_key" (default) or "adc"
+               - "location": GCP region (required for ADC mode)
+               - "project_id": GCP project ID (required for ADC mode)
+
+    Returns:
+        LLMConfig configured for Vertex AI
+
+    Raises:
+        ValueError: If ADC mode but missing location or project_id
+    """
+    # Default extra if not provided
+    if not extra:
+        extra = {"auth_type": "api_key"}
+
+    auth_type = extra.get("auth_type", "api_key")
+
+    if auth_type == "adc":
+        # ADC mode requires location and project_id
+        location = extra.get("location")
+        project_id = extra.get("project_id")
+
+        if not location or not project_id:
+            raise ValueError(
+                "Vertex AI ADC mode requires 'location' and 'project_id' in extra config"
+            )
+
+        # Construct dynamic base URL for ADC mode
+        base_url = f"https://{location}-aiplatform.googleapis.com/v1"
+    else:
+        # API Key mode - use Gemini API endpoint (actual URL built in selector)
+        base_url = "https://generativelanguage.googleapis.com/v1beta"
+
+    return LLMConfig(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        temperature=temperature,
+        max_completion_tokens=max_completion_tokens,
+        timeout=timeout,
+        provider="vertexai",
+        extra=extra,
+    )
+
+
 def other_config(
     api_key: str,
     model: str,
@@ -201,6 +271,8 @@ def create_config(
     provider: str,
     api_key: str,
     model: str | None = None,
+    extra: dict[str, str] | None = None,
+    system_prompt: str | None = None,
     **kwargs,
 ) -> LLMConfig:
     """Create LLM configuration for a named provider.
@@ -208,19 +280,26 @@ def create_config(
     Factory function that dispatches to provider-specific config functions.
 
     Args:
-        provider: Provider name ("openai", "cerebras", "sambanova")
+        provider: Provider name ("openai", "cerebras", "sambanova", "anthropic", "vertexai")
         api_key: API authentication key
         model: Optional model override (uses provider default if None)
+        extra: Provider-specific configuration (e.g., Vertex AI location/project_id)
+        system_prompt: Custom system prompt (uses default LLM_SYSTEM_PROMPT if None)
         **kwargs: Additional config options (temperature, timeout, etc.)
 
     Returns:
         LLMConfig for the specified provider
 
     Raises:
-        ValueError: If provider is unknown
+        ValueError: If provider is unknown or Vertex AI params missing
 
     Example:
         config = create_config("openai", api_key="sk-...", model="gpt-4o-mini")
+        config = create_config(
+            "vertexai",
+            api_key="<access_token>",
+            extra={"location": "us-central1", "project_id": "my-project"}
+        )
     """
     provider = provider.lower()
 
@@ -234,6 +313,17 @@ def create_config(
     if model is None:
         model = PROVIDER_MODELS[provider]
 
+    # Special handling for Vertex AI - requires extra config
+    if provider == "vertexai":
+        config = vertexai_config(
+            api_key=api_key,
+            model=model,
+            extra=extra,
+            **kwargs,
+        )
+        config.system_prompt = system_prompt
+        return config
+
     config_funcs = {
         "openai": openai_config,
         "cerebras": cerebras_config,
@@ -242,7 +332,9 @@ def create_config(
         "other": other_config,
     }
 
-    return config_funcs[provider](api_key=api_key, model=model, **kwargs)
+    config = config_funcs[provider](api_key=api_key, model=model, **kwargs)
+    config.system_prompt = system_prompt
+    return config
 
 
 def uses_strict_mode(provider: str) -> bool:
@@ -273,3 +365,22 @@ def uses_anthropic_api(provider: str) -> bool:
         True if provider uses Anthropic-style API
     """
     return provider.lower() in ANTHROPIC_STYLE_PROVIDERS
+
+
+def uses_vertexai_api(provider: str) -> bool:
+    """Check if provider uses Vertex AI API format.
+
+    Vertex AI API differs from OpenAI in:
+    - Dynamic endpoint URL with project_id and location
+    - Uses 'contents' array with 'parts' instead of 'messages'
+    - Uses 'systemInstruction' for system prompt
+    - Uses 'responseSchema' in 'generationConfig' for structured output
+    - Uses 'Authorization: Bearer' with GCP access token
+
+    Args:
+        provider: Provider name
+
+    Returns:
+        True if provider uses Vertex AI API
+    """
+    return provider.lower() in VERTEX_AI_STYLE_PROVIDERS

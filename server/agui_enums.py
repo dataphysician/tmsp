@@ -1,4 +1,4 @@
-"""Server-specific enums.
+"""Server-specific enums
 
 Contains enums used only by the server for SSE streaming protocol.
 These are NOT needed for client-side (Pyodide) deployment.

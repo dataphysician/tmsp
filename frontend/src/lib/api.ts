@@ -40,12 +40,15 @@ export interface AGUIEvent {
 
 export interface TraversalConfig {
   clinical_note: string;
-  provider?: 'openai' | 'cerebras' | 'sambanova' | 'anthropic' | 'other';
+  provider?: 'openai' | 'cerebras' | 'sambanova' | 'anthropic' | 'vertexai' | 'other';
   api_key?: string;
   model?: string;
   selector?: 'llm' | 'manual';
   max_tokens?: number;
   temperature?: number;
+  extra?: Record<string, string>;  // Provider-specific config (e.g., Vertex AI location/project_id)
+  system_prompt?: string;  // Custom system prompt (uses default if empty)
+  scaffolded?: boolean;    // true = tree traversal (default), false = single-shot
 }
 
 /**
@@ -101,6 +104,9 @@ export function streamTraversal(
           selector: config.selector ?? 'llm',
           max_tokens: config.max_tokens ?? null,
           temperature: config.temperature ?? null,
+          extra: config.extra ?? null,  // Provider-specific config (e.g., Vertex AI location/project_id)
+          system_prompt: config.system_prompt ?? null,
+          scaffolded: config.scaffolded ?? true,
         }),
         signal: controller.signal,
       });
@@ -173,6 +179,9 @@ export async function runTraversal(
       selector: config.selector ?? 'llm',
       max_tokens: config.max_tokens ?? null,
       temperature: config.temperature ?? null,
+      extra: config.extra ?? null,  // Provider-specific config (e.g., Vertex AI location/project_id)
+      system_prompt: config.system_prompt ?? null,
+      scaffolded: config.scaffolded ?? true,
     }),
   });
 
@@ -181,6 +190,130 @@ export async function runTraversal(
   }
 
   return response.json();
+}
+
+// Rewind configuration for spot rewind feature
+export interface RewindConfig {
+  batch_id: string;
+  feedback: string;
+  provider?: 'openai' | 'cerebras' | 'sambanova' | 'anthropic' | 'vertexai' | 'other';
+  api_key?: string;
+  model?: string;
+  selector?: 'llm' | 'manual';
+  max_tokens?: number;
+  temperature?: number;
+  extra?: Record<string, string>;
+  system_prompt?: string;  // Custom system prompt (uses default if empty)
+  scaffolded?: boolean;    // true = tree traversal (default), false = single-shot
+}
+
+/**
+ * Stream a rewind traversal from a specific batch with feedback.
+ *
+ * Uses Burr's fork pattern to branch from checkpoint and inject feedback.
+ * Returns AG-UI SSE stream same as streamTraversal().
+ *
+ * @param config - Rewind configuration (batch_id, feedback, LLM settings)
+ * @param onEvent - Called for each AG-UI event
+ * @param onError - Called on error
+ *
+ * @returns AbortController to cancel the stream
+ *
+ * @example
+ * ```tsx
+ * const controller = streamRewind(
+ *   {
+ *     batch_id: "E08.3|children",
+ *     feedback: "Select E08.32 instead - patient has diabetic retinopathy",
+ *     provider: "openai",
+ *     api_key: "sk-..."
+ *   },
+ *   (event) => {
+ *     switch (event.type) {
+ *       case 'STATE_DELTA':
+ *         applyPatch(graphState, event.delta);
+ *         break;
+ *     }
+ *   },
+ *   (error) => console.error("Rewind error:", error)
+ * );
+ * ```
+ */
+export function streamRewind(
+  config: RewindConfig,
+  onEvent: (event: AGUIEvent) => void,
+  onError: (error: Error) => void
+): AbortController {
+  const controller = new AbortController();
+
+  (async () => {
+    try {
+      const response = await fetch('/api/traverse/rewind', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+        },
+        body: JSON.stringify({
+          batch_id: config.batch_id,
+          feedback: config.feedback,
+          provider: config.provider ?? 'openai',
+          api_key: config.api_key ?? '',
+          model: config.model ?? null,
+          selector: config.selector ?? 'llm',
+          max_tokens: config.max_tokens ?? null,
+          temperature: config.temperature ?? null,
+          extra: config.extra ?? null,
+          system_prompt: config.system_prompt ?? null,
+          scaffolded: config.scaffolded ?? true,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error: ${response.status}`);
+      }
+
+      if (!response.body) {
+        throw new Error('No response body');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) {
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE events from buffer
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6)) as AGUIEvent;
+              onEvent(data);
+            } catch (parseError) {
+              console.error('Failed to parse SSE event:', parseError);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      if (error instanceof Error && error.name !== 'AbortError') {
+        onError(error);
+      }
+    }
+  })();
+
+  return controller;
 }
 
 // Graph API response for VISUALIZE tab

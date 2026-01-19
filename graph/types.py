@@ -1,4 +1,4 @@
-"""Graph types for ICD-10-CM visualization.
+"""Graph types for ICD-10-CM visualization
 
 These types are the single source of truth for graph nodes and edges,
 used across REST API, AG-UI streaming, and agent state.

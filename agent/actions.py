@@ -1,4 +1,4 @@
-"""Burr actions for ICD-10-CM traversal.
+"""Burr actions for ICD-10-CM traversal
 
 Core actions:
 - load_node: Query ICD_INDEX, populate candidates dict

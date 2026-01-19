@@ -136,11 +136,27 @@ export interface BenchmarkMetrics {
   // These represent alternative clinical pathways - hidden from graph, shown in report
   otherCount: number;
 
-  // Accuracy scores
-  traversalAccuracy: number;    // (Expected nodes traversed) / (Expected nodes) - coverage of expected trajectory
-  finalCodesAccuracy: number;   // exact / expected - accuracy of finalization decisions
+  // Recall scores
+  traversalRecall: number;      // (Expected nodes traversed) / (Expected nodes) - what fraction of expected trajectory was covered
+  finalCodesRecall: number;     // (Exact matches) / (Expected codes) - what fraction of expected endpoints were exactly matched
 
   // Detailed outcomes
   outcomes: ExpectedCodeOutcome[];
   otherCodes: string[];  // Traversed codes unrelated to any expected (hidden from graph)
+}
+
+// LLM Configuration types
+
+export type LLMProvider = 'openai' | 'cerebras' | 'sambanova' | 'anthropic' | 'vertexai' | 'other';
+
+export interface LLMConfig {
+  provider: LLMProvider;
+  apiKey: string;
+  model: string;
+  maxTokens: number;
+  temperature: number;
+  extra?: Record<string, string>;  // Provider-specific config (e.g., Vertex AI location/projectId)
+  systemPrompt?: string;    // Custom system prompt (uses default if empty)
+  scaffolded?: boolean;     // true = tree traversal (default), false = single-shot
+  visualizePrediction?: boolean;  // When scaffolded=false, visualize predicted codes as graph
 }

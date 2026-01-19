@@ -1,4 +1,4 @@
-"""Candidate Selector module for ICD-10-CM code selection.
+"""Candidate Selector module for ICD-10-CM code selection
 
 Provides extensible LLM-based and manual selector functions for use with
 Burr orchestration of ICD-10-CM hierarchy traversal.

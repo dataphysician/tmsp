@@ -14,6 +14,8 @@ interface BenchmarkReportViewerProps {
   traversedNodes?: GraphNode[];  // Raw traversed nodes for interim computation
   // Elapsed time (managed by parent for persistence)
   elapsedTime?: number | null;
+  // Hide overshoot/undershoot (for zero-shot without infer precursors)
+  hideOvershootUndershoot?: boolean;
 }
 
 // Tree node interface for hierarchy display
@@ -156,6 +158,7 @@ export function BenchmarkReportViewer({
   combinedNodes = [],
   traversedNodes = [],
   elapsedTime = null,
+  hideOvershootUndershoot = false,
 }: BenchmarkReportViewerProps) {
   const [expandedSections, setExpandedSections] = useState<Set<string>>(
     new Set(['metrics', 'outcomes'])
@@ -213,15 +216,19 @@ export function BenchmarkReportViewer({
   };
 
   // Derive expanded state for interim sections based on highlightMode
+  // Only expand interim for the region being highlighted, collapse others
+  // 'matched' and 'missed' keep all interim collapsed (only highlights final codes)
   const isInterimExpanded = (box: 'target' | 'shared' | 'benchmark'): boolean => {
     if (!highlightMode) return false;
-    if (highlightMode === 'expected' || highlightMode === 'missed') {
+    if (highlightMode === 'expected') {
       return box === 'target';
     }
-    if (highlightMode === 'traversed') {
+    if (highlightMode === 'traversed' || highlightMode === 'undershoot') {
       return box === 'shared';
     }
-    // 'matched', 'undershoot', 'overshoot' keep interim collapsed (highlighting specific codes)
+    if (highlightMode === 'overshoot') {
+      return box === 'benchmark';
+    }
     return false;
   };
 
@@ -348,9 +355,14 @@ export function BenchmarkReportViewer({
   }, [tree]);
 
   // Group outcomes by status
+  // When hideOvershootUndershoot is true, treat overshoot/undershoot as missed
   const groupedOutcomes = metrics?.outcomes.reduce(
     (acc, outcome) => {
-      acc[outcome.status].push(outcome);
+      if (hideOvershootUndershoot && (outcome.status === 'overshoot' || outcome.status === 'undershoot')) {
+        acc.missed.push(outcome);
+      } else {
+        acc[outcome.status].push(outcome);
+      }
       return acc;
     },
     {
@@ -507,8 +519,8 @@ export function BenchmarkReportViewer({
               <div className="section-content metrics-panel">
                 {/* Gauges (Left Side) */}
                 <div className="metrics-gauges">
-                  <Gauge value={metrics.traversalAccuracy} label="Traversal Accuracy" />
-                  <Gauge value={metrics.finalCodesAccuracy} label="Final Codes Accuracy" />
+                  <Gauge value={metrics.traversalRecall} label="Traversal Recall" />
+                  <Gauge value={metrics.finalCodesRecall} label="Final Codes Recall" />
                 </div>
 
                 {/* Count Summary (Right Side) */}
@@ -542,21 +554,21 @@ export function BenchmarkReportViewer({
                       <span className="count-label">Matched</span>
                     </div>
                     <div
-                      className={`count-item overshoot interactive ${highlightMode === 'overshoot' ? 'selected' : ''}`}
-                      onClick={(e) => handleHighlightClick('overshoot', e)}
+                      className={`count-item overshoot interactive ${highlightMode === 'overshoot' ? 'selected' : ''} ${hideOvershootUndershoot ? 'disabled' : ''}`}
+                      onClick={(e) => !hideOvershootUndershoot && handleHighlightClick('overshoot', e)}
                       role="button"
-                      tabIndex={0}
+                      tabIndex={hideOvershootUndershoot ? -1 : 0}
                     >
-                      <span className="count-value">{metrics.overshootCount}</span>
+                      <span className="count-value">{hideOvershootUndershoot ? 0 : metrics.overshootCount}</span>
                       <span className="count-label">Overshoot</span>
                     </div>
                     <div
-                      className={`count-item undershoot interactive ${highlightMode === 'undershoot' ? 'selected' : ''}`}
-                      onClick={(e) => handleHighlightClick('undershoot', e)}
+                      className={`count-item undershoot interactive ${highlightMode === 'undershoot' ? 'selected' : ''} ${hideOvershootUndershoot ? 'disabled' : ''}`}
+                      onClick={(e) => !hideOvershootUndershoot && handleHighlightClick('undershoot', e)}
                       role="button"
-                      tabIndex={0}
+                      tabIndex={hideOvershootUndershoot ? -1 : 0}
                     >
-                      <span className="count-value">{metrics.undershootCount}</span>
+                      <span className="count-value">{hideOvershootUndershoot ? 0 : metrics.undershootCount}</span>
                       <span className="count-label">Undershoot</span>
                     </div>
                     <div
@@ -565,7 +577,7 @@ export function BenchmarkReportViewer({
                       role="button"
                       tabIndex={0}
                     >
-                      <span className="count-value">{metrics.missedCount}</span>
+                      <span className="count-value">{hideOvershootUndershoot ? metrics.missedCount + metrics.overshootCount + metrics.undershootCount : metrics.missedCount}</span>
                       <span className="count-label">Missed Decisions</span>
                     </div>
                   </div>
@@ -610,12 +622,14 @@ export function BenchmarkReportViewer({
 
                   {shouldShowInterim('target') && (
                     <div className="venn-interim-codes">
+                      {/* COLLAPSE TOGGLE (shown when expanded, above header) */}
+                      <div className="venn-expand-toggle">▼ Hide Interim Nodes</div>
                       <div className="venn-interim-header">Interim Nodes</div>
                       <div className="venn-codes">
                         {interimTarget.map(n => (
                           <span
                             key={n.id}
-                            className="venn-code-tag expected-region dimmed-interim"
+                            className={`venn-code-tag expected-region dimmed-interim ${highlightMode === 'expected' ? 'highlighted' : ''}`}
                             title={`${n.label}\nStatus: Expected Path`}
                             onClick={(e) => { e.stopPropagation(); onCodeClick?.(n.id); }}
                           >
@@ -624,8 +638,6 @@ export function BenchmarkReportViewer({
                         ))}
                         {interimTarget.length === 0 && <span className="venn-empty">No interim nodes</span>}
                       </div>
-                      {/* COLLAPSE TOGGLE (shown when expanded, at bottom) */}
-                      <div className="venn-expand-toggle">▼ Hide Interim Nodes</div>
                     </div>
                   )}
                 </div>
@@ -672,12 +684,14 @@ export function BenchmarkReportViewer({
 
                   {shouldShowInterim('shared') && (
                     <div className="venn-interim-codes">
+                      {/* COLLAPSE TOGGLE (shown when expanded, above header) */}
+                      <div className="venn-expand-toggle">▼ Hide Interim Nodes</div>
                       <div className="venn-interim-header">Interim Nodes</div>
                       <div className="venn-codes">
                         {interimShared.map(n => (
                           <span
                             key={n.id}
-                            className="venn-code-tag intersection-region dimmed-interim"
+                            className={`venn-code-tag intersection-region dimmed-interim ${highlightMode === 'traversed' || highlightMode === 'undershoot' ? 'highlighted' : ''}`}
                             title={`${n.label}\nStatus: Traversed Path`}
                             onClick={(e) => { e.stopPropagation(); onCodeClick?.(n.id); }}
                           >
@@ -686,8 +700,6 @@ export function BenchmarkReportViewer({
                         ))}
                         {interimShared.length === 0 && <span className="venn-empty">No interim nodes</span>}
                       </div>
-                      {/* COLLAPSE TOGGLE (shown when expanded, at bottom) */}
-                      <div className="venn-expand-toggle">▼ Hide Interim Nodes</div>
                     </div>
                   )}
                 </div>
@@ -734,12 +746,14 @@ export function BenchmarkReportViewer({
 
                   {shouldShowInterim('benchmark') && (
                     <div className="venn-interim-codes">
+                      {/* COLLAPSE TOGGLE (shown when expanded, above header) */}
+                      <div className="venn-expand-toggle">▼ Hide Interim Nodes</div>
                       <div className="venn-interim-header">Interim Nodes</div>
                       <div className="venn-codes">
                         {interimBenchmark.map(n => (
                           <span
                             key={n.id}
-                            className="venn-code-tag benchmark-region dimmed-interim"
+                            className={`venn-code-tag benchmark-region dimmed-interim ${highlightMode === 'overshoot' ? 'highlighted' : ''}`}
                             title={`${n.label}\nStatus: Traversed Path`}
                             onClick={(e) => { e.stopPropagation(); onCodeClick?.(n.id); }}
                           >
@@ -748,8 +762,6 @@ export function BenchmarkReportViewer({
                         ))}
                         {interimBenchmark.length === 0 && <span className="venn-empty">No interim nodes</span>}
                       </div>
-                      {/* COLLAPSE TOGGLE (shown when expanded, at bottom) */}
-                      <div className="venn-expand-toggle">▼ Hide Interim Nodes</div>
                     </div>
                   )}
                 </div>

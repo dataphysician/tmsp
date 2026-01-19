@@ -1,4 +1,4 @@
-"""Entry point for running the server as a module.
+"""Entry point for running the server as a module
 
 Usage:
     uv run python -m server

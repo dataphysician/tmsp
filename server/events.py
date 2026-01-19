@@ -1,4 +1,4 @@
-"""AG-UI protocol event types.
+"""AG-UI protocol event types
 
 These types implement the AG-UI streaming protocol for real-time graph updates:
 - JsonPatchOp: RFC 6902 JSON Patch operations for incremental updates

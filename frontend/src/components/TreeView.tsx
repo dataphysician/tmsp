@@ -74,12 +74,10 @@ function TreeNodeComponent({
           <div
             className={`tree-node-box ${showDetails ? 'expanded' : ''} ${hasChildren || hasDetails ? 'expandable' : ''}`}
             onClick={() => {
+              // Collapsed node with children: expand children first (don't toggle details)
+              // Expanded node OR leaf node: toggle details panel
               if (hasChildren && !isExpanded) {
                 toggleNode(node.code);
-                // Auto-expand details when expanding node with details
-                if (hasDetails && !showDetails) {
-                  toggleDetails(node.code);
-                }
               } else if (hasDetails) {
                 toggleDetails(node.code);
               }

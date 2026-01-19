@@ -65,7 +65,7 @@ function buildTreeFromGraph(
       let parentCode: string | null = null;
       for (const edge of edges) {
         if (String(edge.target) === currentCode &&
-            (edge.edge_type === 'hierarchy' || (edge.edge_type === 'lateral' && edge.rule === 'sevenChrDef'))) {
+          (edge.edge_type === 'hierarchy' || (edge.edge_type === 'lateral' && edge.rule === 'sevenChrDef'))) {
           parentCode = String(edge.source);
           break;
         }

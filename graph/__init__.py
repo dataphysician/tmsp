@@ -1,4 +1,4 @@
-"""Graph package for ICD-10-CM visualization.
+"""Graph package for ICD-10-CM visualization
 
 This package provides:
 - Graph types (GraphNode, GraphEdge) for nodes and edges

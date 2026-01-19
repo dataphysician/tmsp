@@ -1,4 +1,4 @@
-"""ICD-10-CM tree building and graph construction utilities.
+"""ICD-10-CM tree building and graph construction utilities
 
 This module provides:
 - ICD-10-CM data loading from the flat index
@@ -434,8 +434,12 @@ def build_graph(
                 root = code
             roots.add(root)
 
-    # Deduplicate lateral links
-    lateral_links = list(set(lateral_links))
+    # Filter lateral links to only show when both endpoints are in the graph
+    lateral_links = [
+        (src, tgt, key)
+        for src, tgt, key in set(lateral_links)
+        if src in all_nodes and tgt in all_nodes
+    ]
 
     return {
         "nodes": all_nodes,
@@ -449,6 +453,115 @@ def build_graph(
         "count": len(all_nodes),
     }
 
+def build_graph_full_paths(
+    codes: list[str],
+    index: dict[str, dict] = data,
+) -> dict:
+    """Build graph showing all full paths from ROOT to target codes.
+
+    This is the "Show all paths" mode - every target code gets its complete
+    ancestry traced to ROOT, with lateral links shown as visual annotations.
+
+    Algorithm:
+    1. Walk parent(code) to ROOT for each target, collecting all ancestors
+    2. Build tree edges by connecting each node to its closest retained ancestor
+    3. Add lateral links as separate visual edges (only if both endpoints in nodes)
+
+    Args:
+        codes: List of end codes
+        index: The flat index dict
+
+    Returns:
+        dict with:
+        - nodes: set of all required nodes
+        - tree: dict mapping parent -> set of children
+        - roots: set of top-level nodes (connect to ROOT)
+        - leaves: the original input codes
+        - anchored: dict (empty, kept for API compatibility)
+        - lateral_links: list of (source_node, target_code, key) for visualization
+        - seventh_char: dict of code -> (char, meaning, source_node) for codes with 7th char
+        - placeholders: set of placeholder codes (ending in X)
+    """
+    all_nodes: set[str] = set()
+    leaves = set(codes)
+    seventh_char: dict[str, tuple[str, str, str]] = {}
+    placeholders: set[str] = set()
+
+    # Step 1: Collect all nodes by walking each target to ROOT
+    code_ancestors: dict[str, list[str]] = {}
+    for code in codes:
+        ancestors = trace_ancestors(code, index)
+        code_ancestors[code] = ancestors
+        all_nodes.add(code)
+        all_nodes.update(ancestors)
+
+        # Collect 7th char and placeholder info
+        char = extract_seventh_char(code)
+        if char:
+            result = get_seventh_char_def(code, index)
+            if result:
+                seven_def, source_node = result
+                if char in seven_def:
+                    seventh_char[code] = (char, seven_def[char], source_node)
+            placeholders.update(get_placeholder_codes(code, index))
+
+    # Step 2: Build tree edges (parent -> children)
+    tree: dict[str, set[str]] = {}
+    roots: set[str] = set()
+
+    for node in all_nodes:
+        if node not in index:
+            continue
+        # Find closest ancestor that's also in all_nodes
+        parent = get_parent_code(index[node])
+        if parent is None or parent == "ROOT":
+            roots.add(node)
+            continue
+
+        # Walk up until we find a retained ancestor
+        current = parent
+        while current and current not in all_nodes:
+            if current not in index:
+                break
+            current = get_parent_code(index[current])
+
+        if current is None or current == "ROOT" or current not in all_nodes:
+            roots.add(node)
+        else:
+            if current not in tree:
+                tree[current] = set()
+            tree[current].add(node)
+
+    # Step 3: Collect lateral links (only if both endpoints in nodes)
+    lateral_links: list[tuple[str, str, str]] = []
+    for node in all_nodes:
+        if node not in index:
+            continue
+        metadata = index[node].get("metadata", {})
+        for key in LATERAL_KEYS:
+            if key not in metadata:
+                continue
+            linked_codes = metadata[key]
+            if not isinstance(linked_codes, dict):
+                continue
+            for linked in linked_codes:
+                if linked in all_nodes:
+                    lateral_links.append((node, linked, key))
+
+    # Deduplicate lateral links
+    lateral_links = list(set(lateral_links))
+
+    return {
+        "nodes": all_nodes,
+        "tree": tree,
+        "roots": roots,
+        "leaves": leaves,
+        "anchored": {},  # No longer used, kept for API compatibility
+        "lateral_links": lateral_links,
+        "seventh_char": seventh_char,
+        "placeholders": placeholders,
+        "count": len(all_nodes),
+    }
 
 def get_node_category(
     code: str,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate TypeScript types from Pydantic models.
+"""Generate TypeScript types from Pydantic models
 
 This script exports JSON schemas from the consolidated Pydantic models
 and generates TypeScript interfaces for the frontend.

@@ -184,14 +184,14 @@ export function computeBenchmarkMetrics(
   const overshootCount = outcomes.filter((o) => o.status === 'overshoot').length;
   const missedCount = outcomes.filter((o) => o.status === 'missed').length;
 
-  // Traversal Accuracy: How well did traversal cover the expected trajectory?
-  // (Expected nodes that were traversed) / (Total expected nodes)
+  // Traversal Recall: What fraction of the expected trajectory was visited?
+  // Note: Does NOT penalize valid alternative paths that reach the same endpoints.
   const expectedNodesTraversed = [...expectedNodeIds].filter(id => traversedNodeIds.has(id)).length;
-  const traversalAccuracy = expectedNodeIds.size > 0 ? expectedNodesTraversed / expectedNodeIds.size : 0;
+  const traversalRecall = expectedNodeIds.size > 0 ? expectedNodesTraversed / expectedNodeIds.size : 0;
 
-  // Final Codes Accuracy: How accurate were finalization decisions?
-  // exact / expected (penalizes over/under shoots and misses)
-  const finalCodesAccuracy = expectedCodes.size > 0 ? exactCount / expectedCodes.size : 0;
+  // Final Codes Recall: What fraction of expected endpoints were exactly matched?
+  // Penalizes undershoots, overshoots, and misses (only exact matches count).
+  const finalCodesRecall = expectedCodes.size > 0 ? exactCount / expectedCodes.size : 0;
 
   return {
     expectedCount: expectedCodes.size,
@@ -203,8 +203,8 @@ export function computeBenchmarkMetrics(
     overshootCount,
     missedCount,
     otherCount: otherCodes.length,
-    traversalAccuracy,
-    finalCodesAccuracy,
+    traversalRecall,
+    finalCodesRecall,
     outcomes,
     otherCodes,
   };
@@ -218,7 +218,7 @@ function buildParentMap(edges: GraphEdge[]): Map<string, string> {
   const parentMap = new Map<string, string>();
   for (const edge of edges) {
     if (edge.edge_type === 'hierarchy' ||
-        (edge.edge_type === 'lateral' && edge.rule === 'sevenChrDef')) {
+      (edge.edge_type === 'lateral' && edge.rule === 'sevenChrDef')) {
       parentMap.set(String(edge.target), String(edge.source));
     }
   }
@@ -389,6 +389,226 @@ function calculateDepthFromCode(code: string): number {
 }
 
 /**
+ * Phase 1: Update nodes from 'expected' to 'traversed' based on selected_ids.
+ * Called during streaming (STEP_FINISHED events) for real-time feedback.
+ *
+ * Only updates nodes that are:
+ * 1. Currently 'expected' status
+ * 2. In the traversed codes (nodeId + selected_ids from this event)
+ * 3. Part of the expected graph (verified via expectedNodeIds)
+ *
+ * Note: nodeId is included because it represents the node being processed
+ * in the current batch - it has been traversed to reach this point.
+ * This is important for:
+ * - Placeholder nodes (T84.53X) which are nodeId in sevenChrDef batches
+ * - Intermediate nodes which are nodeId in children batches
+ */
+export function updateTraversedNodes(
+  currentNodes: BenchmarkGraphNode[],
+  selectedIds: string[],
+  expectedNodeIds: Set<string>,
+  nodeId?: string
+): BenchmarkGraphNode[] {
+  // Include both selectedIds and nodeId in traversed set
+  const traversedSet = new Set(selectedIds);
+  if (nodeId && nodeId !== 'ROOT') {
+    traversedSet.add(nodeId);
+  }
+
+  return currentNodes.map((node) => {
+    // Handle both 'expected' status AND idle/undefined status (from reset)
+    const isColorable = node.benchmarkStatus === 'expected' || node.benchmarkStatus === undefined;
+    if (
+      isColorable &&
+      traversedSet.has(node.id) &&
+      expectedNodeIds.has(node.id)
+    ) {
+      return { ...node, benchmarkStatus: 'traversed' as const };
+    }
+    return node;
+  });
+}
+
+/**
+ * Phase 2: Compute final statuses and markers based on finalized code comparison.
+ * Called only at RUN_FINISHED.
+ *
+ * @param nodes - Current nodes (already have 'traversed' status from Phase 1)
+ * @param expectedEdges - Expected graph edges (for ancestor/descendant computation)
+ * @param streamedNodeIds - All node IDs selected during traversal (from Phase 1)
+ * @param finalizedCodes - Codes finalized by benchmark traversal
+ * @param expectedLeaves - User-specified expected finalized codes
+ * @param traversedEdges - Edges from traversal (for parent map expansion)
+ */
+export function computeFinalizedComparison(
+  nodes: BenchmarkGraphNode[],
+  expectedEdges: GraphEdge[],
+  streamedNodeIds: Set<string>,
+  finalizedCodes: Set<string>,
+  expectedLeaves: Set<string>,
+  traversedEdges: GraphEdge[] = [],
+  options: { finalizedOnlyMode?: boolean } = {}
+): {
+  nodes: BenchmarkGraphNode[];
+  overshootMarkers: OvershootMarker[];
+  missedEdgeMarkers: EdgeMissMarker[];
+  traversedSet: Set<string>;
+} {
+  const { finalizedOnlyMode = false } = options;
+
+  // Build parent maps for ancestor expansion
+  const expectedParentMap = buildParentMap(expectedEdges);
+  const traversedParentMap = buildParentMap(traversedEdges);
+  const combinedParentMap = new Map([...expectedParentMap, ...traversedParentMap]);
+
+  // Build ancestor map for undershoot/overshoot detection (expected graph only)
+  const ancestorMap = buildAncestorMap(expectedEdges);
+
+  // Build traversedSet
+  // In finalizedOnlyMode (zero-shot without infer precursors): only finalized codes, no ancestor expansion
+  // Otherwise: streamedNodes ∪ finalizedCodes ∪ ancestors
+  let traversedSet: Set<string>;
+  if (finalizedOnlyMode) {
+    // Only the finalized codes themselves - no intermediate "traversed" nodes
+    traversedSet = new Set(finalizedCodes);
+  } else {
+    traversedSet = new Set([...streamedNodeIds, ...finalizedCodes]);
+    const nodesToExpand = new Set([...streamedNodeIds, ...finalizedCodes]);
+    for (const code of nodesToExpand) {
+      let current = code;
+      while (combinedParentMap.has(current) || expectedParentMap.has(current)) {
+        const parent = combinedParentMap.get(current) ?? expectedParentMap.get(current);
+        if (!parent || parent === 'ROOT') break;
+        traversedSet.add(parent);
+        current = parent;
+      }
+    }
+  }
+
+  // First pass: identify undershoot nodes (stopping points)
+  // For each missed expected leaf, find its DEEPEST finalized ancestor
+  // Only that deepest ancestor is the "undershoot" - other ancestors are just "traversed"
+  const undershootNodes = new Set<string>();
+  for (const leaf of expectedLeaves) {
+    if (!finalizedCodes.has(leaf)) {
+      // This leaf was missed - find deepest finalized ancestor (the stopping point)
+      const ancestors = ancestorMap.get(leaf) || new Set();
+      let deepestFinalized: string | null = null;
+      let deepestDepth = -1;
+      for (const ancestor of ancestors) {
+        if (finalizedCodes.has(ancestor)) {
+          // Get depth from node
+          const ancestorNode = nodes.find((n) => n.id === ancestor);
+          const depth = ancestorNode?.depth ?? 0;
+          if (depth > deepestDepth) {
+            deepestDepth = depth;
+            deepestFinalized = ancestor;
+          }
+        }
+      }
+      if (deepestFinalized) {
+        undershootNodes.add(deepestFinalized);
+      }
+    }
+  }
+
+  // Compute final node statuses
+  // In finalizedOnlyMode: matched > undershoot > expected (no "traversed" status)
+  // Otherwise: matched > undershoot > traversed > expected
+  const updatedNodes = nodes.map((node) => {
+    const nodeId = node.id;
+    const isExpectedLeaf = expectedLeaves.has(nodeId);
+    const isBenchmarkFinalized = finalizedCodes.has(nodeId);
+
+    // Matched: expected leaf that was finalized
+    if (isExpectedLeaf && isBenchmarkFinalized) {
+      return { ...node, benchmarkStatus: 'matched' as const };
+    }
+
+    // Undershoot: the deepest finalized ancestor of a missed expected leaf
+    if (undershootNodes.has(nodeId)) {
+      return { ...node, benchmarkStatus: 'undershoot' as const };
+    }
+
+    // In finalizedOnlyMode, skip "traversed" status - only endpoint comparison matters
+    if (!finalizedOnlyMode) {
+      // Traversed: finalized nodes on correct path, or any node in traversedSet
+      if (isBenchmarkFinalized || traversedSet.has(nodeId)) {
+        return { ...node, benchmarkStatus: 'traversed' as const };
+      }
+    }
+
+    // Expected: nodes not yet visited
+    // In finalizedOnlyMode, explicitly reset to 'expected' to override any 'traversed'
+    // status that was incorrectly set during STEP_FINISHED from intermediate predictions
+    if (finalizedOnlyMode) {
+      return { ...node, benchmarkStatus: 'expected' as const };
+    }
+    return node;
+  });
+
+  // Build descendant map from ancestor map (for missed edge detection)
+  const expectedDescendantsMap = new Map<string, Set<string>>();
+  for (const node of nodes) {
+    expectedDescendantsMap.set(node.id, new Set());
+  }
+  for (const node of nodes) {
+    const ancestors = ancestorMap.get(node.id);
+    if (ancestors) {
+      for (const ancestor of ancestors) {
+        const descSet = expectedDescendantsMap.get(ancestor);
+        if (descSet) {
+          descSet.add(node.id);
+        }
+      }
+    }
+  }
+
+  // Compute missed edge markers
+  // Edge is missed if: source ∈ traversedSet AND target ∉ traversedSet
+  // AND no descendant of target ∈ traversedSet
+  const missedEdgeMarkers: EdgeMissMarker[] = [];
+  for (const edge of expectedEdges) {
+    const src = String(edge.source);
+    const tgt = String(edge.target);
+    const sourceTraversed = src === 'ROOT' || traversedSet.has(src);
+    const targetTraversed = traversedSet.has(tgt);
+
+    if (sourceTraversed && !targetTraversed) {
+      const descendants = expectedDescendantsMap.get(tgt) || new Set();
+      const anyDescendantTraversed = [...descendants].some((d) => traversedSet.has(d));
+
+      if (!anyDescendantTraversed) {
+        missedEdgeMarkers.push({
+          edgeSource: src,
+          edgeTarget: tgt,
+          missedCode: tgt,
+        });
+      }
+    }
+  }
+
+  // Compute overshoot markers
+  // Finalized code is overshoot if it's a descendant of an expected leaf
+  const overshootMarkers: OvershootMarker[] = [];
+  for (const finalized of finalizedCodes) {
+    const ancestors = ancestorMap.get(finalized) ?? new Set();
+    for (const leaf of expectedLeaves) {
+      if (ancestors.has(leaf)) {
+        overshootMarkers.push({
+          sourceNode: leaf,
+          targetCode: finalized,
+          depth: calculateDepthFromCode(finalized),
+        });
+        break;
+      }
+    }
+  }
+
+  return { nodes: updatedNodes, overshootMarkers, missedEdgeMarkers, traversedSet };
+}
+
+/**
  * Initialize expected graph nodes with 'expected' status.
  */
 export function initializeExpectedNodes(nodes: GraphNode[]): BenchmarkGraphNode[] {
@@ -399,6 +619,17 @@ export function initializeExpectedNodes(nodes: GraphNode[]): BenchmarkGraphNode[
 }
 
 /**
+ * Reset nodes to idle state (remove benchmarkStatus).
+ * Used when re-running benchmark to show plain black nodes before traversal starts.
+ */
+export function resetNodesToIdle(nodes: BenchmarkGraphNode[]): BenchmarkGraphNode[] {
+  return nodes.map((node) => {
+    const { benchmarkStatus: _, ...rest } = node;
+    return rest as BenchmarkGraphNode;
+  });
+}
+
+/**
  * Extract finalized codes from graph nodes.
  */
 export function extractFinalizedCodes(nodes: GraphNode[]): Set<string> {
@@ -406,4 +637,3 @@ export function extractFinalizedCodes(nodes: GraphNode[]): Set<string> {
     nodes.filter((n) => n.category === 'finalized').map((n) => n.id)
   );
 }
-

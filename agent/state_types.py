@@ -1,4 +1,4 @@
-"""Agent state types for ICD-10-CM traversal.
+"""Agent state types for ICD-10-CM traversal
 
 These types define the agent's decision-making process during DFS traversal:
 - CandidateDecision: Individual code selection decision

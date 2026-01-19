@@ -1,4 +1,4 @@
-"""Server-side components for TMSP.
+"""Server-side components for TMSP
 
 This package contains FastAPI server, AG-UI streaming events, and REST API payloads.
 Not needed for client-side Pyodide deployment.

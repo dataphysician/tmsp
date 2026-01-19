@@ -4,7 +4,9 @@ import { GraphViewer } from './components/GraphViewer';
 import { TrajectoryViewer } from './components/TrajectoryViewer';
 import { BenchmarkReportViewer } from './components/BenchmarkReportViewer';
 import { VisualizeReportViewer } from './components/VisualizeReportViewer';
-import { streamTraversal, buildGraph, type AGUIEvent } from './lib/api';
+import { LLMSettingsPanel, NodeRewindModal } from './components/shared';
+import { streamTraversal, streamRewind, buildGraph, type AGUIEvent } from './lib/api';
+import { getDescendantNodeIds, extractBatchType } from './lib/graphUtils';
 import type {
   TraversalState,
   DecisionPoint,
@@ -16,17 +18,26 @@ import type {
   TraversalStatus,
   OvershootMarker,
   EdgeMissMarker,
+  LLMConfig,
 } from './lib/types';
 import {
   buildAncestorMap,
   compareFinalizedCodes,
   computeBenchmarkMetrics,
-  computeBenchmarkVisualization,
+  computeFinalizedComparison,
   initializeExpectedNodes,
+  resetNodesToIdle,
+  updateTraversedNodes,
 } from './lib/benchmark';
+import {
+  INITIAL_TRAVERSAL_STATE,
+  LLM_SYSTEM_PROMPT,
+  LLM_SYSTEM_PROMPT_NON_SCAFFOLDED,
+  type ViewTab,
+  type SidebarTab,
+} from './lib/constants';
 import './App.css';
 
-type ViewTab = 'graph' | 'trajectory';
 type FeatureTab = 'visualize' | 'traverse' | 'benchmark';
 
 // Merge helpers for two-stage rendering (Stream + Reconcile)
@@ -57,68 +68,10 @@ function calculateDepthFromCode(code: string): number {
   return code.replace(/\./g, '').length;
 }
 
-const INITIAL_STATE: TraversalState = {
-  nodes: [],
-  edges: [],
-  decision_history: [],
-  current_path: [],
-  finalized_codes: [],
-  status: 'idle',
-  current_step: '',
-  error: null,
-};
-
-interface LLMConfig {
-  provider: 'openai' | 'cerebras' | 'sambanova' | 'anthropic' | 'other';
-  apiKey: string;
-  model: string;
-  maxTokens: number;
-  temperature: number;
-}
-
-// Model options per provider (display order)
-const PROVIDER_MODELS: Record<LLMConfig['provider'], string[]> = {
-  openai: ['gpt-4o-mini', 'gpt-4o', 'gpt-5.2'],
-  cerebras: ['gpt-oss-120b', 'qwen-3-235b-a22b-instruct-2507', 'zai-glm-4.7'],
-  sambanova: ['Meta-Llama-3.1-8B-Instruct', 'Meta-Llama-3.3-70B-Instruct', 'DeepSeek-R1-0528'],
-  anthropic: ['claude-haiku-4-5', 'claude-sonnet-4-5', 'claude-opus-4-5'],
-  other: [], // Other provider uses custom model input
-};
-
-// Default model per provider (may differ from first in list)
-const DEFAULT_MODELS: Record<LLMConfig['provider'], string> = {
-  openai: 'gpt-4o-mini',
-  cerebras: 'gpt-oss-120b',
-  sambanova: 'Meta-Llama-3.1-8B-Instruct',
-  anthropic: 'claude-sonnet-4-5',
-  other: '',
-};
-
-// Default temperature per model (0.0 for unlisted models)
-const getDefaultTemperature = (model: string): number => {
-  if (model === 'gpt-5.2') return 1.0;
-  if (model === 'zai-glm-4.7') return 0.5;
-  if (model === 'qwen-3-235b-a22b-instruct-2507') return 0.3;
-  if (model === 'DeepSeek-R1-0528') return 0.6;
-  return 0.0;
-};
-
-// Default max tokens per model
-const getDefaultMaxTokens = (model: string): number => {
-  // OpenAI models
-  if (model === 'gpt-4o' || model === 'gpt-4o-mini') return 16384;
-  if (model === 'gpt-5.2') return 20000;
-  // Anthropic models
-  if (model.startsWith('claude-')) return 64000;
-  // Default for Cerebras, SambaNova, and others
-  return 8192;
-};
-
-type SidebarTab = 'clinical-note' | 'llm-settings';
 
 function TraversalUI() {
   const [clinicalNote, setClinicalNote] = useState('');
-  const [state, setState] = useState<TraversalState>(INITIAL_STATE);
+  const [state, setState] = useState<TraversalState>(INITIAL_TRAVERSAL_STATE);
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [batchCount, setBatchCount] = useState(0);
@@ -131,11 +84,14 @@ function TraversalUI() {
 
   // LLM Configuration
   const [llmConfig, setLlmConfig] = useState<LLMConfig>({
-    provider: 'openai',
+    provider: 'vertexai',
     apiKey: '',
-    model: 'gpt-4o-mini',
-    maxTokens: 16384,
+    model: 'gemini-2.5-flash',
+    maxTokens: 64000,
     temperature: 0.0,
+    extra: { auth_type: 'api_key', location: '', project_id: '' },
+    systemPrompt: LLM_SYSTEM_PROMPT,
+    scaffolded: true,
   });
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('clinical-note');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -147,6 +103,10 @@ function TraversalUI() {
   const [isLoadingGraph, setIsLoadingGraph] = useState(false);
   const [graphError, setGraphError] = useState<string | null>(null);
 
+  // Zero-shot visualization graph (for Traverse tab when visualizePrediction is ON)
+  const [zeroShotVisualization, setZeroShotVisualization] = useState<{ nodes: GraphNode[]; edges: GraphEdge[] } | null>(null);
+  const [isLoadingZeroShotViz, setIsLoadingZeroShotViz] = useState(false);
+
   // BENCHMARK tab state
   const [benchmarkExpectedCodes, setBenchmarkExpectedCodes] = useState<Set<string>>(new Set());
   const [benchmarkCodeInput, setBenchmarkCodeInput] = useState('');
@@ -156,6 +116,8 @@ function TraversalUI() {
   // Refs to track latest values for use in async callbacks (avoid stale closures)
   const benchmarkTraversedNodesRef = useRef<GraphNode[]>([]);
   const benchmarkTraversedEdgesRef = useRef<GraphEdge[]>([]);
+  // Phase 1: Track all selected_ids during streaming for Phase 2 marker computation
+  const benchmarkStreamedIdsRef = useRef<Set<string>>(new Set());
   const [benchmarkCombinedNodes, setBenchmarkCombinedNodes] = useState<BenchmarkGraphNode[]>([]);
   const [benchmarkCombinedEdges, setBenchmarkCombinedEdges] = useState<GraphEdge[]>([]);
   const [benchmarkOvershootMarkers, setBenchmarkOvershootMarkers] = useState<OvershootMarker[]>([]);
@@ -171,6 +133,40 @@ function TraversalUI() {
   const benchmarkControllerRef = useRef<AbortController | null>(null);
   const [benchmarkSidebarTab, setBenchmarkSidebarTab] = useState<SidebarTab>('clinical-note');
   const [benchmarkInvalidCodes, setBenchmarkInvalidCodes] = useState<Set<string>>(new Set());
+
+  // Benchmark: Infer Precursor Nodes toggle for zero-shot mode
+  const [benchmarkInferPrecursors, setBenchmarkInferPrecursors] = useState(false);
+
+  // Cached finalized-only view (no X markers - default view)
+  const [benchmarkFinalizedView, setBenchmarkFinalizedView] = useState<{
+    nodes: BenchmarkGraphNode[];
+    edges: GraphEdge[];
+    metrics: BenchmarkMetrics;
+    overshootMarkers: OvershootMarker[];
+  } | null>(null);
+
+  // Cached inferred view (merged graph with X markers)
+  const [benchmarkInferredView, setBenchmarkInferredView] = useState<{
+    nodes: BenchmarkGraphNode[];
+    edges: GraphEdge[];
+    metrics: BenchmarkMetrics;
+    overshootMarkers: OvershootMarker[];
+    missedEdgeMarkers: EdgeMissMarker[];
+    inferredNodes: GraphNode[];  // Raw inferred graph nodes for Report interim computation
+  } | null>(null);
+
+  // NOTE: Cross-run caching for zero-shot is now handled by the backend (Burr + SQLite)
+  // The backend caches LLM responses based on (clinical_note, provider, model, temperature, system_prompt)
+  // Frontend processes results into comparison views in handleBenchmarkEvent RUN_FINISHED handler
+
+  // Rewind state (for spot rewind feature in TRAVERSE tab)
+  const [rewindTargetNode, setRewindTargetNode] = useState<GraphNode | null>(null);
+  const [rewindTargetBatchId, setRewindTargetBatchId] = useState<string | null>(null);
+  const [rewindFeedbackText, setRewindFeedbackText] = useState<string>('');
+  const [isRewindModalOpen, setIsRewindModalOpen] = useState(false);
+  const [isRewinding, setIsRewinding] = useState(false);
+  const [rewindError, setRewindError] = useState<string | null>(null);
+  const rewindControllerRef = useRef<AbortController | null>(null);
 
   // Elapsed time tracking (lifted up from child components for persistence across tab switches)
   const [traverseElapsedTime, setTraverseElapsedTime] = useState<number | null>(null);
@@ -417,7 +413,7 @@ function TraversalUI() {
     setIsLoading(true);
     setBatchCount(0);
     setState({
-      ...INITIAL_STATE,
+      ...INITIAL_TRAVERSAL_STATE,
       status: 'traversing',
       current_step: 'Starting traversal',
     });
@@ -431,6 +427,9 @@ function TraversalUI() {
         selector: 'llm',
         max_tokens: llmConfig.maxTokens,
         temperature: llmConfig.temperature,
+        extra: llmConfig.extra,
+        system_prompt: llmConfig.systemPrompt || undefined,
+        scaffolded: llmConfig.scaffolded ?? true,
       },
       handleAGUIEvent,
       handleError
@@ -454,6 +453,155 @@ function TraversalUI() {
   const handleNodeClick = useCallback((nodeId: string) => {
     setSelectedNode(prev => (prev === nodeId ? null : nodeId));
   }, []);
+
+  // Rewind handlers (for spot rewind feature in TRAVERSE tab)
+  const handleNodeRewindClick = useCallback((nodeId: string, batchId?: string, feedback?: string) => {
+    // Find the node in current state
+    const node = state.nodes.find(n => n.id === nodeId);
+    if (!node) return;
+
+    // Only allow rewind on non-ROOT nodes during/after traversal
+    if (nodeId === 'ROOT' || state.status === 'idle') return;
+
+    setRewindTargetNode(node);
+    setRewindTargetBatchId(batchId || null);
+    setRewindFeedbackText(feedback || '');
+    setIsRewindModalOpen(true);
+    setRewindError(null);
+  }, [state.nodes, state.status]);
+
+  const handleRewindClose = useCallback(() => {
+    if (!isRewinding) {
+      setIsRewindModalOpen(false);
+      setRewindTargetNode(null);
+      setRewindTargetBatchId(null);
+      setRewindFeedbackText('');
+      setRewindError(null);
+    }
+  }, [isRewinding]);
+
+  const handleRewindSubmit = useCallback(async (nodeId: string, feedback: string) => {
+    setIsRewinding(true);
+    setRewindError(null);
+
+    try {
+      // Use stored batchId if available, otherwise construct from first matching decision
+      let batchId = rewindTargetBatchId;
+      if (!batchId) {
+        const decision = state.decision_history.find(d => d.current_node === nodeId);
+        const batchType = decision ? extractBatchType(decision.current_label) : 'children';
+        batchId = `${nodeId}|${batchType}`;
+      }
+
+      // Cancel any existing rewind stream
+      if (rewindControllerRef.current) {
+        rewindControllerRef.current.abort();
+      }
+
+      // Remove descendant nodes immediately (optimistic update)
+      const descendantIds = getDescendantNodeIds(nodeId, state.edges);
+
+      setState(prev => ({
+        ...prev,
+        nodes: prev.nodes.filter(n => !descendantIds.has(n.id)),
+        edges: prev.edges.filter(e =>
+          !descendantIds.has(e.source as string) &&
+          !descendantIds.has(e.target as string)
+        ),
+        finalized_codes: prev.finalized_codes.filter(c => !descendantIds.has(c)),
+        decision_history: prev.decision_history.filter(d => !descendantIds.has(d.current_node)),
+        status: 'traversing',
+        current_step: `Rewinding from ${nodeId}...`,
+      }));
+
+      // Close modal
+      setIsRewindModalOpen(false);
+      setRewindTargetNode(null);
+      setRewindTargetBatchId(null);
+
+      // Stream the rewind traversal
+      rewindControllerRef.current = streamRewind(
+        {
+          batch_id: batchId,
+          feedback,
+          provider: llmConfig.provider,
+          api_key: llmConfig.apiKey,
+          model: llmConfig.model || undefined,
+          selector: 'llm',
+          max_tokens: llmConfig.maxTokens,
+          temperature: llmConfig.temperature,
+          extra: llmConfig.extra,
+          system_prompt: llmConfig.systemPrompt || undefined,
+          scaffolded: llmConfig.scaffolded ?? true,
+        },
+        handleAGUIEvent,
+        (error) => {
+          setRewindError(error.message);
+          setIsRewinding(false);
+          setState(prev => ({
+            ...prev,
+            status: 'error',
+            error: error.message,
+          }));
+        }
+      );
+    } catch (error) {
+      setRewindError(error instanceof Error ? error.message : 'Rewind failed');
+      setIsRewinding(false);
+    }
+  }, [state.decision_history, state.edges, llmConfig, handleAGUIEvent]);
+
+  // Effect to reset isRewinding when traversal completes
+  useEffect(() => {
+    if (isRewinding && (state.status === 'complete' || state.status === 'error')) {
+      setIsRewinding(false);
+    }
+  }, [isRewinding, state.status]);
+
+  // Effect to visualize zero-shot predictions when enabled
+  useEffect(() => {
+    const shouldVisualize =
+      state.status === 'complete' &&
+      !(llmConfig.scaffolded ?? true) &&
+      (llmConfig.visualizePrediction ?? false) &&
+      state.finalized_codes.length > 0;
+
+    if (shouldVisualize) {
+      // Build graph from finalized codes for Traverse tab visualization
+      (async () => {
+        setIsLoadingZeroShotViz(true);
+        try {
+          const result = await buildGraph(state.finalized_codes);
+          setZeroShotVisualization({ nodes: result.nodes, edges: result.edges });
+        } catch (err) {
+          console.error('Failed to build zero-shot visualization:', err);
+          setZeroShotVisualization(null);
+        } finally {
+          setIsLoadingZeroShotViz(false);
+        }
+      })();
+    } else if (state.status === 'idle' || (llmConfig.scaffolded ?? true)) {
+      // Clear visualization when returning to idle or switching to scaffolded mode
+      setZeroShotVisualization(null);
+    }
+  }, [state.status, state.finalized_codes, llmConfig.scaffolded, llmConfig.visualizePrediction]);
+
+  // Get the decision for the rewind target node
+  // If batchId is set, find the matching decision by batch type
+  const rewindTargetDecision = rewindTargetNode
+    ? (() => {
+        if (rewindTargetBatchId) {
+          // batchId format: "nodeId|batchType"
+          const batchType = rewindTargetBatchId.split('|')[1];
+          return state.decision_history.find(d =>
+            d.current_node === rewindTargetNode.id &&
+            extractBatchType(d.current_label) === batchType
+          ) || null;
+        }
+        // Fallback to first matching decision
+        return state.decision_history.find(d => d.current_node === rewindTargetNode.id) || null;
+      })()
+    : null;
 
   // VISUALIZE tab handlers
   const handleAddCode = useCallback(async () => {
@@ -571,6 +719,16 @@ function TraversalUI() {
       .filter(c => c.length > 0);
 
     if (codes.length > 0) {
+      // If benchmark is complete, clear traversal state first (new benchmark setup)
+      if (benchmarkStatus === 'complete') {
+        setBenchmarkCombinedNodes([]);
+        setBenchmarkCombinedEdges([]);
+        setBenchmarkOvershootMarkers([]);
+        setBenchmarkMissedEdgeMarkers([]);
+        setBenchmarkMetrics(null);
+        setBenchmarkStatus('idle');
+      }
+
       const newSet = new Set(benchmarkExpectedCodes);
       codes.forEach(code => newSet.add(code));
       setBenchmarkExpectedCodes(newSet);
@@ -579,10 +737,20 @@ function TraversalUI() {
       // Auto-build the expected graph
       await buildExpectedGraph(newSet);
     }
-  }, [benchmarkCodeInput, benchmarkExpectedCodes, buildExpectedGraph]);
+  }, [benchmarkCodeInput, benchmarkExpectedCodes, buildExpectedGraph, benchmarkStatus]);
 
   // Remove an expected code and rebuild the graph
   const handleBenchmarkRemoveCode = useCallback(async (code: string) => {
+    // If benchmark is complete, clear traversal state first (new benchmark setup)
+    if (benchmarkStatus === 'complete') {
+      setBenchmarkCombinedNodes([]);
+      setBenchmarkCombinedEdges([]);
+      setBenchmarkOvershootMarkers([]);
+      setBenchmarkMissedEdgeMarkers([]);
+      setBenchmarkMetrics(null);
+      setBenchmarkStatus('idle');
+    }
+
     const newSet = new Set(benchmarkExpectedCodes);
     newSet.delete(code);
     setBenchmarkExpectedCodes(newSet);
@@ -606,7 +774,7 @@ function TraversalUI() {
       setBenchmarkMissedEdgeMarkers([]);
       setBenchmarkInvalidCodes(new Set());
     }
-  }, [benchmarkExpectedCodes, buildExpectedGraph]);
+  }, [benchmarkExpectedCodes, buildExpectedGraph, benchmarkStatus]);
 
   const handleBenchmarkEvent = useCallback((event: AGUIEvent) => {
     switch (event.type) {
@@ -732,27 +900,19 @@ function TraversalUI() {
           });
           setBenchmarkDecisions(prev => [...prev, decision]);
 
-          // Update combined graph with benchmark statuses in real-time
-          setBenchmarkCombinedNodes(_prevCombined => {
-            if (!benchmarkExpectedGraph) return [];
+          // Phase 1a: Accumulate streamed IDs for Phase 2 marker computation
+          for (const id of selectedIds) {
+            benchmarkStreamedIdsRef.current.add(id);
+          }
 
-            // Use ref for latest traversed nodes
-            const allTraversedNodes = mergeById(benchmarkTraversedNodesRef.current, newNodes);
-            const streamedNodeIds = new Set(allTraversedNodes.map(n => n.id));
+          // Phase 1b: Update traversed status in real-time (visual feedback)
+          // Updates expected nodes that were traversed (nodeId + selected_ids) to 'traversed' status
+          // nodeId is included because it represents the node being processed in the current batch
+          setBenchmarkCombinedNodes(prevCombined => {
+            if (!benchmarkExpectedGraph || prevCombined.length === 0) return prevCombined;
 
-            // During streaming, nothing is finalized yet - use empty set
-            // Final statuses (matched, undershoot) are computed in RUN_FINISHED
-            const allTraversedEdges = mergeByKey(benchmarkTraversedEdgesRef.current, newEdges);
-            const { nodes } = computeBenchmarkVisualization(
-              benchmarkExpectedGraph.nodes,
-              benchmarkExpectedGraph.edges,
-              streamedNodeIds,
-              new Set<string>(), // finalizedCodes - empty during streaming
-              benchmarkExpectedCodes,
-              allTraversedEdges,
-              allTraversedNodes
-            );
-            return nodes;
+            const expectedNodeIds = new Set(benchmarkExpectedGraph.nodes.map(n => n.id));
+            return updateTraversedNodes(prevCombined, selectedIds, expectedNodeIds, nodeId);
           });
         }
         break;
@@ -765,62 +925,175 @@ function TraversalUI() {
         } else {
           const finalNodesRaw = (event.metadata?.final_nodes || []) as string[];
           const finalNodes = new Set(finalNodesRaw);
-          // Compute final metrics and visualization
+          const isZeroShot = !(llmConfig.scaffolded ?? true);
+
+          // NOTE: Cross-run caching is now handled by the backend (Burr + SQLite)
+          // The backend reports cache status in event.metadata.cached
+          const wasCached = event.metadata?.cached ?? false;
+          if (wasCached) {
+            console.log('[BACKEND CACHE HIT] Using cached zero-shot results:', finalNodesRaw.length, 'codes');
+          }
+
+          // Phase 2: Compute final statuses and markers
           // Use refs to get latest traversed data (avoid stale closure)
           if (benchmarkExpectedGraph) {
-            const latestTraversedNodes = benchmarkTraversedNodesRef.current;
             const latestTraversedEdges = benchmarkTraversedEdgesRef.current;
-            const streamedNodeIds = new Set(latestTraversedNodes.map(n => n.id));
+            const streamedIds = benchmarkStreamedIdsRef.current;
 
-            // Compute visualization (nodes, edges, markers) in a single pass
-            const {
-              nodes: finalCombinedNodes,
-              missedEdgeMarkers,
-              overshootMarkers,
-              traversedSet,
-            } = computeBenchmarkVisualization(
-              benchmarkExpectedGraph.nodes,
-              benchmarkExpectedGraph.edges,
-              streamedNodeIds,
-              finalNodes,
-              benchmarkExpectedCodes,
-              latestTraversedEdges,
-              latestTraversedNodes
-            );
+            // For zero-shot finalized-only view: use empty set for streamedIds
+            // Zero-shot doesn't actually traverse - intermediate predictions shouldn't affect status
+            // Only the actual final codes matter for comparison
+            const finalizedViewStreamedIds = isZeroShot ? new Set<string>() : streamedIds;
 
-            setBenchmarkCombinedNodes(finalCombinedNodes);
-            setBenchmarkMissedEdgeMarkers(missedEdgeMarkers);
-            setBenchmarkOvershootMarkers(overshootMarkers);
+            // Phase 2: Compute final comparison with markers
+            // Uses accumulated streamedIds from Phase 1 + finalizedCodes (scaffolded only)
+            setBenchmarkCombinedNodes(prevCombined => {
+              const {
+                nodes: finalCombinedNodes,
+                missedEdgeMarkers,
+                overshootMarkers,
+                traversedSet,
+              } = computeFinalizedComparison(
+                prevCombined,
+                benchmarkExpectedGraph.edges,
+                finalizedViewStreamedIds,
+                finalNodes,
+                benchmarkExpectedCodes,
+                latestTraversedEdges,
+                // Zero-shot finalized-only mode: no "traversed" status, only endpoint comparison
+                { finalizedOnlyMode: isZeroShot }
+              );
 
-            // Compute metrics (separate concern - used for report)
-            const expectedAncestorMap = buildAncestorMap(benchmarkExpectedGraph.edges);
-            const traversedAncestorMap = buildAncestorMap(latestTraversedEdges);
+              // Set markers (side effect, but needed here for traversedSet)
+              setBenchmarkMissedEdgeMarkers(missedEdgeMarkers);
+              setBenchmarkOvershootMarkers(overshootMarkers);
 
-            const { outcomes, otherCodes } = compareFinalizedCodes(
-              benchmarkExpectedCodes,
-              expectedAncestorMap,
-              finalNodes,
-              traversedAncestorMap
-            );
+              // Compute metrics (separate concern - used for report)
+              const expectedAncestorMap = buildAncestorMap(benchmarkExpectedGraph.edges);
+              const traversedAncestorMap = buildAncestorMap(latestTraversedEdges);
 
-            // Exclude ROOT from node counts - it's a virtual node, not a real ICD-10 code
-            const expectedNodeIds = new Set(
-              benchmarkExpectedGraph.nodes.map(n => n.id).filter(id => id !== 'ROOT')
-            );
-            const traversedNodeIdsExcludingRoot = new Set(
-              [...traversedSet].filter(id => id !== 'ROOT')
-            );
+              const { outcomes, otherCodes } = compareFinalizedCodes(
+                benchmarkExpectedCodes,
+                expectedAncestorMap,
+                finalNodes,
+                traversedAncestorMap
+              );
 
-            const metrics = computeBenchmarkMetrics(
-              benchmarkExpectedCodes,
-              finalNodes,
-              expectedNodeIds,
-              traversedNodeIdsExcludingRoot,
-              outcomes,
-              otherCodes
-            );
+              // Exclude ROOT from node counts - it's a virtual node, not a real ICD-10 code
+              const expectedNodeIds = new Set(
+                benchmarkExpectedGraph.nodes.map(n => n.id).filter(id => id !== 'ROOT')
+              );
+              const traversedNodeIdsExcludingRoot = new Set(
+                [...traversedSet].filter(id => id !== 'ROOT')
+              );
 
-            setBenchmarkMetrics(metrics);
+              const metrics = computeBenchmarkMetrics(
+                benchmarkExpectedCodes,
+                finalNodes,
+                expectedNodeIds,
+                traversedNodeIdsExcludingRoot,
+                outcomes,
+                otherCodes
+              );
+
+              setBenchmarkMetrics(metrics);
+
+              // Cache finalized view (no X markers - overshoot arrows only)
+              setBenchmarkFinalizedView({
+                nodes: finalCombinedNodes,
+                edges: benchmarkExpectedGraph.edges,
+                metrics: metrics,
+                overshootMarkers: overshootMarkers,
+              });
+
+              // For zero-shot mode: build inferred view with X markers
+              // The inferred graph represents the conceptual traversal path from final codes
+              // We compare this against the UNCHANGED expected graph, same as scaffolded mode
+              if (isZeroShot && finalNodesRaw.length > 0) {
+                (async () => {
+                  try {
+                    // Build inferred graph from final codes (represents what LLM "traversed")
+                    const inferredGraph = await buildGraph(finalNodesRaw);
+
+                    // Use inferred node IDs as the "traversed" set (simulating scaffolded traversal)
+                    const inferredTraversedIds = new Set(inferredGraph.nodes.map(n => n.id));
+
+                    // Initialize expected nodes with 'expected' status
+                    const initializedExpectedNodes: BenchmarkGraphNode[] = benchmarkExpectedGraph.nodes.map(node => ({
+                      ...node,
+                      benchmarkStatus: 'expected' as const,
+                    }));
+
+                    // Run the same comparison as scaffolded mode:
+                    // Compare inferred traversal against expected graph
+                    const {
+                      nodes: inferredViewNodes,
+                      missedEdgeMarkers: inferredMissedMarkers,
+                      overshootMarkers: inferredOvershootMarkers,
+                      traversedSet: inferredTraversedSet,
+                    } = computeFinalizedComparison(
+                      initializedExpectedNodes,
+                      benchmarkExpectedGraph.edges,  // Use expected edges (not merged)
+                      inferredTraversedIds,          // Inferred nodes as "streamed" traversal
+                      finalNodes,                    // Finalized codes
+                      benchmarkExpectedCodes,        // Expected leaf codes
+                      inferredGraph.edges            // Inferred edges for ancestor expansion
+                    );
+
+                    // Compute metrics using expected graph structure
+                    const expectedAncestorMap = buildAncestorMap(benchmarkExpectedGraph.edges);
+                    const inferredAncestorMap = buildAncestorMap(inferredGraph.edges);
+
+                    const { outcomes: inferredOutcomes, otherCodes: inferredOtherCodes } = compareFinalizedCodes(
+                      benchmarkExpectedCodes,
+                      expectedAncestorMap,
+                      finalNodes,
+                      inferredAncestorMap
+                    );
+
+                    // Exclude ROOT from node counts
+                    const expectedNodeIdsForMetrics = new Set(
+                      benchmarkExpectedGraph.nodes.map(n => n.id).filter(id => id !== 'ROOT')
+                    );
+                    const inferredTraversedNodeIds = new Set(
+                      [...inferredTraversedSet].filter(id => id !== 'ROOT')
+                    );
+
+                    const baseInferredMetrics = computeBenchmarkMetrics(
+                      benchmarkExpectedCodes,
+                      finalNodes,
+                      expectedNodeIdsForMetrics,
+                      inferredTraversedNodeIds,
+                      inferredOutcomes,
+                      inferredOtherCodes
+                    );
+
+                    // Override display counts to show graph node counts (not just leaf codes)
+                    // This makes "Expected" show 19 (all expected nodes) instead of 3 (leaf codes)
+                    // and "Traversed" show 65 (all inferred nodes) instead of 22 (finalized codes)
+                    const inferredMetrics = {
+                      ...baseInferredMetrics,
+                      expectedCount: expectedNodeIdsForMetrics.size,
+                      traversedCount: inferredTraversedNodeIds.size,
+                    };
+
+                    // Cache inferred view - uses expected graph structure, not merged
+                    setBenchmarkInferredView({
+                      nodes: inferredViewNodes,
+                      edges: benchmarkExpectedGraph.edges,  // Expected edges unchanged
+                      metrics: inferredMetrics,
+                      overshootMarkers: inferredOvershootMarkers,
+                      missedEdgeMarkers: inferredMissedMarkers,
+                      inferredNodes: inferredGraph.nodes,  // Raw inferred nodes for Report interim
+                    });
+                  } catch (err) {
+                    console.error('Failed to build inferred view:', err);
+                  }
+                })();
+              }
+
+              return finalCombinedNodes;
+            });
           }
 
           setBenchmarkStatus('complete');
@@ -828,7 +1101,7 @@ function TraversalUI() {
         }
         break;
     }
-  }, [benchmarkExpectedGraph, benchmarkExpectedCodes, benchmarkTraversedNodes, benchmarkTraversedEdges]);
+  }, [benchmarkExpectedGraph, benchmarkExpectedCodes, benchmarkTraversedNodes, benchmarkTraversedEdges, llmConfig]);
 
   const handleBenchmarkError = useCallback((error: Error) => {
     setBenchmarkStatus('error');
@@ -848,11 +1121,15 @@ function TraversalUI() {
       benchmarkControllerRef.current.abort();
     }
 
+    // NOTE: Cross-run caching is now handled by the backend (Burr + SQLite)
+    // The frontend always sends the request; backend returns cached results if available
+
     // Reset traversal state but keep expected graph
     setBenchmarkTraversedNodes([]);
     setBenchmarkTraversedEdges([]);
     benchmarkTraversedNodesRef.current = [];
     benchmarkTraversedEdgesRef.current = [];
+    benchmarkStreamedIdsRef.current = new Set(); // Reset Phase 1 streamed IDs
     setBenchmarkOvershootMarkers([]);
     setBenchmarkMissedEdgeMarkers([]);
     setBenchmarkDecisions([]);
@@ -861,12 +1138,15 @@ function TraversalUI() {
     setBenchmarkStatus('traversing');
     setBenchmarkCurrentStep('Starting benchmark traversal');
     setBenchmarkError(null);
+    // Reset cached views for new benchmark (toggle state persists - user preference)
+    setBenchmarkFinalizedView(null);
+    setBenchmarkInferredView(null);
 
-    // Reinitialize combined graph with expected nodes
-    if (benchmarkExpectedGraph) {
-      const combinedNodes = initializeExpectedNodes(benchmarkExpectedGraph.nodes);
-      setBenchmarkCombinedNodes(combinedNodes);
-      setBenchmarkCombinedEdges(benchmarkExpectedGraph.edges);
+    // Reset graph to idle state first (plain black nodes)
+    // This ensures a clean visual slate before traversal colors nodes
+    if (benchmarkCombinedNodes.length > 0) {
+      const idleNodes = resetNodesToIdle(benchmarkCombinedNodes);
+      setBenchmarkCombinedNodes(idleNodes);
     }
 
     benchmarkControllerRef.current = streamTraversal(
@@ -878,12 +1158,15 @@ function TraversalUI() {
         selector: 'llm',
         max_tokens: llmConfig.maxTokens,
         temperature: llmConfig.temperature,
+        extra: llmConfig.extra,
+        system_prompt: llmConfig.systemPrompt || undefined,
+        scaffolded: llmConfig.scaffolded ?? true,
       },
       handleBenchmarkEvent,
       handleBenchmarkError
     );
     return true;
-  }, [benchmarkClinicalNote, llmConfig, benchmarkExpectedGraph, handleBenchmarkEvent, handleBenchmarkError]);
+  }, [benchmarkClinicalNote, llmConfig, benchmarkCombinedNodes, handleBenchmarkEvent, handleBenchmarkError]);
 
   const handleBenchmarkCancel = useCallback(() => {
     if (benchmarkControllerRef.current) {
@@ -909,6 +1192,7 @@ function TraversalUI() {
     setBenchmarkTraversedEdges([]);
     benchmarkTraversedNodesRef.current = [];
     benchmarkTraversedEdgesRef.current = [];
+    benchmarkStreamedIdsRef.current = new Set(); // Reset Phase 1 streamed IDs
     setBenchmarkCombinedNodes([]);
     setBenchmarkCombinedEdges([]);
     setBenchmarkOvershootMarkers([]);
@@ -921,6 +1205,10 @@ function TraversalUI() {
     setBenchmarkClinicalNote('');
     setBenchmarkBatchCount(0);
     setBenchmarkInvalidCodes(new Set());
+    // Reset cached views and toggle
+    setBenchmarkFinalizedView(null);
+    setBenchmarkInferredView(null);
+    setBenchmarkInferPrecursors(false);
   }, []);
 
   return (
@@ -1078,8 +1366,27 @@ function TraversalUI() {
             {sidebarTab === 'clinical-note' && (
               <div className="sidebar-tab-content">
                 <textarea
+                  key="traverse-clinical-note"
                   value={clinicalNote}
-                  onChange={(e) => setClinicalNote(e.target.value)}
+                  onChange={(e) => {
+                    const newValue = e.target.value;
+                    // Defensive check: reject if value matches system prompts
+                    if (newValue === LLM_SYSTEM_PROMPT || newValue === LLM_SYSTEM_PROMPT_NON_SCAFFOLDED) {
+                      console.error('[BUG DETECTED] Clinical note onChange received system prompt value!');
+                      console.error('[BUG] Event type:', e.type, 'isTrusted:', e.isTrusted);
+                      console.error('[BUG] Target id:', e.target.id, 'className:', e.target.className);
+                      console.error('[BUG] Stack trace:', new Error().stack);
+                      return; // Do NOT update state with system prompt
+                    }
+                    setClinicalNote(newValue);
+                  }}
+                  onPaste={(e) => {
+                    const pastedText = e.clipboardData.getData('text');
+                    console.log('[DEBUG paste] length:', pastedText.length, 'preview:', pastedText.substring(0, 50));
+                    if (pastedText === LLM_SYSTEM_PROMPT || pastedText === LLM_SYSTEM_PROMPT_NON_SCAFFOLDED) {
+                      console.error('[BUG DETECTED] Clipboard contains system prompt!');
+                    }
+                  }}
                   placeholder="Paste or type a clinical note..."
                   disabled={isLoading}
                 />
@@ -1089,141 +1396,11 @@ function TraversalUI() {
             {/* LLM Settings Tab */}
             {sidebarTab === 'llm-settings' && (
               <div className="sidebar-tab-content">
-                <div className="setting-row">
-                  <label>Provider</label>
-                  <select
-                    value={llmConfig.provider}
-                    onChange={(e) => {
-                      const provider = e.target.value as LLMConfig['provider'];
-                      const model = DEFAULT_MODELS[provider];
-                      setLlmConfig(prev => ({
-                        ...prev,
-                        provider,
-                        model,
-                        temperature: getDefaultTemperature(model),
-                        maxTokens: getDefaultMaxTokens(model),
-                      }));
-                    }}
-                  >
-                    <option value="openai">OpenAI</option>
-                    <option value="cerebras">Cerebras</option>
-                    <option value="sambanova">SambaNova</option>
-                    <option value="anthropic">Anthropic</option>
-                    <option value="other">Other</option>
-                  </select>
-                </div>
-                {llmConfig.provider === 'other' && (
-                  <div className="setting-row">
-                    <label>Base URL</label>
-                    <input
-                      type="text"
-                      placeholder="https://api.example.com/v1"
-                      disabled
-                    />
-                  </div>
-                )}
-                <div className="setting-row">
-                  <label>API Key</label>
-                  <input
-                    type="password"
-                    value={llmConfig.apiKey}
-                    onChange={(e) =>
-                      setLlmConfig(prev => ({ ...prev, apiKey: e.target.value }))
-                    }
-                    placeholder="Enter API key..."
-                  />
-                </div>
-                {llmConfig.provider !== 'other' && PROVIDER_MODELS[llmConfig.provider].length > 0 ? (
-                  <>
-                    <div className="setting-row">
-                      <label>Model</label>
-                      <select
-                        value={PROVIDER_MODELS[llmConfig.provider].includes(llmConfig.model) ? llmConfig.model : '__custom__'}
-                        onChange={(e) => {
-                          const value = e.target.value;
-                          if (value === '__custom__') {
-                            setLlmConfig(prev => ({ ...prev, model: '', temperature: 0.0, maxTokens: 8192 }));
-                          } else {
-                            setLlmConfig(prev => ({
-                              ...prev,
-                              model: value,
-                              temperature: getDefaultTemperature(value),
-                              maxTokens: getDefaultMaxTokens(value),
-                            }));
-                          }
-                        }}
-                      >
-                        {PROVIDER_MODELS[llmConfig.provider].map(m => (
-                          <option key={m} value={m}>{m}</option>
-                        ))}
-                        <option value="__custom__">Custom...</option>
-                      </select>
-                    </div>
-                    {!PROVIDER_MODELS[llmConfig.provider].includes(llmConfig.model) && (
-                      <div className="setting-row">
-                        <label>Custom Model</label>
-                        <input
-                          type="text"
-                          value={llmConfig.model}
-                          onChange={(e) => {
-                            const value = e.target.value;
-                            setLlmConfig(prev => ({
-                              ...prev,
-                              model: value,
-                              temperature: getDefaultTemperature(value),
-                              maxTokens: getDefaultMaxTokens(value),
-                            }));
-                          }}
-                          placeholder="Enter model name..."
-                        />
-                      </div>
-                    )}
-                  </>
-                ) : (
-                  <div className="setting-row">
-                    <label>Model</label>
-                    <input
-                      type="text"
-                      value={llmConfig.model}
-                      onChange={(e) => {
-                        const value = e.target.value;
-                        setLlmConfig(prev => ({
-                          ...prev,
-                          model: value,
-                          temperature: getDefaultTemperature(value),
-                          maxTokens: getDefaultMaxTokens(value),
-                        }));
-                      }}
-                      placeholder="Enter model name..."
-                    />
-                  </div>
-                )}
-                <div className="setting-row">
-                  <label>Max Completion Tokens</label>
-                  <input
-                    type="number"
-                    value={llmConfig.maxTokens}
-                    onChange={(e) =>
-                      setLlmConfig(prev => ({ ...prev, maxTokens: parseInt(e.target.value) || 128000 }))
-                    }
-                    min={1}
-                    max={200000}
-                    step={1}
-                  />
-                </div>
-                <div className="setting-row">
-                  <label>Temperature: <span className="temperature-value">{llmConfig.temperature.toFixed(1)}</span></label>
-                  <input
-                    type="range"
-                    value={llmConfig.temperature}
-                    onChange={(e) =>
-                      setLlmConfig(prev => ({ ...prev, temperature: parseFloat(e.target.value) }))
-                    }
-                    min={0}
-                    max={2}
-                    step={0.1}
-                  />
-                </div>
+                <LLMSettingsPanel
+                  config={llmConfig}
+                  onChange={setLlmConfig}
+                  disabled={isLoading}
+                />
               </div>
             )}
 
@@ -1302,8 +1479,17 @@ function TraversalUI() {
               {benchmarkSidebarTab === 'clinical-note' && (
                 <div className="input-group flex-grow">
                   <textarea
+                    key="benchmark-clinical-note"
                     value={benchmarkClinicalNote}
-                    onChange={(e) => setBenchmarkClinicalNote(e.target.value)}
+                    onChange={(e) => {
+                      const newValue = e.target.value;
+                      // Defensive check: reject if value matches system prompts
+                      if (newValue === LLM_SYSTEM_PROMPT || newValue === LLM_SYSTEM_PROMPT_NON_SCAFFOLDED) {
+                        console.error('[BUG DETECTED] Benchmark clinical note onChange received system prompt value!');
+                        return;
+                      }
+                      setBenchmarkClinicalNote(newValue);
+                    }}
                     placeholder="Paste or type a clinical note to benchmark against expected codes..."
                     disabled={benchmarkStatus === 'traversing'}
                     className="clinical-note-input"
@@ -1313,143 +1499,15 @@ function TraversalUI() {
 
               {/* LLM Settings Tab */}
               {benchmarkSidebarTab === 'llm-settings' && (
-                <div className="llm-settings-content">
-                  <div className="setting-row">
-                    <label>Provider</label>
-                    <select
-                      value={llmConfig.provider}
-                      onChange={(e) => {
-                        const provider = e.target.value as LLMConfig['provider'];
-                        const model = DEFAULT_MODELS[provider];
-                        setLlmConfig(prev => ({
-                          ...prev,
-                          provider,
-                          model,
-                          temperature: getDefaultTemperature(model),
-                          maxTokens: getDefaultMaxTokens(model),
-                        }));
-                      }}
-                    >
-                      <option value="openai">OpenAI</option>
-                      <option value="cerebras">Cerebras</option>
-                      <option value="sambanova">SambaNova</option>
-                      <option value="anthropic">Anthropic</option>
-                      <option value="other">Other</option>
-                    </select>
-                  </div>
-                  {llmConfig.provider === 'other' && (
-                    <div className="setting-row">
-                      <label>Base URL</label>
-                      <input
-                        type="text"
-                        placeholder="https://api.example.com/v1"
-                        disabled
-                      />
-                    </div>
-                  )}
-                  <div className="setting-row">
-                    <label>API Key</label>
-                    <input
-                      type="password"
-                      value={llmConfig.apiKey}
-                      onChange={(e) =>
-                        setLlmConfig(prev => ({ ...prev, apiKey: e.target.value }))
-                      }
-                      placeholder="Enter API key..."
-                    />
-                  </div>
-                  {llmConfig.provider !== 'other' && PROVIDER_MODELS[llmConfig.provider].length > 0 ? (
-                    <>
-                      <div className="setting-row">
-                        <label>Model</label>
-                        <select
-                          value={PROVIDER_MODELS[llmConfig.provider].includes(llmConfig.model) ? llmConfig.model : '__custom__'}
-                          onChange={(e) => {
-                            const value = e.target.value;
-                            if (value === '__custom__') {
-                              setLlmConfig(prev => ({ ...prev, model: '', temperature: 0.0, maxTokens: 8192 }));
-                            } else {
-                              setLlmConfig(prev => ({
-                                ...prev,
-                                model: value,
-                                temperature: getDefaultTemperature(value),
-                                maxTokens: getDefaultMaxTokens(value),
-                              }));
-                            }
-                          }}
-                        >
-                          {PROVIDER_MODELS[llmConfig.provider].map(m => (
-                            <option key={m} value={m}>{m}</option>
-                          ))}
-                          <option value="__custom__">Custom...</option>
-                        </select>
-                      </div>
-                      {!PROVIDER_MODELS[llmConfig.provider].includes(llmConfig.model) && (
-                        <div className="setting-row">
-                          <label>Custom Model</label>
-                          <input
-                            type="text"
-                            value={llmConfig.model}
-                            onChange={(e) => {
-                              const value = e.target.value;
-                              setLlmConfig(prev => ({
-                                ...prev,
-                                model: value,
-                                temperature: getDefaultTemperature(value),
-                                maxTokens: getDefaultMaxTokens(value),
-                              }));
-                            }}
-                            placeholder="Enter model name..."
-                          />
-                        </div>
-                      )}
-                    </>
-                  ) : (
-                    <div className="setting-row">
-                      <label>Model</label>
-                      <input
-                        type="text"
-                        value={llmConfig.model}
-                        onChange={(e) => {
-                          const value = e.target.value;
-                          setLlmConfig(prev => ({
-                            ...prev,
-                            model: value,
-                            temperature: getDefaultTemperature(value),
-                            maxTokens: getDefaultMaxTokens(value),
-                          }));
-                        }}
-                        placeholder="Enter model name..."
-                      />
-                    </div>
-                  )}
-                  <div className="setting-row">
-                    <label>Max Completion Tokens</label>
-                    <input
-                      type="number"
-                      value={llmConfig.maxTokens}
-                      onChange={(e) =>
-                        setLlmConfig(prev => ({ ...prev, maxTokens: parseInt(e.target.value) || 128000 }))
-                      }
-                      min={1}
-                      max={200000}
-                      step={1}
-                    />
-                  </div>
-                  <div className="setting-row">
-                    <label>Temperature: <span className="temperature-value">{llmConfig.temperature.toFixed(1)}</span></label>
-                    <input
-                      type="range"
-                      value={llmConfig.temperature}
-                      onChange={(e) =>
-                        setLlmConfig(prev => ({ ...prev, temperature: parseFloat(e.target.value) }))
-                      }
-                      min={0}
-                      max={2}
-                      step={0.1}
-                    />
-                  </div>
-                </div>
+                <LLMSettingsPanel
+                  config={llmConfig}
+                  onChange={setLlmConfig}
+                  disabled={benchmarkStatus === 'traversing'}
+                  benchmarkMode={true}
+                  benchmarkInferPrecursors={benchmarkInferPrecursors}
+                  onBenchmarkInferPrecursorsChange={setBenchmarkInferPrecursors}
+                  benchmarkComplete={benchmarkStatus === 'complete'}
+                />
               )}
             </div>
 
@@ -1490,7 +1548,12 @@ function TraversalUI() {
               className={`feature-tab ${activeFeatureTab === 'visualize' ? 'active' : ''}`}
               onClick={() => {
                 if (activeFeatureTab === 'visualize') {
-                  setSidebarCollapsed(prev => !prev);
+                  // If in report view, switch to graph; otherwise toggle sidebar
+                  if (visualizeViewTab === 'trajectory') {
+                    setVisualizeViewTab('graph');
+                  } else {
+                    setSidebarCollapsed(prev => !prev);
+                  }
                 } else {
                   setActiveFeatureTab('visualize');
                   setSidebarCollapsed(false);
@@ -1503,7 +1566,12 @@ function TraversalUI() {
               className={`feature-tab ${activeFeatureTab === 'traverse' ? 'active' : ''}`}
               onClick={() => {
                 if (activeFeatureTab === 'traverse') {
-                  setSidebarCollapsed(prev => !prev);
+                  // If in report view, switch to graph; otherwise toggle sidebar
+                  if (traverseViewTab === 'trajectory') {
+                    setTraverseViewTab('graph');
+                  } else {
+                    setSidebarCollapsed(prev => !prev);
+                  }
                 } else {
                   setActiveFeatureTab('traverse');
                   setSidebarCollapsed(false);
@@ -1517,7 +1585,12 @@ function TraversalUI() {
               className={`feature-tab ${activeFeatureTab === 'benchmark' ? 'active' : ''}`}
               onClick={() => {
                 if (activeFeatureTab === 'benchmark') {
-                  setSidebarCollapsed(prev => !prev);
+                  // If in report view, switch to graph; otherwise toggle sidebar
+                  if (benchmarkViewTab === 'trajectory') {
+                    setBenchmarkViewTab('graph');
+                  } else {
+                    setSidebarCollapsed(prev => !prev);
+                  }
                 } else {
                   setActiveFeatureTab('benchmark');
                   setSidebarCollapsed(false);
@@ -1532,7 +1605,7 @@ function TraversalUI() {
             <span className="view-label">View:</span>
             <button
               className={`view-btn ${(activeFeatureTab === 'visualize' ? visualizeViewTab :
-                  activeFeatureTab === 'traverse' ? traverseViewTab : benchmarkViewTab) === 'graph' ? 'active' : ''
+                activeFeatureTab === 'traverse' ? traverseViewTab : benchmarkViewTab) === 'graph' ? 'active' : ''
                 }`}
               onClick={() => {
                 if (activeFeatureTab === 'visualize') setVisualizeViewTab('graph');
@@ -1544,7 +1617,7 @@ function TraversalUI() {
             </button>
             <button
               className={`view-btn ${(activeFeatureTab === 'visualize' ? visualizeViewTab :
-                  activeFeatureTab === 'traverse' ? traverseViewTab : benchmarkViewTab) === 'trajectory' ? 'active' : ''
+                activeFeatureTab === 'traverse' ? traverseViewTab : benchmarkViewTab) === 'trajectory' ? 'active' : ''
                 }`}
               onClick={() => {
                 if (activeFeatureTab === 'visualize') setVisualizeViewTab('trajectory');
@@ -1581,21 +1654,33 @@ function TraversalUI() {
           )}
           {activeFeatureTab === 'traverse' && (
             traverseViewTab === 'graph' ? (
-              <GraphViewer
-                nodes={state.nodes}
-                edges={state.edges}
-                selectedNode={selectedNode}
-                onNodeClick={handleNodeClick}
-                finalizedCodes={state.finalized_codes}
-                isTraversing={state.status === 'traversing'}
-                currentStep={state.current_step}
-                decisionCount={state.decision_history.length}
-                status={state.status}
-                errorMessage={state.error}
-                decisions={state.decision_history}
-                codesBarLabel="Extracted Codes"
-                elapsedTime={traverseElapsedTime}
-              />
+              // Use visualization graph when zero-shot + visualizePrediction is ON
+              (() => {
+                const useVisualization =
+                  !(llmConfig.scaffolded ?? true) &&
+                  (llmConfig.visualizePrediction ?? false) &&
+                  zeroShotVisualization !== null;
+
+                return (
+                  <GraphViewer
+                    nodes={useVisualization ? zeroShotVisualization.nodes : state.nodes}
+                    edges={useVisualization ? zeroShotVisualization.edges : state.edges}
+                    selectedNode={selectedNode}
+                    onNodeClick={handleNodeClick}
+                    finalizedCodes={state.finalized_codes}
+                    isTraversing={state.status === 'traversing' || isLoadingZeroShotViz}
+                    currentStep={isLoadingZeroShotViz ? 'Building visualization...' : state.current_step}
+                    decisionCount={state.decision_history.length}
+                    status={isLoadingZeroShotViz ? 'traversing' : state.status}
+                    errorMessage={state.error}
+                    decisions={state.decision_history}
+                    codesBarLabel="Extracted Codes"
+                    elapsedTime={traverseElapsedTime}
+                    onNodeRewindClick={handleNodeRewindClick}
+                    allowRewind={state.status !== 'idle' && state.nodes.length > 1}
+                  />
+                );
+              })()
             ) : (
               <TrajectoryViewer
                 decisions={state.decision_history}
@@ -1608,53 +1693,128 @@ function TraversalUI() {
           )}
           {activeFeatureTab === 'benchmark' && (
             benchmarkViewTab === 'graph' ? (
-              <GraphViewer
-                nodes={benchmarkCombinedNodes}
-                edges={benchmarkCombinedEdges}
-                selectedNode={selectedNode}
-                onNodeClick={handleNodeClick}
-                finalizedCodes={
-                  benchmarkStatus === 'complete' && benchmarkMetrics
-                    ? benchmarkMetrics.outcomes
-                      .filter(o => o.status === 'exact')
-                      .map(o => o.expectedCode)
-                    : [...benchmarkExpectedCodes]
-                }
-                isTraversing={benchmarkStatus === 'traversing'}
-                currentStep={benchmarkCurrentStep}
-                decisionCount={benchmarkDecisions.length}
-                status={benchmarkStatus}
-                errorMessage={benchmarkError}
-                decisions={benchmarkDecisions}
-                benchmarkMode={true}
-                benchmarkMetrics={benchmarkMetrics}
-                overshootMarkers={benchmarkOvershootMarkers}
-                missedEdgeMarkers={benchmarkMissedEdgeMarkers}
-                expectedLeaves={benchmarkExpectedCodes}
-                onRemoveExpectedCode={benchmarkStatus === 'complete' ? undefined : handleBenchmarkRemoveCode}
-                invalidCodes={benchmarkInvalidCodes}
-                codesBarLabel={benchmarkStatus === 'complete' ? 'Matched Final Codes' : 'Target Final Codes'}
-                elapsedTime={benchmarkElapsedTime}
-                triggerFitToWindow={benchmarkFitTrigger}
-              />
+              // Select view based on toggle: inferred (with X markers) or finalized (no X markers)
+              (() => {
+                const isZeroShot = !(llmConfig.scaffolded ?? true);
+                const isComplete = benchmarkStatus === 'complete';
+                const useInferredView = isZeroShot && isComplete && benchmarkInferPrecursors && benchmarkInferredView !== null;
+                const useFinalizedView = isZeroShot && isComplete && !benchmarkInferPrecursors && benchmarkFinalizedView !== null;
+
+                // Get active view data
+                const activeView = useInferredView
+                  ? benchmarkInferredView
+                  : useFinalizedView
+                    ? benchmarkFinalizedView
+                    : null;
+
+                const activeNodes = activeView?.nodes ?? benchmarkCombinedNodes;
+                const activeEdges = activeView?.edges ?? benchmarkCombinedEdges;
+                const activeMetrics = activeView?.metrics ?? benchmarkMetrics;
+                const activeOvershootMarkers = activeView?.overshootMarkers ?? benchmarkOvershootMarkers;
+                const activeMissedEdgeMarkers = useInferredView && benchmarkInferredView
+                  ? benchmarkInferredView.missedEdgeMarkers
+                  : benchmarkMissedEdgeMarkers;
+
+                // Show X markers when:
+                // - Zero-shot mode with infer precursors enabled, OR
+                // - Scaffolded mode (always has full traversal path)
+                const showXMarkers = !isZeroShot || benchmarkInferPrecursors;
+
+                return (
+                  <GraphViewer
+                    nodes={activeNodes}
+                    edges={activeEdges}
+                    selectedNode={selectedNode}
+                    onNodeClick={handleNodeClick}
+                    finalizedCodes={
+                      isComplete && activeMetrics
+                        ? activeMetrics.outcomes
+                          .filter(o => o.status === 'exact')
+                          .map(o => o.expectedCode)
+                        : [...benchmarkExpectedCodes]
+                    }
+                    isTraversing={benchmarkStatus === 'traversing'}
+                    currentStep={benchmarkCurrentStep}
+                    decisionCount={benchmarkDecisions.length}
+                    status={benchmarkStatus}
+                    errorMessage={benchmarkError}
+                    decisions={benchmarkDecisions}
+                    benchmarkMode={true}
+                    benchmarkMetrics={activeMetrics}
+                    overshootMarkers={activeOvershootMarkers}
+                    missedEdgeMarkers={activeMissedEdgeMarkers}
+                    expectedLeaves={benchmarkExpectedCodes}
+                    onRemoveExpectedCode={isComplete ? undefined : handleBenchmarkRemoveCode}
+                    invalidCodes={benchmarkInvalidCodes}
+                    codesBarLabel={isComplete ? 'Matched Final Codes' : 'Target Final Codes'}
+                    elapsedTime={benchmarkElapsedTime}
+                    triggerFitToWindow={benchmarkFitTrigger}
+                    showXMarkers={showXMarkers}
+                  />
+                );
+              })()
             ) : (
-              <BenchmarkReportViewer
-                metrics={benchmarkMetrics}
-                decisions={benchmarkDecisions}
-                status={benchmarkStatus}
-                currentStep={benchmarkCurrentStep}
-                errorMessage={benchmarkError}
-                onCodeClick={handleNodeClick}
-                expectedGraph={benchmarkExpectedGraph}
-                expectedCodes={benchmarkExpectedCodes}
-                combinedNodes={benchmarkCombinedNodes}
-                traversedNodes={benchmarkTraversedNodes}
-                elapsedTime={benchmarkElapsedTime}
-              />
+              // Report view also uses active metrics based on toggle
+              (() => {
+                const isZeroShot = !(llmConfig.scaffolded ?? true);
+                const isComplete = benchmarkStatus === 'complete';
+                const useInferredView = isZeroShot && isComplete && benchmarkInferPrecursors && benchmarkInferredView !== null;
+                const useFinalizedView = isZeroShot && isComplete && !benchmarkInferPrecursors && benchmarkFinalizedView !== null;
+
+                const activeMetrics = useInferredView
+                  ? benchmarkInferredView?.metrics
+                  : useFinalizedView
+                    ? benchmarkFinalizedView?.metrics
+                    : benchmarkMetrics;
+
+                // For zero-shot mode, use cached view nodes for correct interim computation
+                // Finalized-only: empty arrays = no interim nodes shown at all
+                // Inferred: use cached view nodes for interim display
+                const activeCombinedNodes = useInferredView
+                  ? benchmarkInferredView?.nodes ?? []
+                  : useFinalizedView
+                    ? []  // No interim nodes in finalized-only view
+                    : benchmarkCombinedNodes;
+
+                const activeTraversedNodes = useInferredView
+                  ? benchmarkInferredView?.inferredNodes ?? []
+                  : useFinalizedView
+                    ? []  // No interim nodes in finalized-only view
+                    : benchmarkTraversedNodes;
+
+                return (
+                  <BenchmarkReportViewer
+                    metrics={activeMetrics}
+                    decisions={benchmarkDecisions}
+                    status={benchmarkStatus}
+                    currentStep={benchmarkCurrentStep}
+                    errorMessage={benchmarkError}
+                    onCodeClick={handleNodeClick}
+                    expectedGraph={benchmarkExpectedGraph}
+                    expectedCodes={benchmarkExpectedCodes}
+                    combinedNodes={activeCombinedNodes}
+                    traversedNodes={activeTraversedNodes}
+                    elapsedTime={benchmarkElapsedTime}
+                    hideOvershootUndershoot={useFinalizedView}
+                  />
+                );
+              })()
             )
           )}
         </div>
       </main>
+
+      {/* Rewind Modal */}
+      <NodeRewindModal
+        node={rewindTargetNode}
+        decision={rewindTargetDecision}
+        isOpen={isRewindModalOpen}
+        onClose={handleRewindClose}
+        onSubmit={handleRewindSubmit}
+        isSubmitting={isRewinding}
+        error={rewindError}
+        initialFeedback={rewindFeedbackText}
+      />
     </div>
   );
 }

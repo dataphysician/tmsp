@@ -122,7 +122,7 @@ The caching system ensures identical contexts produce identical selections. Runn
                     ┌────────────┼────────────┐
                     ▼            ▼            ▼
               ┌─────────┐  ┌─────────┐  ┌─────────┐
-              │ children│  │codeFirst│  │codeAlso │  ... parallel batches
+              │codeFirst│  │ children│  │codeAlso │  ... parallel batches
               └────┬────┘  └────┬────┘  └────┬────┘
                    │            │            │
                    ▼            ▼            ▼

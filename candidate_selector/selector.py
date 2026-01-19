@@ -1,4 +1,4 @@
-"""Async selector functions for ICD-10-CM code selection.
+"""Async selector functions for ICD-10-CM code selection
 
 Provides llm_selector (API-based) and manual_selector (interactive CLI).
 """
@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from . import config as llm_config
 from .config import LLMConfig
-from .providers import uses_strict_mode, uses_anthropic_api
+from .providers import uses_strict_mode, uses_anthropic_api, uses_vertexai_api
 
 
 # ============================================================================
@@ -119,41 +119,51 @@ Examples:
 Do not include any text outside the JSON object."""
 
 
+ZERO_SHOT_SYSTEM_PROMPT = """You are an expert ICD-10-CM medical coding assistant. Your task is to analyze a clinical note and directly generate the most appropriate ICD-10-CM codes.
+
+RULES:
+1. Analyze the clinical note carefully to identify all diagnoses, conditions, and relevant medical information
+2. Generate the most specific ICD-10-CM codes for each identified condition
+3. Include full codes with appropriate specificity (laterality, episode of care, etc.)
+4. Return codes in the format: XXX.XXXX (e.g., E11.65, I25.10, Z87.891)
+5. Consider coding guidelines for sequencing (principal diagnosis first)
+6. Include all relevant codes - comorbidities, complications, external causes, etc.
+7. For the final step, generate a reasoning trace, and return a list of final ICD-10-CM codes based on that reasoning
+
+RESPONSE FORMAT:
+You must return a valid JSON object with this exact structure (reasoning FIRST):
+{"reasoning": "brief explanation of clinical findings and code selection rationale", "selected_codes": ["X00.0", "X00.1", ...]}
+
+Examples:
+- Diabetic patient: {"reasoning": "Patient has type 2 diabetes with chronic kidney disease stage 3. Selected diabetes code with CKD complication and staging code.", "selected_codes": ["E11.22", "N18.3"]}
+- Chest pain workup: {"reasoning": "Patient presents with chest pain, ruled out for MI. History of CAD with stent.", "selected_codes": ["R07.9", "I25.10", "Z95.5"]}
+- No diagnoses: {"reasoning": "Clinical note describes a routine visit with no specific diagnoses or conditions identified.", "selected_codes": []}
+
+Do not include any text outside the JSON object."""
+
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
 
 
 def _build_user_prompt(
-    batch_id: str,
     context: str,
-    candidates: dict[str, str],
-    feedback: str | None,
+    batch_id: str | None = None,
+    candidates: dict[str, str] | None = None,
+    feedback: str | None = None,
 ) -> str:
-    """Build user prompt with clinical context and candidate codes.
+    """Build user prompt with clinical context and optional candidate codes.
 
     Args:
-        batch_id: Batch identifier (e.g., "B19.2|children")
-        context: Clinical context string from state
-        candidates: Dict of {node_id: label}
+        context: Clinical context/note string
+        batch_id: Optional batch identifier for scaffolded mode (e.g., "B19.2|children")
+        candidates: Optional dict of {node_id: label} for scaffolded mode
         feedback: Optional additional guidance
 
     Returns:
-        Formatted prompt string with context and "code - label" format
+        Formatted prompt string
     """
-    # Parse batch_id to extract node and relationship
-    if "|" in batch_id:
-        node_id, relationship = batch_id.rsplit("|", 1)
-    else:
-        node_id = batch_id
-        relationship = "children"
-
-    # Format candidates as "code - label" lines
-    candidates_text = "\n".join(
-        f"{code} - {label}" for code, label in candidates.items()
-    )
-
-    # Build prompt with feedback FIRST if provided (highest priority)
     prompt_parts = []
 
     # FEEDBACK FIRST - most important information
@@ -162,21 +172,42 @@ def _build_user_prompt(
             f"CRITICAL ADDITIONAL GUIDANCE (MUST PRIORITIZE):\n{feedback}\n"
         )
 
+    # Clinical context (always included)
     if context:
-        prompt_parts.append(f"CLINICAL CONTEXT:\n{context}\n")
+        prompt_parts.append(f"CLINICAL NOTE:\n{context}\n")
 
-    prompt_parts.extend(
-        [
+    # Scaffolded mode: include current code, relationship, and candidates
+    if batch_id is not None and candidates is not None:
+        # Parse batch_id to extract node and relationship
+        if "|" in batch_id:
+            node_id, relationship = batch_id.rsplit("|", 1)
+        else:
+            node_id = batch_id
+            relationship = "children"
+
+        # Format candidates as "code - label" lines
+        candidates_text = "\n".join(
+            f"{code} - {label}" for code, label in candidates.items()
+        )
+
+        prompt_parts.extend([
             f"CURRENT CODE: {node_id}",
             f"RELATIONSHIP TYPE: {relationship}\n",
             f"AVAILABLE CANDIDATES:\n{candidates_text}",
-        ]
-    )
+        ])
 
-    prompt_parts.append(
-        "\nSelect clinically appropriate codes (0 to N codes). "
-        "Return empty list if none are appropriate."
-    )
+    # Closing instruction - mode-appropriate
+    if batch_id is not None and candidates is not None:
+        # Scaffolded mode: selecting from candidates
+        prompt_parts.append(
+            "\nAnalyze and select clinically appropriate codes (0 to N codes). "
+            "Return empty list if none are appropriate."
+        )
+    else:
+        # Zero-shot mode: generating codes directly
+        prompt_parts.append(
+            "\nAnalyze this clinical note and generate appropriate ICD-10-CM codes."
+        )
 
     return "\n".join(prompt_parts)
 
@@ -315,6 +346,163 @@ async def _call_anthropic_api_structured(
         raise Exception(f"Anthropic API call failed: {e!s}")
 
 
+async def _call_vertexai_api_structured(
+    system_prompt: str,
+    user_messages: list[dict[str, str]],
+    config: LLMConfig,
+) -> tuple[list[str], str]:
+    """Make async Vertex AI API call with structured outputs.
+
+    Supports two authentication modes:
+    - API Key mode: Simple endpoint with ?key= parameter (Gemini API style)
+    - ADC mode: Full Vertex AI endpoint with OAuth token (requires location/project_id)
+
+    Args:
+        system_prompt: System prompt (separate from contents)
+        user_messages: User/assistant messages only
+        config: LLM configuration with extra containing auth_type and optionally location/project_id
+
+    Returns:
+        Tuple of (selected_codes, reasoning)
+
+    Raises:
+        Exception: On API errors, validation failures, or timeouts
+    """
+    # Determine auth type (default to 'api_key' for simplicity)
+    auth_type = config.extra.get("auth_type", "api_key") if config.extra else "api_key"
+
+    # Generate JSON schema from Pydantic model
+    # Note: Do NOT sanitize for Vertex AI - it doesn't support additionalProperties
+    schema = CodeSelectionResult.model_json_schema()
+
+    # Prepare timeout configuration
+    timeout = httpx.Timeout(
+        connect=5.0,
+        read=config.timeout,
+        write=5.0,
+        pool=5.0,
+    )
+
+    # Get location (default to global)
+    location = config.extra.get("location", "global").strip() if config.extra else "global"
+    if not location:
+        location = "global"
+
+    # Construct host based on location
+    # Global location uses different host format than regional locations
+    if location.lower() == "global":
+        host = "aiplatform.googleapis.com"
+    else:
+        host = f"{location}-aiplatform.googleapis.com"
+
+    # Build endpoint and headers based on auth type
+    if auth_type == "api_key":
+        # API Key mode - uses publishers endpoint with key in query string
+        endpoint = (
+            f"https://{host}/v1/publishers/google"
+            f"/models/{config.model}:generateContent?key={config.api_key}"
+        )
+        headers = {
+            "Content-Type": "application/json",
+        }
+        print(f"[VERTEX AI] Using API Key mode, location={location}, model={config.model}")
+    else:
+        # ADC mode - requires project_id, uses Bearer token
+        if not config.extra:
+            raise Exception("Vertex AI ADC mode requires 'extra' config with project_id")
+
+        project_id = config.extra.get("project_id", "").strip()
+
+        if not project_id:
+            raise Exception("Vertex AI ADC mode requires 'project_id' in extra config")
+
+        endpoint = (
+            f"https://{host}/v1/projects/{project_id}"
+            f"/locations/{location}/publishers/google/models/{config.model}:generateContent"
+        )
+        headers = {
+            "Authorization": f"Bearer {config.api_key}",
+            "Content-Type": "application/json",
+        }
+        print(f"[VERTEX AI] Using ADC mode, location={location}, project_id={project_id}, model={config.model}")
+
+    # Convert messages to Vertex AI 'contents' format
+    # Vertex AI uses: {"role": "user"|"model", "parts": [{"text": "..."}]}
+    contents = []
+    for msg in user_messages:
+        role = "model" if msg["role"] == "assistant" else "user"
+        contents.append({
+            "role": role,
+            "parts": [{"text": msg["content"]}]
+        })
+
+    # Prepare Vertex AI payload with structured output format
+    payload: dict = {
+        "contents": contents,
+        "systemInstruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+            "maxOutputTokens": config.max_completion_tokens,
+        },
+    }
+
+    # Only add temperature if not 0.0 (to get deterministic output)
+    if config.temperature != 0.0:
+        payload["generationConfig"]["temperature"] = config.temperature
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(endpoint, json=payload, headers=headers)
+            response.raise_for_status()
+
+            result = response.json()
+
+            # Vertex AI response structure:
+            # {"candidates": [{"content": {"role": "model", "parts": [{"text": "..."}]}}]}
+            candidates = result.get("candidates", [])
+            if not candidates:
+                raise Exception("Empty response from Vertex AI API")
+
+            # Get text from first candidate's content parts
+            content = ""
+            candidate_content = candidates[0].get("content", {})
+            parts = candidate_content.get("parts", [])
+            for part in parts:
+                if "text" in part:
+                    content = part.get("text", "")
+                    break
+
+            if not content:
+                raise Exception("No text content in Vertex AI response")
+
+            # Parse JSON string
+            parsed = json.loads(content)
+
+            # Validate with Pydantic
+            validated = CodeSelectionResult.model_validate(parsed)
+
+            # Return selected codes and reasoning
+            return (validated.selected_codes, validated.reasoning)
+
+    except httpx.TimeoutException as e:
+        raise Exception(f"Vertex AI API timeout after {config.timeout}s: {e!s}")
+    except httpx.HTTPStatusError as e:
+        error_detail = e.response.text if e.response else "No response"
+        hint = ""
+        if e.response.status_code == 404:
+            hint = "\nTry a different model+location combination."
+        raise Exception(f"Vertex AI API HTTP {e.response.status_code}: {error_detail}{hint}")
+    except httpx.RequestError as e:
+        raise Exception(f"Vertex AI API network error: {e!s}")
+    except json.JSONDecodeError as e:
+        raise Exception(f"Vertex AI response not valid JSON: {e!s}")
+    except Exception as e:
+        raise Exception(f"Vertex AI API call failed: {e!s}")
+
+
 async def _call_llm_api_structured(
     messages: list[dict[str, str]],
     config: LLMConfig,
@@ -328,6 +516,7 @@ async def _call_llm_api_structured(
     - Cerebras: strict=true (5000 char limit, no recursion)
     - SambaNova: strict=false (best-effort compliance)
     - Anthropic: Uses separate API format (dispatched to _call_anthropic_api_structured)
+    - Vertex AI: Uses separate API format (dispatched to _call_vertexai_api_structured)
 
     Args:
         messages: Chat messages (system + user)
@@ -339,17 +528,22 @@ async def _call_llm_api_structured(
     Raises:
         Exception: On API errors, validation failures, or timeouts
     """
+    # Extract system message and user messages for non-OpenAI providers
+    system_prompt = ""
+    user_messages = []
+    for msg in messages:
+        if msg["role"] == "system":
+            system_prompt = msg["content"]
+        else:
+            user_messages.append(msg)
+
     # Dispatch to Anthropic API if using Anthropic provider
     if uses_anthropic_api(config.provider):
-        # Extract system message and user messages
-        system_prompt = ""
-        user_messages = []
-        for msg in messages:
-            if msg["role"] == "system":
-                system_prompt = msg["content"]
-            else:
-                user_messages.append(msg)
         return await _call_anthropic_api_structured(system_prompt, user_messages, config)
+
+    # Dispatch to Vertex AI API if using Vertex AI provider
+    if uses_vertexai_api(config.provider):
+        return await _call_vertexai_api_structured(system_prompt, user_messages, config)
 
     # OpenAI-compatible API flow
     # Generate JSON schema from Pydantic model
@@ -495,10 +689,18 @@ async def llm_selector(
 
     try:
         # Build messages
-        user_prompt = _build_user_prompt(batch_id, context, candidates, feedback)
+        user_prompt = _build_user_prompt(
+            context=context,
+            batch_id=batch_id,
+            candidates=candidates,
+            feedback=feedback,
+        )
+
+        # Use custom system prompt if provided, otherwise use default
+        system_prompt = config.system_prompt or LLM_SYSTEM_PROMPT
 
         messages = [
-            {"role": "system", "content": LLM_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
@@ -539,6 +741,70 @@ async def llm_selector(
         print("[LLM SELECTOR] Returning empty selection")
 
         reasoning = f"API Error: {error_message}. Returned empty selection."
+        return ([], reasoning)
+
+
+async def zero_shot_selector(
+    clinical_note: str,
+    config: LLMConfig | None = None,
+) -> tuple[list[str], str]:
+    """Zero-shot ICD-10 code generation from clinical note.
+
+    Directly generates ICD-10 codes without tree traversal. Used when
+    scaffolded=False in the request.
+
+    Args:
+        clinical_note: The clinical note text to analyze
+        config: Optional LLM configuration (uses global LLM_CONFIG if not provided)
+
+    Returns:
+        Tuple of (selected_codes, reasoning)
+
+    Raises:
+        ValueError: If LLM_CONFIG is not set and config not provided
+    """
+    # Get LLM configuration
+    if config is None:
+        config = llm_config.LLM_CONFIG
+
+    # Check if API key is configured
+    if not config or not config.api_key:
+        raise ValueError(
+            "LLM API key is not configured. "
+            "Set candidate_selector.config.LLM_CONFIG before running zero-shot generation."
+        )
+
+    print(f"[ZERO-SHOT] Provider: {config.provider}, Model: {config.model}")
+    print(f"[ZERO-SHOT] Clinical note length: {len(clinical_note)} chars")
+
+    try:
+        # Use custom system prompt if provided, otherwise use zero-shot default
+        system_prompt = config.system_prompt or ZERO_SHOT_SYSTEM_PROMPT
+
+        user_prompt = _build_user_prompt(context=clinical_note)
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        # Call LLM API with structured outputs
+        selected, reasoning = await _call_llm_api_structured(messages, config)
+
+        print(f"[ZERO-SHOT] Generated {len(selected)} codes: {selected}")
+        print(f"[ZERO-SHOT] Reasoning: {reasoning}")
+
+        return (selected, reasoning)
+
+    except Exception as e:
+        import traceback
+        error_message = str(e)
+        print(f"[ZERO-SHOT ERROR] {error_message}")
+        print("[ZERO-SHOT TRACEBACK]")
+        traceback.print_exc()
+        print("[ZERO-SHOT] Returning empty result")
+
+        reasoning = f"API Error: {error_message}. Zero-shot generation failed."
         return ([], reasoning)
 
 

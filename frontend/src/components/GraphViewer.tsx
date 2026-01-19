@@ -41,6 +41,11 @@ interface GraphViewerProps {
   elapsedTime?: number | null;
   // Trigger fit-to-window (increment to trigger)
   triggerFitToWindow?: number;
+  // Rewind feature props (TRAVERSE tab only)
+  onNodeRewindClick?: (nodeId: string, batchId?: string, feedback?: string) => void;
+  allowRewind?: boolean;
+  // Controls whether X markers render (default true)
+  showXMarkers?: boolean;
 }
 
 // Base constants (designed for ~600px container height / 1080p display)
@@ -92,10 +97,27 @@ export function GraphViewer({
   codesBarLabel,
   elapsedTime = null,
   triggerFitToWindow,
+  onNodeRewindClick,
+  allowRewind = false,
+  showXMarkers = true,
 }: GraphViewerProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [codeSortMode, setCodeSortMode] = useState<SortMode>('default');
+  const [pinnedNodeId, setPinnedNodeId] = useState<string | null>(null);
+  const pinnedNodeIdRef = useRef<string | null>(null);
+
+  // Keep ref in sync with state for D3 event handlers
+  useEffect(() => {
+    pinnedNodeIdRef.current = pinnedNodeId;
+  }, [pinnedNodeId]);
+
+  // Clear pinned state when the pinned node is no longer in the graph
+  useEffect(() => {
+    if (pinnedNodeId && !nodes.some(n => n.id === pinnedNodeId)) {
+      setPinnedNodeId(null);
+    }
+  }, [pinnedNodeId, nodes]);
   const hasInitializedZoom = useRef(false);
   const prevIsTraversing = useRef(isTraversing);
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
@@ -221,21 +243,25 @@ export function GraphViewer({
     return () => resizeObserver.disconnect();
   }, [debouncedFitToWindow]);
 
-  // Periodic fit-to-window during traversal (every 3s when idle)
+  // Periodic fit-to-window: frequent during traversal, sparse after completion
   useEffect(() => {
-    if (isTraversing) {
-      autoFitIntervalRef.current = setInterval(() => {
-        const timeSinceInteraction = Date.now() - lastInteractionTime.current;
-        if (timeSinceInteraction >= 3000) {
-          handleFitToWindow();
-        }
-      }, 3000);
-    } else {
-      if (autoFitIntervalRef.current) {
-        clearInterval(autoFitIntervalRef.current);
-        autoFitIntervalRef.current = null;
-      }
+    // Clear existing interval when traversing state changes
+    if (autoFitIntervalRef.current) {
+      clearInterval(autoFitIntervalRef.current);
+      autoFitIntervalRef.current = null;
     }
+
+    // During traversal: auto-fit every 3 seconds (responsive)
+    // After traversal: auto-fit every 20 seconds (sparse, less intrusive)
+    const interval = isTraversing ? 3000 : 20000;
+    const idleThreshold = isTraversing ? 3000 : 5000;
+
+    autoFitIntervalRef.current = setInterval(() => {
+      const timeSinceInteraction = Date.now() - lastInteractionTime.current;
+      if (timeSinceInteraction >= idleThreshold) {
+        handleFitToWindow();
+      }
+    }, interval);
 
     return () => {
       if (autoFitIntervalRef.current) {
@@ -326,8 +352,12 @@ export function GraphViewer({
       if (!allChildren.has(sourceId)) allChildren.set(sourceId, []);
       allChildren.get(sourceId)!.push(targetId);
 
-      // Only hierarchy edges go into hierarchyChildren (for Phase 2 tree positioning)
-      if (e.edge_type === 'hierarchy') {
+      // Hierarchy edges AND sevenChrDef edges go into hierarchyChildren
+      // (sevenChrDef is lateral type but represents vertical parent-child relationship)
+      const isHierarchy = e.edge_type === 'hierarchy';
+      const isSevenChrDef = e.edge_type === 'lateral' && e.rule === 'sevenChrDef';
+
+      if (isHierarchy || isSevenChrDef) {
         if (!hierarchyChildren.has(sourceId)) hierarchyChildren.set(sourceId, []);
         hierarchyChildren.get(sourceId)!.push(targetId);
       }
@@ -512,11 +542,8 @@ export function GraphViewer({
       // Deduplicate panels with identical batch type + selected codes
       // (Can happen when multiple trajectories converge on the same node due to node deduplication)
       const nodeDecisions = nodeDecisionsRaw.reduce((acc, dec) => {
-        // Normalize batch label (trim, lowercase, remove " batch" suffix)
-        const normalizedLabel = dec.current_label
-          .trim()
-          .toLowerCase()
-          .replace(/ batch$/, '');
+        // Normalize batch label for deduplication
+        const normalizedLabel = normalizeBatchName(dec.current_label);
         // Normalize selected codes (strip to alphanumeric + dots only, sort, join)
         const normalizedCodes = (dec.selected_codes || [])
           .map(c => c.replace(/[^A-Za-z0-9.]/g, ''))
@@ -528,33 +555,21 @@ export function GraphViewer({
           acc.result.push(dec);
         }
         return acc;
-      }, { seen: new Set<string>(), result: [] as typeof nodeDecisionsRaw }).result;
+      }, { seen: new Set<string>(), result: [] as typeof nodeDecisionsRaw }).result
+        // Filter out children batches for nodes that can't have children selections
+        .filter(dec => {
+          // Use centralized helper for decision filtering
+          if (!shouldIncludeDecision(dec, d, finalizedCodesSet)) {
+            return false;
+          }
+          // Keep all batches (including empty selections) to allow Add Feedback
+          return true;
+        });
 
       // Determine if we should show batch panels
       // Show for: benchmark traversed nodes with decisions, OR traverse mode with decisions
       const shouldShowBatchPanels = (isTraversedInBenchmark && nodeDecisions.length > 0) ||
         (!benchmarkMode && nodeDecisions.length > 0);
-
-      // Helper to determine if batch section should be shown
-      // - Leaf nodes (billable/finalized, except activators with sevenChrDef) - no batch section
-      // - Placeholder nodes with 'children' batch - no batch section
-      const shouldShowBatchSection = (batchName: string): boolean => {
-        const isLeafNode = d.billable || d.category === 'finalized';
-        const isActivator = d.category === 'activator';
-        const isPlaceholder = d.category === 'placeholder';
-
-        // Activator nodes (6th char with sevenChrDef) should show the batch
-        if (isActivator) return true;
-
-        // Leaf nodes without activator status - don't show batch (no choices)
-        if (isLeafNode) return false;
-
-        // Placeholder nodes with 'children' batch - don't show (implicit)
-        if (isPlaceholder && batchName === 'children') return false;
-
-        // All other cases - show the batch section
-        return true;
-      };
 
       // If we have decisions, show batch panels (side-by-side for parallel batches)
       if (shouldShowBatchPanels) {
@@ -590,13 +605,13 @@ export function GraphViewer({
         }[] = [];
 
         nodeDecisions.slice(0, maxPanels).forEach((decision) => {
-          const batchName = decision.current_label.replace(' batch', '');
+          const batchName = normalizeBatchName(decision.current_label);
           const labelLines = wrapText(fullLabel, maxCharsPerLine);
           const selectedCandidates = decision.candidates.filter(c => c.selected);
 
-          // Determine if batch section should be shown
+          // Determine if batch section should be shown (use centralized helper)
           const hasSelections = selectedCandidates.length > 0;
-          const showBatch = shouldShowBatchSection(batchName);
+          const showBatch = shouldShowBatch(batchName, d, finalizedCodesSet);
 
           // For each selected candidate, wrap the label separately
           const selectedItems: { code: string; labelLines: string[] }[] = [];
@@ -646,6 +661,14 @@ export function GraphViewer({
               contentHeight += lineHeight; // "Reasoning:" header
               contentHeight += reasoningLines.length * lineHeight; // Reasoning lines
             }
+
+            // Add Feedback textarea + button (TRAVERSE tab only)
+            if (allowRewind && !benchmarkMode && d.id !== 'ROOT' && onNodeRewindClick) {
+              contentHeight += 12; // Gap before textarea
+              contentHeight += 50; // Textarea height (2 lines)
+              contentHeight += 8; // Gap between textarea and button
+              contentHeight += 26; // Button height
+            }
           }
 
           contentHeight += padding; // Bottom padding
@@ -676,7 +699,8 @@ export function GraphViewer({
           // Create panel group
           const panel = expandedOverlayGroup.append('g')
             .attr('class', 'batch-panel')
-            .attr('transform', `translate(${panelX}, ${startY})`);
+            .attr('transform', `translate(${panelX}, ${startY})`)
+            .on('click', (event: MouseEvent) => event.stopPropagation());
 
           // Panel background with uniform height
           panel.append('rect')
@@ -796,6 +820,84 @@ export function GraphViewer({
                   .text(line);
               });
             }
+
+            // Add Feedback textarea + button for TRAVERSE tab (inside each panel)
+            if (allowRewind && !benchmarkMode && d.id !== 'ROOT' && onNodeRewindClick) {
+              const textareaWidth = panelWidth - padding * 2;
+              const textareaHeight = 50;
+              const buttonWidth = 100;
+              const buttonHeight = 24;
+
+              // Construct batchId from decision
+              const batchType = data.decision.current_label.match(/^(\w+)\s+batch$/)?.[1] || 'children';
+              const batchId = `${d.id}|${batchType}`;
+              const textareaId = `feedback-textarea-${d.id}-${batchType}`;
+
+              // Gap before textarea
+              yPos += 12;
+
+              // Textarea using foreignObject
+              const fo = panel.append('foreignObject')
+                .attr('x', padding)
+                .attr('y', yPos)
+                .attr('width', textareaWidth)
+                .attr('height', textareaHeight);
+
+              fo.append('xhtml:textarea')
+                .attr('id', textareaId)
+                .attr('placeholder', 'Enter feedback for this batch...')
+                .style('width', '100%')
+                .style('height', '100%')
+                .style('resize', 'none')
+                .style('background-color', '#f8fafc')
+                .style('border', '1px solid #d1d5db')
+                .style('border-radius', '4px')
+                .style('padding', '6px 8px')
+                .style('font-size', '11px')
+                .style('font-family', 'inherit')
+                .style('line-height', '1.4')
+                .style('overflow-y', 'auto')
+                .style('box-sizing', 'border-box')
+                .on('click', (event: MouseEvent) => event.stopPropagation())
+                .on('mousedown', (event: MouseEvent) => event.stopPropagation());
+
+              yPos += textareaHeight + 8; // Textarea height + gap before button
+
+              const feedbackBtn = panel.append('g')
+                .attr('class', 'feedback-button')
+                .attr('transform', `translate(${padding}, ${yPos})`)
+                .style('cursor', 'pointer')
+                .on('click', (event: MouseEvent) => {
+                  event.stopPropagation();
+                  // Get textarea value
+                  const textareaEl = document.getElementById(textareaId) as HTMLTextAreaElement | null;
+                  const feedbackText = textareaEl?.value || '';
+                  onNodeRewindClick(d.id, batchId, feedbackText);
+                });
+
+              feedbackBtn.append('rect')
+                .attr('width', buttonWidth)
+                .attr('height', buttonHeight)
+                .attr('rx', 4)
+                .attr('fill', '#7c3aed');
+
+              feedbackBtn.append('text')
+                .attr('x', buttonWidth / 2)
+                .attr('y', buttonHeight / 2 + 4)
+                .attr('text-anchor', 'middle')
+                .attr('fill', '#fff')
+                .attr('font-size', 11)
+                .attr('font-weight', 600)
+                .text('Add Feedback');
+
+              // Hover effect
+              feedbackBtn.on('mouseenter', function () {
+                d3.select(this).select('rect').attr('fill', '#6d28d9');
+              });
+              feedbackBtn.on('mouseleave', function () {
+                d3.select(this).select('rect').attr('fill', '#7c3aed');
+              });
+            }
           }
         });
 
@@ -827,8 +929,12 @@ export function GraphViewer({
       }
 
       // Find decision for this node (traverse mode - show batch info with selected codes)
+      // Use centralized helper to filter out children batches for leaf nodes
       const nodeDecision = !benchmarkMode && decisions
-        ? decisions.find(dec => dec.current_node === d.id)
+        ? decisions.find(dec => {
+          if (dec.current_node !== d.id) return false;
+          return shouldIncludeDecision(dec, d, finalizedCodesSet);
+        })
         : null;
 
       // Layout constants
@@ -842,7 +948,7 @@ export function GraphViewer({
 
       // If we have a decision, show the detailed batch format (same as benchmark)
       if (nodeDecision) {
-        const batchName = nodeDecision.current_label.replace(' batch', '');
+        const batchName = normalizeBatchName(nodeDecision.current_label);
         const selectedCandidates = nodeDecision.candidates.filter(c => c.selected);
 
         // Prepare selected items with wrapped labels
@@ -884,6 +990,14 @@ export function GraphViewer({
           contentHeight += reasoningLines.length * lineHeight; // Reasoning lines
         }
 
+        // Add Feedback textarea + button (TRAVERSE tab only)
+        if (allowRewind && !benchmarkMode && d.id !== 'ROOT' && onNodeRewindClick) {
+          contentHeight += 12; // Gap before textarea
+          contentHeight += 50; // Textarea height (2 lines)
+          contentHeight += 8; // Gap between textarea and button
+          contentHeight += 26; // Button height
+        }
+
         contentHeight += padding; // Bottom padding
 
         const overlayWidth = 340;
@@ -891,24 +1005,14 @@ export function GraphViewer({
         const overlayX = pos.x - overlayWidth / 2;
         const overlayY = pos.y - overlayHeight / 2;
 
-        // Determine colors based on category
-        const isFinalized = d.category === 'finalized' || d.billable;
-        const isActivator = d.category === 'activator';
-        const isPlaceholder = d.category === 'placeholder';
-
-        const bgColor = isFinalized ? 'rgba(240, 253, 244, 0.98)' :
-                        isActivator ? 'rgba(239, 246, 255, 0.98)' :
-                        isPlaceholder ? 'rgba(248, 250, 252, 0.98)' :
-                        'rgba(255, 255, 255, 0.98)';
-        const borderColor = isFinalized ? '#16a34a' :
-                            isActivator ? '#2563eb' :
-                            isPlaceholder ? '#94a3b8' :
-                            '#475569';
+        // Determine colors using centralized helper (includes finalizedCodesSet check)
+        const { bgColor, borderColor } = getOverlayColors(d, finalizedCodesSet);
 
         // Create overlay group
         const overlay = expandedOverlayGroup.append('g')
           .attr('class', `expanded-node node-${d.category}`)
-          .attr('transform', `translate(${overlayX}, ${overlayY})`);
+          .attr('transform', `translate(${overlayX}, ${overlayY})`)
+          .on('click', (event: MouseEvent) => event.stopPropagation());
 
         // Background
         overlay.append('rect')
@@ -1017,6 +1121,182 @@ export function GraphViewer({
           });
         }
 
+        // Add Feedback textarea + button for TRAVERSE tab (below reasoning)
+        if (allowRewind && !benchmarkMode && d.id !== 'ROOT' && onNodeRewindClick) {
+          const textareaWidth = overlayWidth - padding * 2;
+          const textareaHeight = 50;
+          const buttonWidth = 100;
+          const buttonHeight = 24;
+
+          // Construct batchId from decision
+          const batchType = nodeDecision.current_label.match(/^(\w+)\s+batch$/)?.[1] || 'children';
+          const batchId = `${d.id}|${batchType}`;
+          const textareaId = `feedback-textarea-single-${d.id}-${batchType}`;
+
+          // Gap before textarea
+          yPos += 12;
+
+          // Textarea using foreignObject
+          const fo = overlay.append('foreignObject')
+            .attr('x', padding)
+            .attr('y', yPos)
+            .attr('width', textareaWidth)
+            .attr('height', textareaHeight);
+
+          fo.append('xhtml:textarea')
+            .attr('id', textareaId)
+            .attr('placeholder', 'Enter feedback for this batch...')
+            .style('width', '100%')
+            .style('height', '100%')
+            .style('resize', 'none')
+            .style('background-color', '#f8fafc')
+            .style('border', '1px solid #d1d5db')
+            .style('border-radius', '4px')
+            .style('padding', '6px 8px')
+            .style('font-size', '11px')
+            .style('font-family', 'inherit')
+            .style('line-height', '1.4')
+            .style('overflow-y', 'auto')
+            .style('box-sizing', 'border-box')
+            .on('click', (event: MouseEvent) => event.stopPropagation())
+            .on('mousedown', (event: MouseEvent) => event.stopPropagation());
+
+          yPos += textareaHeight + 8; // Textarea height + gap before button
+
+          const feedbackBtn = overlay.append('g')
+            .attr('class', 'feedback-button')
+            .attr('transform', `translate(${padding}, ${yPos})`)
+            .style('cursor', 'pointer')
+            .on('click', (event: MouseEvent) => {
+              event.stopPropagation();
+              // Get textarea value
+              const textareaEl = document.getElementById(textareaId) as HTMLTextAreaElement | null;
+              const feedbackText = textareaEl?.value || '';
+              onNodeRewindClick(d.id, batchId, feedbackText);
+            });
+
+          feedbackBtn.append('rect')
+            .attr('width', buttonWidth)
+            .attr('height', buttonHeight)
+            .attr('rx', 4)
+            .attr('fill', '#7c3aed');
+
+          feedbackBtn.append('text')
+            .attr('x', buttonWidth / 2)
+            .attr('y', buttonHeight / 2 + 4)
+            .attr('text-anchor', 'middle')
+            .attr('fill', '#fff')
+            .attr('font-size', 11)
+            .attr('font-weight', 600)
+            .text('Add Feedback');
+
+          // Hover effect
+          feedbackBtn.on('mouseenter', function () {
+            d3.select(this).select('rect').attr('fill', '#6d28d9');
+          });
+          feedbackBtn.on('mouseleave', function () {
+            d3.select(this).select('rect').attr('fill', '#7c3aed');
+          });
+        }
+
+        return; // Don't continue to basic overlay
+      }
+
+      // === Benchmark Expected overlay (expected nodes not yet traversed) ===
+      // Shows: code, billable, label, checkered flag if finalized leaf
+      // No children data (expected graph doesn't show traversal-discovered children)
+      const benchmarkExpected = benchmarkMode &&
+        (d as BenchmarkGraphNode).benchmarkStatus === 'expected';
+
+      if (benchmarkExpected) {
+        const isExpectedLeaf = expectedLeaves.has(d.id);
+
+        // Calculate content dimensions (no children section)
+        const codeText = d.code;
+        const longestLabelLine = labelLines.reduce((a, b) => a.length > b.length ? a : b, '');
+        const estimatedCodeWidth = codeText.length * 11 + 100;
+        const estimatedLabelWidth = longestLabelLine.length * 8;
+        const minWidth = 280;
+        const maxWidth = 420;
+        const overlayWidth = Math.min(maxWidth, Math.max(minWidth, Math.max(estimatedCodeWidth, estimatedLabelWidth) + padding * 2));
+
+        // Calculate height (no children, but may have flag)
+        let contentHeight = padding;
+        contentHeight += 18; // Code line
+        contentHeight += 10; // Gap after code
+        contentHeight += labelLines.length * lineHeight; // Label lines
+        if (isExpectedLeaf) {
+          contentHeight += 22; // Gap + checkered flag row
+        }
+        contentHeight += padding;
+        const overlayHeight = contentHeight;
+
+        const overlayX = pos.x - overlayWidth / 2;
+        const overlayY = pos.y - overlayHeight / 2;
+
+        // Black outline, white background (expected/not-yet-traversed style)
+        const bgColor = 'rgba(255, 255, 255, 0.98)';
+        const borderColor = '#1e293b';
+
+        // Create overlay group
+        const overlay = expandedOverlayGroup.append('g')
+          .attr('class', `expanded-node node-${d.category}`)
+          .attr('transform', `translate(${overlayX}, ${overlayY})`)
+          .on('click', (event: MouseEvent) => event.stopPropagation());
+
+        // Background
+        overlay.append('rect')
+          .attr('class', 'expanded-bg')
+          .attr('width', overlayWidth)
+          .attr('height', overlayHeight)
+          .attr('rx', 6)
+          .attr('ry', 6)
+          .attr('fill', bgColor)
+          .attr('stroke', borderColor)
+          .attr('stroke-width', 2)
+          .attr('filter', 'drop-shadow(0 2px 8px rgba(0, 0, 0, 0.15))');
+
+        let yPos = padding + 14;
+
+        // Line 1: <Code> (Billable/Non-Billable)
+        const codeLineText = overlay.append('text')
+          .attr('x', padding)
+          .attr('y', yPos)
+          .attr('font-size', 13);
+
+        codeLineText.append('tspan')
+          .attr('font-weight', 700)
+          .attr('font-family', 'ui-monospace, monospace')
+          .attr('fill', '#0f172a')
+          .text(codeText);
+
+        codeLineText.append('tspan')
+          .attr('font-weight', 500)
+          .attr('fill', d.billable ? '#15803d' : '#64748b')
+          .text(` ${billableText}`);
+
+        // Label lines
+        yPos += 10;
+        labelLines.forEach((line) => {
+          yPos += lineHeight;
+          overlay.append('text')
+            .attr('x', padding)
+            .attr('y', yPos)
+            .attr('font-size', 11)
+            .attr('fill', '#334155')
+            .text(line);
+        });
+
+        // Checkered flag for expected leaves
+        if (isExpectedLeaf) {
+          yPos += 20;
+          overlay.append('text')
+            .attr('x', padding)
+            .attr('y', yPos)
+            .attr('font-size', 14)
+            .text('🏁 Expected Finalized');
+        }
+
         return; // Don't continue to basic overlay
       }
 
@@ -1061,24 +1341,14 @@ export function GraphViewer({
       const overlayX = pos.x - overlayWidth / 2;
       const overlayY = pos.y - overlayHeight / 2;
 
-      // Determine colors based on category
-      const isFinalized = d.category === 'finalized' || d.billable;
-      const isActivator = d.category === 'activator';
-      const isPlaceholder = d.category === 'placeholder';
-
-      const bgColor = isFinalized ? 'rgba(240, 253, 244, 0.98)' :
-                      isActivator ? 'rgba(239, 246, 255, 0.98)' :
-                      isPlaceholder ? 'rgba(248, 250, 252, 0.98)' :
-                      'rgba(255, 255, 255, 0.98)';
-      const borderColor = isFinalized ? '#16a34a' :
-                          isActivator ? '#2563eb' :
-                          isPlaceholder ? '#94a3b8' :
-                          '#475569';
+      // Determine colors using centralized helper (includes finalizedCodesSet check)
+      const { bgColor, borderColor } = getOverlayColors(d, finalizedCodesSet);
 
       // Create overlay group
       const overlay = expandedOverlayGroup.append('g')
         .attr('class', `expanded-node node-${d.category}`)
-        .attr('transform', `translate(${overlayX}, ${overlayY})`);
+        .attr('transform', `translate(${overlayX}, ${overlayY})`)
+        .on('click', (event: MouseEvent) => event.stopPropagation());
 
       // Background
       overlay.append('rect')
@@ -1180,12 +1450,21 @@ export function GraphViewer({
         return pos ? `translate(${pos.x - NODE_WIDTH / 2}, ${pos.y - NODE_HEIGHT / 2})` : '';
       })
       .style('cursor', 'pointer')
-      .on('click', (_, d) => onNodeClick(d.id))
-      .on('mouseenter', function(_, d) {
+      .on('click', function (event: MouseEvent, d) {
+        event.stopPropagation(); // Prevent SVG background click handler
+        // Pin this node's overlay (clicking another node will pin that one instead)
+        setPinnedNodeId(d.id);
+        showExpandedNode(d, this as SVGGElement);
+        onNodeClick(d.id);
+      })
+      .on('mouseenter', function (_, d) {
         showExpandedNode(d, this as SVGGElement);
       })
       .on('mouseleave', () => {
-        hideExpandedNode();
+        // Only hide if not pinned
+        if (!pinnedNodeIdRef.current) {
+          hideExpandedNode();
+        }
       });
 
     // Node rectangles - uniform height
@@ -1246,7 +1525,7 @@ export function GraphViewer({
         .text('🏁');
     }
 
-    // Node label text - truncated, two lines max
+    // Node label text - word-wrapped, two lines max
     nodeGroups.append('text')
       .attr('class', 'node-label')
       .attr('x', NODE_WIDTH / 2)
@@ -1254,7 +1533,7 @@ export function GraphViewer({
       .attr('text-anchor', 'middle')
       .attr('font-size', 9)
       .attr('fill', '#64748b')
-      .text(d => truncateLabel(d.label, 22));
+      .text(d => wrapNodeLabel(d.label, 22)[0]);
 
     nodeGroups.append('text')
       .attr('class', 'node-label')
@@ -1263,16 +1542,11 @@ export function GraphViewer({
       .attr('text-anchor', 'middle')
       .attr('font-size', 9)
       .attr('fill', '#64748b')
-      .text(d => {
-        if (d.label.length > 22) {
-          return truncateLabel(d.label.substring(22), 22);
-        }
-        return '';
-      });
+      .text(d => wrapNodeLabel(d.label, 22)[1]);
 
     // Note: Native title tooltip removed - using expanded overlay on hover instead
 
-    // Render overshoot markers (red X) in benchmark mode
+    // Render overshoot markers (red arrows + optional X) in benchmark mode
     if (benchmarkMode && overshootMarkers.length > 0) {
       // Calculate positions for overshoot X markers
       const overshootPositions = new Map<string, { x: number; y: number }>();
@@ -1286,7 +1560,7 @@ export function GraphViewer({
         }
       }
 
-      // Render edges pointing to overshoot X positions
+      // Render edges pointing to overshoot X positions (always show red arrows)
       const overshootEdgeGroup = g.append('g').attr('class', 'overshoot-edges');
       overshootEdgeGroup.selectAll('.edge-overshoot')
         .data(overshootMarkers)
@@ -1308,27 +1582,29 @@ export function GraphViewer({
         .attr('stroke-width', 2)
         .attr('marker-end', 'url(#arrowhead-overshoot)');
 
-      // Render X markers at overshoot positions
-      const overshootGroup = g.append('g').attr('class', 'overshoot-markers');
-      overshootGroup.selectAll('.overshoot-x')
-        .data([...overshootPositions.entries()])
-        .join('g')
-        .attr('class', 'overshoot-x')
-        .attr('transform', ([, pos]) => `translate(${pos.x}, ${pos.y})`)
-        .each(function() {
-          const xGroup = d3.select(this);
-          // Draw X shape
-          xGroup.append('path')
-            .attr('d', 'M-10,-10 L10,10 M10,-10 L-10,10')
-            .attr('stroke', '#dc2626')
-            .attr('stroke-width', 3)
-            .attr('fill', 'none')
-            .attr('stroke-linecap', 'round');
-        });
+      // Render X markers at overshoot positions (only when showXMarkers is true)
+      if (showXMarkers) {
+        const overshootGroup = g.append('g').attr('class', 'overshoot-markers');
+        overshootGroup.selectAll('.overshoot-x')
+          .data([...overshootPositions.entries()])
+          .join('g')
+          .attr('class', 'overshoot-x')
+          .attr('transform', ([, pos]) => `translate(${pos.x}, ${pos.y})`)
+          .each(function () {
+            const xGroup = d3.select(this);
+            // Draw X shape
+            xGroup.append('path')
+              .attr('d', 'M-10,-10 L10,10 M10,-10 L-10,10')
+              .attr('stroke', '#dc2626')
+              .attr('stroke-width', 3)
+              .attr('fill', 'none')
+              .attr('stroke-linecap', 'round');
+          });
+      }
     }
 
-    // Render missed edge markers (red X on left side of edges to missed expected nodes)
-    if (benchmarkMode && missedEdgeMarkers.length > 0) {
+    // Render missed edge markers (red X near target node's arrowhead) - only when showXMarkers is true
+    if (benchmarkMode && missedEdgeMarkers.length > 0 && showXMarkers) {
       const missedGroup = g.append('g').attr('class', 'missed-edge-markers');
 
       missedEdgeMarkers.forEach(marker => {
@@ -1336,17 +1612,43 @@ export function GraphViewer({
         const tgtPos = positions.get(marker.edgeTarget);
         if (!srcPos || !tgtPos) return;
 
-        // Position X at midpoint of the edge, offset to the left
-        const midX = (srcPos.x + tgtPos.x) / 2 - 20; // 20px to the left
-        const midY = (srcPos.y + NODE_HEIGHT / 2 + tgtPos.y - NODE_HEIGHT / 2) / 2;
+        // Position X a few pixels before the arrowhead on the edge path
+        // For curved edges (when source and target have different x), follow the curve
+        const ARROW_PADDING = 8;
+        const X_OFFSET_BEFORE_ARROW = 35; // Distance along edge before arrowhead
 
-        // Draw X shape
-        missedGroup.append('path')
-          .attr('d', `M${midX - 8},${midY - 8} L${midX + 8},${midY + 8} M${midX + 8},${midY - 8} L${midX - 8},${midY + 8}`)
-          .attr('stroke', '#dc2626')
-          .attr('stroke-width', 3)
-          .attr('fill', 'none')
-          .attr('stroke-linecap', 'round');
+        // Calculate point on edge path near the arrowhead
+        // The arrowhead is at (tgtPos.x, tgtPos.y - NODE_HEIGHT/2 - ARROW_PADDING)
+        const arrowX = tgtPos.x;
+        const arrowY = tgtPos.y - NODE_HEIGHT / 2 - ARROW_PADDING;
+
+        // For lateral (curved) edges, position X along the approach direction
+        // Calculate approach angle from control point to target
+        const dx = tgtPos.x - srcPos.x;
+        if (Math.abs(dx) > NODE_WIDTH) {
+          // This is a curved lateral edge - position X before arrowhead along the curve's approach
+          // The curve approaches from above-left, so offset diagonally
+          const xPos = arrowX - X_OFFSET_BEFORE_ARROW * 0.7;
+          const yPos = arrowY - X_OFFSET_BEFORE_ARROW * 0.5;
+
+          missedGroup.append('path')
+            .attr('d', `M${xPos - 8},${yPos - 8} L${xPos + 8},${yPos + 8} M${xPos + 8},${yPos - 8} L${xPos - 8},${yPos + 8}`)
+            .attr('stroke', '#dc2626')
+            .attr('stroke-width', 3)
+            .attr('fill', 'none')
+            .attr('stroke-linecap', 'round');
+        } else {
+          // Vertical/near-vertical edge - position X directly above arrowhead (closer than lateral)
+          const xPos = arrowX;
+          const yPos = arrowY - 18; // Reduced offset for vertical edges (was X_OFFSET_BEFORE_ARROW = 35)
+
+          missedGroup.append('path')
+            .attr('d', `M${xPos - 8},${yPos - 8} L${xPos + 8},${yPos + 8} M${xPos + 8},${yPos - 8} L${xPos - 8},${yPos + 8}`)
+            .attr('stroke', '#dc2626')
+            .attr('stroke-width', 3)
+            .attr('fill', 'none')
+            .attr('stroke-linecap', 'round');
+        }
       });
     }
 
@@ -1373,6 +1675,14 @@ export function GraphViewer({
 
     svg.call(zoom);
     zoomRef.current = zoom;
+
+    // Click on SVG background (any click not stopped by nodes/buttons) releases the pinned overlay
+    svg.on('click', () => {
+      if (pinnedNodeIdRef.current) {
+        setPinnedNodeId(null);
+        hideExpandedNode();
+      }
+    });
 
     // IMPORTANT: Apply the current transform to the new <g> element
     // This preserves the user's pan/zoom position when the graph re-renders
@@ -1406,7 +1716,7 @@ export function GraphViewer({
       hasInitializedZoom.current = true;
     }
 
-  }, [nodes, edges, selectedNode, onNodeClick, finalizedCodes, isTraversing, benchmarkMode, overshootMarkers, missedEdgeMarkers, expectedLeaves, nodeReasoningMap, handleFitToWindow]);
+  }, [nodes, edges, selectedNode, onNodeClick, finalizedCodes, isTraversing, benchmarkMode, overshootMarkers, missedEdgeMarkers, expectedLeaves, nodeReasoningMap, handleFitToWindow, showXMarkers]);
 
   return (
     <div className="graph-container" ref={containerRef}>
@@ -1456,18 +1766,42 @@ export function GraphViewer({
                   <>
                     <span className="stat-separator">·</span>
                     <span className="benchmark-stat other">
-                      <strong>{benchmarkMetrics.otherCount}</strong> other
+                      <strong>{benchmarkMetrics.otherCount}</strong> other trajectories
                     </span>
                   </>
                 )}
                 <span className="stat-separator">|</span>
                 <span className="benchmark-score">
-                  Traversal Accuracy: <strong>{(benchmarkMetrics.traversalAccuracy * 100).toFixed(1)}%</strong>
+                  Traversal Recall: <strong>{(benchmarkMetrics.traversalRecall * 100).toFixed(1)}%</strong>
                 </span>
                 <span className="stat-separator">·</span>
                 <span className="benchmark-score">
-                  Final Codes Accuracy: <strong>{(benchmarkMetrics.finalCodesAccuracy * 100).toFixed(1)}%</strong>
+                  Final Codes Recall: <strong>{(benchmarkMetrics.finalCodesRecall * 100).toFixed(1)}%</strong>
                 </span>
+              </span>
+            </div>
+          ) : benchmarkMode && !benchmarkMetrics && nodeCount > 0 ? (
+            // Benchmark mode: before or during traversal
+            <div className="report-line">
+              <span className="report-label">Report:</span>
+              <span className="report-stats">
+                {status === 'idle' ? (
+                  // Before traversal: show target nodes count
+                  <>
+                    <strong>{nodeCount}</strong> target nodes
+                  </>
+                ) : (
+                  // During traversal: show intersecting traversed nodes count
+                  <>
+                    <strong>
+                      {(nodes as BenchmarkGraphNode[]).filter(
+                        n => n.benchmarkStatus === 'traversed' || n.benchmarkStatus === 'matched'
+                      ).length}
+                    </strong> nodes traversed
+                    <span className="stat-separator">·</span>
+                    <strong>{nodeCount}</strong> target nodes
+                  </>
+                )}
               </span>
             </div>
           ) : (nodeCount > 0 || finalizedCodes.length > 0 || decisionCount > 0) && (
@@ -1514,13 +1848,9 @@ export function GraphViewer({
       <div className="graph-svg-area">
         <svg ref={svgRef} width="100%" height="100%" />
         <div className="zoom-controls">
-          <div className="zoom-row">
-            <button className="zoom-btn" onClick={handleZoomIn} title="Zoom in">+</button>
-            <button className="zoom-btn" onClick={handleZoomOut} title="Zoom out">−</button>
-          </div>
-          <div className="zoom-row zoom-row-end">
-            <button className="zoom-btn zoom-btn-fit" onClick={handleFitToWindow} title="Fit to window">⤢</button>
-          </div>
+          <button className="zoom-btn" onClick={handleZoomIn} title="Zoom in">+</button>
+          <button className="zoom-btn" onClick={handleZoomOut} title="Zoom out">−</button>
+          <button className="zoom-btn zoom-btn-fit" onClick={handleFitToWindow} title="Fit to window">⤢</button>
         </div>
         {status === 'idle' && nodes.filter(n => n.id !== 'ROOT').length === 0 && (
           <div className="empty-state absolute">
@@ -1633,10 +1963,60 @@ export function GraphViewer({
   );
 }
 
-// Truncate label to max length with ellipsis
-function truncateLabel(label: string | undefined, maxLen: number): string {
-  if (!label) return '';
-  return label.length > maxLen ? label.substring(0, maxLen - 1) + '…' : label;
+// Wrap node label into two lines with word boundaries (no mid-word breaks)
+// Returns [line1, line2] where line2 has ellipsis if there's overflow
+function wrapNodeLabel(label: string | undefined, maxCharsPerLine: number): [string, string] {
+  if (!label) return ['', ''];
+
+  const words = label.split(' ');
+  let line1 = '';
+  let line2 = '';
+  let wordIndex = 0;
+
+  // Build first line - fit complete words only
+  for (; wordIndex < words.length; wordIndex++) {
+    const word = words[wordIndex];
+    const testLine = line1 ? line1 + ' ' + word : word;
+    if (testLine.length <= maxCharsPerLine) {
+      line1 = testLine;
+    } else {
+      break;
+    }
+  }
+
+  // If no words fit on line1, put the first word (even if too long)
+  if (!line1 && words.length > 0) {
+    line1 = words[0].length > maxCharsPerLine
+      ? words[0].substring(0, maxCharsPerLine - 1) + '…'
+      : words[0];
+    wordIndex = 1;
+  }
+
+  // Build second line from remaining words
+  for (; wordIndex < words.length; wordIndex++) {
+    const word = words[wordIndex];
+    const testLine = line2 ? line2 + ' ' + word : word;
+    if (testLine.length <= maxCharsPerLine - 1) { // Reserve space for potential ellipsis
+      line2 = testLine;
+    } else {
+      // More words remain - add ellipsis
+      if (line2) {
+        line2 = line2 + '…';
+      } else {
+        // First word of line2 is too long
+        line2 = word.substring(0, maxCharsPerLine - 1) + '…';
+      }
+      return [line1, line2];
+    }
+  }
+
+  // Check if there were more words that didn't fit
+  // (This happens when we break out of the first loop with remaining words)
+  if (wordIndex < words.length && line2 && !line2.endsWith('…')) {
+    line2 = line2 + '…';
+  }
+
+  return [line1, line2];
 }
 
 // Check if two node positions collide (with padding)
@@ -1648,7 +2028,7 @@ function hasCollision(
   padding: number = 20
 ): boolean {
   return Math.abs(x1 - x2) < nodeWidth + padding &&
-         Math.abs(y1 - y2) < nodeHeight + padding;
+    Math.abs(y1 - y2) < nodeHeight + padding;
 }
 
 // Find a non-colliding X position for a node
@@ -1695,10 +2075,19 @@ function calculatePositions(
   levelHeight: number
 ): Map<string, { x: number; y: number }> {
   const positions = new Map<string, { x: number; y: number }>();
-  const positionedNodes = new Set<string>(); // Track all positioned nodes
+  const hierarchyNodeIds = new Set<string>(); // Track nodes that are part of hierarchy columns (Phase 2)
+
+  // Build set of nodes that have hierarchy parents (connected via hierarchy/sevenChrDef from above)
+  // These nodes should stay in their columns even if they're also lateral targets
+  const nodesWithHierarchyParent = new Set<string>();
+  for (const [, children] of hierarchyChildren.entries()) {
+    for (const childId of children) {
+      nodesWithHierarchyParent.add(childId);
+    }
+  }
+
   const layoutWidth = 160;
   const nodePadding = 15;
-  const lateralOffset = nodeWidth + 60;
 
   // Helper to get Y position for a node based on depth
   const getYForDepth = (depth: number): number => {
@@ -1742,8 +2131,11 @@ function calculatePositions(
 
   // Phase 2: Position subtree helper - positions a node and all its hierarchy children
   // parentDepth is used to infer depth for nodes not in nodeMap (edge targets from streaming)
-  // useHierarchyOnly: true for Phase 2 (main tree), false for Phase 3 (lateral subtrees)
-  function positionSubtree(nodeId: string, x: number, visited: Set<string>, parentDepth: number = -1, useHierarchyOnly: boolean = true) {
+  // isHierarchyPhase: true for Phase 2 (main tree), false for Phase 3 (lateral subtrees)
+  //
+  // COLUMNAR LAYOUT: Single-child chains are vertically aligned (same X) for straight edges.
+  // Multi-child nodes spread children horizontally while keeping the layout balanced.
+  function positionSubtree(nodeId: string, x: number, visited: Set<string>, parentDepth: number = -1, isHierarchyPhase: boolean = true) {
     if (visited.has(nodeId)) return;
     visited.add(nodeId);
 
@@ -1755,19 +2147,29 @@ function calculatePositions(
     // Position even if not in nodeMap - the node might be an edge target that hasn't been
     // added to the nodes array yet (streaming race condition)
     if (!positions.has(nodeId) && nodeId !== 'ROOT') {
-      positionedNodes.add(nodeId);
       const y = getYForDepth(nodeDepth) + nodeHeight / 2;
       positions.set(nodeId, { x, y });
+      // Track hierarchy nodes so they're never moved later
+      if (isHierarchyPhase) {
+        hierarchyNodeIds.add(nodeId);
+      }
     }
 
-    // Use allChildren to treat all edges (hierarchy and lateral) as parent-child for positioning
-    // This creates a unified tree layout like the static archive reference implementation
-    const childrenMap = useHierarchyOnly ? hierarchyChildren : allChildren;
+    // Use hierarchyChildren for Phase 2, allChildren for lateral subtrees
+    const childrenMap = isHierarchyPhase ? hierarchyChildren : allChildren;
     const childIds = childrenMap.get(nodeId) || [];
     if (childIds.length === 0) return;
 
     const sortedChildren = [...childIds].sort();
 
+    // COLUMNAR LAYOUT: If single child, position directly below parent (same X)
+    // This creates straight vertical edges for hierarchy and sevenChrDef relationships
+    if (sortedChildren.length === 1) {
+      positionSubtree(sortedChildren[0], x, visited, nodeDepth, isHierarchyPhase);
+      return;
+    }
+
+    // Multiple children: spread horizontally centered under parent
     let totalChildWidth = 0;
     for (const childId of sortedChildren) {
       totalChildWidth += subtreeWidth.get(childId) || (layoutWidth + nodePadding);
@@ -1778,20 +2180,31 @@ function calculatePositions(
     for (const childId of sortedChildren) {
       const childWidth = subtreeWidth.get(childId) || (layoutWidth + nodePadding);
       const childCenterX = childX + childWidth / 2;
-      positionSubtree(childId, childCenterX, visited, nodeDepth, useHierarchyOnly);
+      positionSubtree(childId, childCenterX, visited, nodeDepth, isHierarchyPhase);
       childX += childWidth;
     }
   }
 
-  // Position the full tree starting from ROOT (use allChildren to treat all edges as parent-child)
-  positionSubtree('ROOT', containerWidth / 2, new Set<string>(), -1, false);
+  // Position the full tree starting from ROOT (use hierarchyChildren for vertical column layout)
+  positionSubtree('ROOT', containerWidth / 2, new Set<string>(), -1, true);
 
   // Add ROOT as a virtual positioned node at top center for edge rendering
   positions.set('ROOT', { x: containerWidth / 2, y: 25 });
+  hierarchyNodeIds.add('ROOT');
 
-  // Phase 3: Fallback lateral node positioning (for edge cases)
-  // Most nodes should be positioned in Phase 2, but this handles any stragglers
-  // from streaming race conditions or disconnected lateral chains
+  // Phase 3: Lateral node positioning
+  // Position lateral nodes close to their sources by shifting hierarchy columns if needed
+  const minGap = 20;
+  const step = nodeWidth + minGap;
+
+  // Track lateral targets already processed - each should only be positioned ONCE
+  // to prevent accumulated shifts from multiple passes
+  const processedLateralTargets = new Set<string>();
+
+  // Track how many lateral nodes have been placed from each source
+  // Used to offset multiple lateral targets from the same parent incrementally
+  const lateralCountPerSource = new Map<string, number>();
+
   let maxPasses = 15;
   let madeProgress = true;
 
@@ -1802,8 +2215,18 @@ function calculatePositions(
       const targetId = String(edge.target);
       const sourceId = String(edge.source);
 
-      // Skip if already positioned
-      if (positions.has(targetId)) continue;
+      // Skip if already processed in Phase 3 - prevents accumulated shifts
+      if (processedLateralTargets.has(targetId)) continue;
+
+      // Skip if already positioned AND has hierarchy parent (ancestor linking to it)
+      // Nodes with hierarchy parents should stay in their columns
+      if (positions.has(targetId) && nodesWithHierarchyParent.has(targetId)) continue;
+
+      // If already positioned but no hierarchy parent, we'll reposition it closer to lateral source
+      if (positions.has(targetId)) {
+        // This node was positioned but has no hierarchy ancestor - reposition it
+        hierarchyNodeIds.delete(targetId);  // Allow Phase 4 to move if needed
+      }
 
       // Need source to be positioned first
       const sourcePos = positions.get(sourceId);
@@ -1814,21 +2237,66 @@ function calculatePositions(
       // Determine depth: from node if available, otherwise calculate from code structure
       // ICD depth rules: Chapter_* = 1, Ranges (X##-X##) = 2, Codes = length without dots
       const targetDepth = targetNode?.depth ?? calculateDepthFromCode(targetId);
-
-      // Position lateral node at its depth with proper height
       const targetY = getYForDepth(targetDepth) + nodeHeight / 2;
-      const startX = sourcePos.x + lateralOffset;
-      const targetX = findNonCollidingX(startX, targetY, positions, nodeWidth, nodeHeight, targetId);
 
-      positions.set(targetId, { x: targetX, y: targetY });
-      positionedNodes.add(targetId);
+      // Get how many lateral nodes already placed from this source
+      const lateralIndex = lateralCountPerSource.get(sourceId) || 0;
+
+      // Ideal position: to the right of source, offset by how many laterals already placed
+      // First lateral at +step, second at +2*step, etc.
+      const idealX = sourcePos.x + step * (lateralIndex + 1);
+
+      // Check for ACTUAL collision at the lateral node's position (both X and Y)
+      // This determines IF we need to shift - only shift when the lateral node truly collides
+      let collidingColumnX: number | null = null;
+      for (const [id, pos] of positions.entries()) {
+        if (id === sourceId) continue;
+        if (hasCollision(idealX, targetY, pos.x, pos.y, nodeWidth, nodeHeight)) {
+          collidingColumnX = pos.x;
+          break;
+        }
+      }
+
+      // If there's actual collision, shift the ENTIRE hierarchy column (all Y depths)
+      // and everything to its right - columns move as a unit
+      if (collidingColumnX !== null) {
+        const updates: Array<[string, { x: number; y: number }]> = [];
+        for (const [id, pos] of positions.entries()) {
+          if (id === sourceId) continue;
+          // Shift all nodes at or to the right of the colliding column's X position
+          if (pos.x >= collidingColumnX - nodeWidth / 2) {
+            updates.push([id, { x: pos.x + step, y: pos.y }]);
+          }
+        }
+        for (const [id, newPos] of updates) {
+          positions.set(id, newPos);
+        }
+      }
+
+      // Place the lateral node at its ideal position (close to source)
+      positions.set(targetId, { x: idealX, y: targetY });
+      processedLateralTargets.add(targetId);  // Mark as processed to prevent reprocessing
+      lateralCountPerSource.set(sourceId, lateralIndex + 1);  // Increment for next lateral from same source
       madeProgress = true;
 
-      // If this lateral node has children (hierarchy or lateral), position them now
-      // Use allChildren and useHierarchyOnly=false to get all descendants
-      const nodeChildren = allChildren.get(targetId);
-      if (nodeChildren && nodeChildren.length > 0) {
-        positionSubtree(targetId, targetX, new Set<string>(), targetDepth, false);
+      // If this lateral node has HIERARCHY children, position them in a column below
+      const hierarchyChildIds = hierarchyChildren.get(targetId);
+      if (hierarchyChildIds && hierarchyChildIds.length > 0) {
+        // Clear positions of all hierarchy descendants so they get repositioned
+        // under the lateral target's new position (not their old Phase 2 positions)
+        const clearDescendantPositions = (nodeId: string, visited: Set<string>) => {
+          if (visited.has(nodeId)) return;
+          visited.add(nodeId);
+          const children = hierarchyChildren.get(nodeId) || [];
+          for (const childId of children) {
+            positions.delete(childId);
+            hierarchyNodeIds.delete(childId);
+            clearDescendantPositions(childId, visited);
+          }
+        };
+        clearDescendantPositions(targetId, new Set<string>());
+
+        positionSubtree(targetId, idealX, new Set<string>(), targetDepth, true);
       }
     }
   }
@@ -1840,21 +2308,41 @@ function calculatePositions(
     }
   }
 
-  // Phase 4: Final collision resolution pass
+  // Phase 4: Final collision resolution pass - ONLY move non-hierarchy nodes
   const allPositionedNodes = [...positions.entries()];
 
   for (let i = 0; i < allPositionedNodes.length; i++) {
-    const [, posA] = allPositionedNodes[i];
+    const [idA, posA] = allPositionedNodes[i];
 
     for (let j = i + 1; j < allPositionedNodes.length; j++) {
       const [idB, posB] = allPositionedNodes[j];
 
       if (hasCollision(posA.x, posA.y, posB.x, posB.y, nodeWidth, nodeHeight)) {
-        // Move the second node to avoid collision
-        const newX = findNonCollidingX(posA.x + nodeWidth + 30, posB.y, positions, nodeWidth, nodeHeight, idB);
-        posB.x = newX;
-        positions.set(idB, posB);
-        allPositionedNodes[j] = [idB, posB];
+        // Determine which node to move - NEVER move hierarchy nodes
+        const aIsHierarchy = hierarchyNodeIds.has(idA);
+        const bIsHierarchy = hierarchyNodeIds.has(idB);
+
+        if (aIsHierarchy && bIsHierarchy) {
+          // Both are hierarchy - this shouldn't happen, but don't move either
+          console.warn(`[COLLISION] Two hierarchy nodes collide: ${idA} and ${idB}`);
+          continue;
+        }
+
+        // Move the non-hierarchy node (or B if neither is hierarchy)
+        const nodeToMove = aIsHierarchy ? idB : (bIsHierarchy ? idA : idB);
+        const posToMove = nodeToMove === idA ? posA : posB;
+        const otherPos = nodeToMove === idA ? posB : posA;
+
+        const newX = findNonCollidingX(otherPos.x + nodeWidth + 30, posToMove.y, positions, nodeWidth, nodeHeight, nodeToMove);
+        posToMove.x = newX;
+        positions.set(nodeToMove, posToMove);
+
+        // Update the array entry
+        if (nodeToMove === idA) {
+          allPositionedNodes[i] = [idA, posA];
+        } else {
+          allPositionedNodes[j] = [idB, posB];
+        }
       }
     }
   }
@@ -1909,33 +2397,125 @@ function createCurvedEdgePath(
   return `M${x1},${y1} Q${cx},${cy} ${x2},${y2}`;
 }
 
-// Node styling helpers
+// ============================================================================
+// Node Type Helpers - Centralized node classification logic
+// ============================================================================
+
+// Check if node is a leaf node (billable, finalized category, or in finalized codes list)
+function isLeafNode(node: GraphNode, finalizedCodes: Set<string>): boolean {
+  return node.billable || node.category === 'finalized' || finalizedCodes.has(node.code);
+}
+
+// Check if node should be styled as finalized (same logic as isLeafNode for consistency)
+function isFinalizedNode(node: GraphNode, finalizedCodes: Set<string>): boolean {
+  return node.category === 'finalized' || node.billable || finalizedCodes.has(node.code);
+}
+
+function isActivatorNode(node: GraphNode): boolean {
+  return node.category === 'activator';
+}
+
+function isPlaceholderNode(node: GraphNode): boolean {
+  return node.category === 'placeholder';
+}
+
+// ============================================================================
+// Batch/Decision Helpers - Centralized batch filtering and normalization
+// ============================================================================
+
+// Normalize batch label to lowercase name without " batch" suffix
+function normalizeBatchName(label: string | undefined): string {
+  return (label || '').replace(' batch', '').toLowerCase();
+}
+
+// Check if a decision should be included for overlay display
+// Filters out children batches for nodes that can't have children selections
+function shouldIncludeDecision(
+  dec: DecisionPoint,
+  node: GraphNode,
+  finalizedCodes: Set<string>
+): boolean {
+  const batchName = normalizeBatchName(dec.current_label);
+  const leaf = isLeafNode(node, finalizedCodes);
+  const placeholderOrActivator = isPlaceholderNode(node) || isActivatorNode(node);
+
+  // Filter out children batches for leaf, placeholder, and activator nodes
+  if ((leaf || placeholderOrActivator) && batchName === 'children') {
+    return false;
+  }
+
+  return true;
+}
+
+// Check if a batch section should be shown in overlay
+// Returns false for children batches on leaf/placeholder nodes
+function shouldShowBatch(batchName: string, node: GraphNode, finalizedCodes: Set<string>): boolean {
+  const leaf = isLeafNode(node, finalizedCodes);
+  const activator = isActivatorNode(node);
+  const placeholder = isPlaceholderNode(node);
+
+  // Activator nodes (6th char with sevenChrDef) should show the batch
+  if (activator) return true;
+
+  // Leaf nodes with 'children' batch - don't show (no children to select)
+  // But DO show lateral batches (useAdditionalCode, codeFirst, codeAlso)
+  if (leaf && batchName === 'children') return false;
+
+  // Placeholder nodes with 'children' batch - don't show (implicit)
+  if (placeholder && batchName === 'children') return false;
+
+  // All other cases - show the batch section
+  return true;
+}
+
+// ============================================================================
+// Overlay Color Helpers - Centralized color determination for overlays
+// ============================================================================
+
+function getOverlayColors(node: GraphNode, finalizedCodes: Set<string>): { bgColor: string; borderColor: string } {
+  const finalized = isFinalizedNode(node, finalizedCodes);
+  const activator = isActivatorNode(node);
+  const placeholder = isPlaceholderNode(node);
+
+  const bgColor = finalized ? 'rgba(240, 253, 244, 0.98)' :
+    activator ? 'rgba(239, 246, 255, 0.98)' :
+      placeholder ? 'rgba(248, 250, 252, 0.98)' :
+        'rgba(255, 255, 255, 0.98)';
+
+  const borderColor = finalized ? '#16a34a' :
+    activator ? '#2563eb' :
+      placeholder ? '#94a3b8' :
+        '#475569';
+
+  return { bgColor, borderColor };
+}
+
+// ============================================================================
+// Node Styling Helpers - For graph node rendering
+// ============================================================================
 // Priority: activator (blue) > finalized (green) > placeholder (dashed gray) > ancestor (black)
+
 function getNodeFill(node: GraphNode, finalizedCodes: Set<string>): string {
   // Activator nodes (have sevenChrDef) are NOT finalized - they need 7th char
-  if (node.category === 'activator') return '#ffffff';
-  // Finalized = explicit category OR billable OR in finalized codes list
-  const isFinalized = node.category === 'finalized' || node.billable || finalizedCodes.has(node.code);
-  if (isFinalized) return '#f0fdf4';
-  if (node.category === 'placeholder') return '#ffffff';
+  if (isActivatorNode(node)) return '#ffffff';
+  if (isFinalizedNode(node, finalizedCodes)) return '#f0fdf4';
+  if (isPlaceholderNode(node)) return '#ffffff';
   // ROOT styled same as ancestor
   return '#ffffff';
 }
 
 function getNodeStroke(node: GraphNode, finalizedCodes: Set<string>): string {
   // Activator nodes get blue border (7th Char Rule indicator)
-  if (node.category === 'activator') return '#3b82f6';
-  const isFinalized = node.category === 'finalized' || node.billable || finalizedCodes.has(node.code);
-  if (isFinalized) return '#22c55e';
-  if (node.category === 'placeholder') return '#94a3b8';
+  if (isActivatorNode(node)) return '#3b82f6';
+  if (isFinalizedNode(node, finalizedCodes)) return '#22c55e';
+  if (isPlaceholderNode(node)) return '#94a3b8';
   // ROOT and ancestor nodes use same stroke
   return '#334155';
 }
 
 function getNodeStrokeWidth(node: GraphNode, finalizedCodes: Set<string>): number {
-  if (node.category === 'activator') return 2;
-  const isFinalized = node.category === 'finalized' || node.billable || finalizedCodes.has(node.code);
-  if (isFinalized) return 2.5;
+  if (isActivatorNode(node)) return 2;
+  if (isFinalizedNode(node, finalizedCodes)) return 2.5;
   return 1.5;
 }
 

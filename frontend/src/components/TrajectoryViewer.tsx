@@ -36,7 +36,8 @@ function buildTreeFromDecisions(
   // Process all decisions to build parent-child relationships
   decisions.forEach(decision => {
     const batchType = decision.current_label.replace(' batch', '');
-    const parentNode = decision.current_node;
+    // Normalize parent node: treat empty/falsy values as 'ROOT'
+    const parentNode = decision.current_node || 'ROOT';
 
     // All batches handled uniformly - backend sends full validated codes
     decision.selected_codes.forEach(selectedCode => {
@@ -115,13 +116,13 @@ function buildTreeFromDecisions(
       children: [],
       details: info && !isPlaceholder && info.candidates.length > 0
         ? {
-            candidates: info.candidates.map(c => ({
-              code: c.code,
-              label: c.label,
-              selected: c.code === code,
-            })),
-            reasoning: info.reasoning,
-          }
+          candidates: info.candidates.map(c => ({
+            code: c.code,
+            label: c.label,
+            selected: c.code === code,
+          })),
+          reasoning: info.reasoning,
+        }
         : undefined,
     };
     nodeMap.set(code, node);
