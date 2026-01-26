@@ -12,9 +12,6 @@ wheels/
 # Databases
 *.db
 
-# Large data files
-static/icd10cm.txt
-
 # UV lock file
 uv.lock
 
