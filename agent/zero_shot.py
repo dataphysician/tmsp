@@ -35,6 +35,7 @@ Usage:
 """
 
 import hashlib
+import os
 
 from burr.core import ApplicationBuilder, State, action
 from burr.integrations.persisters.b_aiosqlite import AsyncSQLitePersister
@@ -52,21 +53,30 @@ ZERO_SHOT_PERSISTER: AsyncSQLitePersister | None = None
 async def initialize_zero_shot_persister(
     db_path: str = "./cache.db",
     table_name: str = "zero_shot_state",
+    reset: bool = False,
 ) -> AsyncSQLitePersister:
     """Initialize the zero-shot SQLite persister.
 
-    Uses a separate database from scaffolded traversal to avoid conflicts.
+    Uses a separate table from scaffolded traversal to avoid conflicts.
 
     Args:
         db_path: Path to SQLite database file
         table_name: Table name for state storage
+        reset: If True, delete existing database before creating
 
     Returns:
         Initialized AsyncSQLitePersister
     """
     global ZERO_SHOT_PERSISTER
 
-    # Don't reset - we want to keep the cache!
+    # Cleanup existing persister before reset to avoid orphaned connections
+    if ZERO_SHOT_PERSISTER is not None:
+        await ZERO_SHOT_PERSISTER.cleanup()
+        ZERO_SHOT_PERSISTER = None
+
+    if reset and os.path.exists(db_path):
+        os.remove(db_path)
+
     ZERO_SHOT_PERSISTER = await AsyncSQLitePersister.from_values(
         db_path=db_path,
         table_name=table_name,

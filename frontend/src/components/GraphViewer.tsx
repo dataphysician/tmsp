@@ -1,18 +1,24 @@
-import { useEffect, useRef, useMemo, useState, useCallback } from 'react';
+import { useEffect, useRef, useMemo, useState, useCallback, memo } from 'react';
 import * as d3 from 'd3';
 import type { GraphNode, GraphEdge, TraversalStatus, BenchmarkGraphNode, BenchmarkMetrics, OvershootMarker, EdgeMissMarker, DecisionPoint } from '../lib/types';
 import { exportSvgToFile, generateSvgFilename } from '../lib/exportSvg';
+import { debounce, wrapNodeLabel, formatElapsedTime } from '../lib/textUtils';
+import { calculatePositions } from '../lib/graphPositioning';
+import { createEdgePath, createCurvedEdgePath } from '../lib/edgePaths';
+import {
+  isFinalizedNode,
+  isSevenChrDefFinalizedNode,
+  getNodeFill,
+  getNodeStroke,
+  getNodeStrokeWidth,
+  getBenchmarkNodeFill,
+  getBenchmarkNodeStroke,
+  getBenchmarkNodeStrokeWidth,
+  getBenchmarkNodeStrokeDasharray,
+} from '../lib/nodeStyles';
+import { showNodeOverlay, type OverlayContext } from '../lib/overlayRenderer';
 
 type SortMode = 'default' | 'asc' | 'desc';
-
-// Debounce helper for resize handling
-function debounce<T extends (...args: unknown[]) => void>(fn: T, ms: number): T {
-  let timeoutId: ReturnType<typeof setTimeout>;
-  return ((...args: unknown[]) => {
-    clearTimeout(timeoutId);
-    timeoutId = setTimeout(() => fn(...args), ms);
-  }) as T;
-}
 
 interface GraphViewerProps {
   nodes: GraphNode[] | BenchmarkGraphNode[];
@@ -42,10 +48,14 @@ interface GraphViewerProps {
   // Trigger fit-to-window (increment to trigger)
   triggerFitToWindow?: number;
   // Rewind feature props (TRAVERSE tab only)
-  onNodeRewindClick?: (nodeId: string, batchId?: string, feedback?: string) => void;
+  onNodeRewindClick?: (nodeId: string, batchType?: string, feedback?: string) => void;
   allowRewind?: boolean;
   // Controls whether X markers render (default true)
   showXMarkers?: boolean;
+  // Streaming traversed IDs for real-time visual feedback during benchmark traversal
+  streamingTraversedIds?: Set<string>;
+  // Node ID currently being rewound (shows loading state)
+  rewindingNodeId?: string | null;
 }
 
 // Base constants (designed for ~600px container height / 1080p display)
@@ -54,28 +64,7 @@ const BASE_NODE_HEIGHT = 60;
 const BASE_LEVEL_HEIGHT = 100;
 const REFERENCE_HEIGHT = 600; // Reference container height for scale factor calculation
 
-// Helper to wrap text into lines
-function wrapText(text: string, maxWidth: number): string[] {
-  if (!text) return [''];
-  const words = text.split(' ');
-  const lines: string[] = [];
-  let currentLine = '';
-
-  for (const word of words) {
-    const testLine = currentLine ? currentLine + ' ' + word : word;
-    if (testLine.length <= maxWidth) {
-      currentLine = testLine;
-    } else {
-      if (currentLine) lines.push(currentLine);
-      currentLine = word;
-    }
-  }
-  if (currentLine) lines.push(currentLine);
-  return lines.length ? lines : [''];
-}
-
-
-export function GraphViewer({
+function GraphViewerInner({
   nodes,
   edges,
   selectedNode,
@@ -100,17 +89,28 @@ export function GraphViewer({
   onNodeRewindClick,
   allowRewind = false,
   showXMarkers = true,
+  streamingTraversedIds,
+  rewindingNodeId = null,
 }: GraphViewerProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [codeSortMode, setCodeSortMode] = useState<SortMode>('default');
   const [pinnedNodeId, setPinnedNodeId] = useState<string | null>(null);
   const pinnedNodeIdRef = useRef<string | null>(null);
+  const showTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeOverlayNodeRef = useRef<string | null>(null);
+  const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Ref for onNodeRewindClick to avoid stale closures in D3 event handlers
+  const onNodeRewindClickRef = useRef(onNodeRewindClick);
 
-  // Keep ref in sync with state for D3 event handlers
+  // Keep refs in sync with props/state for D3 event handlers
   useEffect(() => {
     pinnedNodeIdRef.current = pinnedNodeId;
   }, [pinnedNodeId]);
+
+  useEffect(() => {
+    onNodeRewindClickRef.current = onNodeRewindClick;
+  }, [onNodeRewindClick]);
 
   // Clear pinned state when the pinned node is no longer in the graph
   useEffect(() => {
@@ -118,23 +118,35 @@ export function GraphViewer({
       setPinnedNodeId(null);
     }
   }, [pinnedNodeId, nodes]);
+
+  // Track rewindingNodeId in ref for D3 access
+  const rewindingNodeIdRef = useRef(rewindingNodeId);
+  useEffect(() => {
+    rewindingNodeIdRef.current = rewindingNodeId;
+  }, [rewindingNodeId]);
+
+  // Close overlay and clear pinned state when rewind starts
+  useEffect(() => {
+    if (rewindingNodeId) {
+      // Clear pinned state - this will trigger overlay close via D3 effect
+      setPinnedNodeId(null);
+      activeOverlayNodeRef.current = null;
+    }
+  }, [rewindingNodeId]);
+
   const hasInitializedZoom = useRef(false);
   const prevIsTraversing = useRef(isTraversing);
+  const prevRewindingNodeId = useRef<string | null>(rewindingNodeId);
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
   const lastInteractionTime = useRef<number>(0);
   const prevNodeCount = useRef<number>(0);
   const autoFitIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // Format elapsed time as seconds with 1 decimal
-  const formatElapsedTime = (ms: number): string => {
-    const seconds = ms / 1000;
-    if (seconds < 60) {
-      return `${seconds.toFixed(1)}s`;
-    }
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = seconds % 60;
-    return `${minutes}m ${remainingSeconds.toFixed(1)}s`;
-  };
+  // Track when rewind completes to add a grace period before allowing fit-to-window
+  const rewindCompletedTimeRef = useRef<number>(0);
+  // Track when traversal completes to add a grace period before allowing fit-to-window
+  const traversalCompletedTimeRef = useRef<number>(0);
+  // Track when nodes are added during a rewind (for delayed zoom after node appears)
+  const lastRewindNodeAddedTimeRef = useRef<number>(0);
 
   const sortedFinalizedCodes = useMemo(() => {
     if (codeSortMode === 'default') return finalizedCodes;
@@ -146,18 +158,17 @@ export function GraphViewer({
     return nodes.filter(n => n.id !== 'ROOT').length;
   }, [nodes]);
 
-  // Build a map from node code to reasoning (for tooltip)
-  const nodeReasoningMap = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const decision of decisions) {
-      for (const candidate of decision.candidates) {
-        if (candidate.selected && candidate.reasoning) {
-          map.set(candidate.code, candidate.reasoning);
-        }
+  // Build a set of node IDs that have sevenChrDef children
+  // Used to filter out "children batch" for nodes where sevenChrDef IS the children batch
+  const nodesWithSevenChrDefChildren = useMemo(() => {
+    const set = new Set<string>();
+    for (const edge of edges) {
+      if (edge.edge_type === 'lateral' && edge.rule === 'sevenChrDef') {
+        set.add(String(edge.source));
       }
     }
-    return map;
-  }, [decisions]);
+    return set;
+  }, [edges]);
 
   // Zoom control handlers
   const handleZoomIn = useCallback(() => {
@@ -194,7 +205,7 @@ export function GraphViewer({
     const padding = 40;
     const scaleX = (width - padding * 2) / bbox.width;
     const scaleY = (height - padding * 2) / bbox.height;
-    const scale = Math.min(scaleX, scaleY, 1.5);
+    const scale = Math.min(scaleX, scaleY, 1.0);
 
     // Center horizontally, position at top
     const scaledWidth = bbox.width * scale;
@@ -251,14 +262,17 @@ export function GraphViewer({
       autoFitIntervalRef.current = null;
     }
 
-    // During traversal: auto-fit every 3 seconds (responsive)
-    // After traversal: auto-fit every 20 seconds (sparse, less intrusive)
-    const interval = isTraversing ? 3000 : 20000;
-    const idleThreshold = isTraversing ? 3000 : 5000;
+    // During traversal: auto-fit every 10 seconds
+    // After traversal: auto-fit every 30 seconds (sparse, less intrusive)
+    const interval = isTraversing ? 10000 : 30000;
+    const idleThreshold = isTraversing ? 5000 : 10000;
 
     autoFitIntervalRef.current = setInterval(() => {
       const timeSinceInteraction = Date.now() - lastInteractionTime.current;
-      if (timeSinceInteraction >= idleThreshold) {
+      // Don't auto-fit if an overlay is open or during rewind
+      const overlayIsOpen = activeOverlayNodeRef.current !== null || pinnedNodeIdRef.current !== null;
+      const isRewinding = rewindingNodeIdRef.current !== null;
+      if (timeSinceInteraction >= idleThreshold && !overlayIsOpen && !isRewinding) {
         handleFitToWindow();
       }
     }, interval);
@@ -287,13 +301,15 @@ export function GraphViewer({
 
     // Always size SVG to fill container
     svg.attr('width', width).attr('height', height);
+
+    // Clear everything and recreate from scratch each render
     svg.selectAll('*').remove();
+    const g = svg.append('g').attr('class', 'main-group');
 
     // Only render content when traversing or has nodes
-    if (nodes.length === 0 && !isTraversing) return;
-
-    // Create main group for zoom/pan
-    const g = svg.append('g').attr('class', 'main-group');
+    if (nodes.length === 0 && !isTraversing) {
+      return;
+    }
 
     // Add arrow markers
     const defs = svg.append('defs');
@@ -338,12 +354,34 @@ export function GraphViewer({
     // Build adjacency for layout
     const nodeMap = new Map(nodes.map(n => [n.id, n]));
 
+    // Ensure ROOT is in nodeMap for positioning (may be missing during streaming)
+    if (!nodeMap.has('ROOT')) {
+      nodeMap.set('ROOT', {
+        id: 'ROOT',
+        code: 'ROOT',
+        label: 'ICD-10-CM',
+        depth: 0,
+        category: 'root' as const,
+        billable: false,
+      });
+    }
+
     // Build TWO children maps:
     // 1. hierarchyChildren: Only hierarchy edges - used for tree positioning in Phase 2
     // 2. allChildren: All edges - used for subtree width calculation and positioning children of lateral nodes
     const hierarchyChildren = new Map<string, string[]>();
     const allChildren = new Map<string, string[]>();
 
+    // Create finalized codes set for position calculation
+    const finalizedCodesSet = new Set(finalizedCodes);
+
+    // Track which nodes have a hierarchy parent (for orphan detection)
+    const hasHierarchyParent = new Set<string>();
+
+    // First pass: build maps from hierarchy edges
+    // IMPORTANT: For ROOT edges, we relax the sourceNode check since ROOT may not be
+    // in the nodes array during streaming (it's added via STATE_SNAPSHOT but may not
+    // have propagated yet when edges arrive via STATE_DELTA)
     edges.forEach(e => {
       const sourceId = String(e.source);
       const targetId = String(e.target);
@@ -352,14 +390,69 @@ export function GraphViewer({
       if (!allChildren.has(sourceId)) allChildren.set(sourceId, []);
       allChildren.get(sourceId)!.push(targetId);
 
-      // Hierarchy edges AND sevenChrDef edges go into hierarchyChildren
-      // (sevenChrDef is lateral type but represents vertical parent-child relationship)
+      // Only hierarchy edges go into hierarchyChildren
+      // We enforce a strict depth check (source.depth < target.depth) to break cycles needed for the tree layout.
+      // This ensures that "back-edges" or "cross-edges" don't confuse the layout algorithm.
       const isHierarchy = e.edge_type === 'hierarchy';
-      const isSevenChrDef = e.edge_type === 'lateral' && e.rule === 'sevenChrDef';
+      const sourceNode = nodeMap.get(sourceId);
+      const targetNode = nodeMap.get(targetId);
 
-      if (isHierarchy || isSevenChrDef) {
-        if (!hierarchyChildren.has(sourceId)) hierarchyChildren.set(sourceId, []);
+      // Special handling for ROOT edges: ROOT has depth 0, so any chapter (depth 1+) is deeper
+      // We don't require sourceNode to exist for ROOT since it may not be in nodeMap during streaming
+      if (isHierarchy && sourceId === 'ROOT' && targetNode) {
+        const targetDepth = targetNode.depth || 0;
+        if (targetDepth > 0) {  // Any non-ROOT node is a valid child of ROOT
+          if (!hierarchyChildren.has('ROOT')) hierarchyChildren.set('ROOT', []);
+          hierarchyChildren.get('ROOT')!.push(targetId);
+          hasHierarchyParent.add(targetId);
+        }
+      } else if (isHierarchy && sourceNode && targetNode) {
+        // Only treat as structural hierarchy if moving "down" the tree (deeper)
+        // If depth is missing/zero (e.g. ROOT), treat it as lower depth
+        const sourceDepth = sourceNode.depth || 0;
+        const targetDepth = targetNode.depth || 0;
+
+        // Break cycles:
+        // 1. Strictly favor deeper targets (parent -> child)
+        // 2. If same depth (sibling/circular dependency), use ID tie-breaker to pick ONE direction
+        //    This ensures we don't remove BOTH edges in a tight cycle (A<->B), which would orphan one node.
+        const isDeeper = targetDepth > sourceDepth;
+        const isSameDepthAndOrdered = targetDepth === sourceDepth && sourceId < targetId;
+
+        if (isDeeper || isSameDepthAndOrdered) {
+          if (!hierarchyChildren.has(sourceId)) hierarchyChildren.set(sourceId, []);
+          hierarchyChildren.get(sourceId)!.push(targetId);
+          hasHierarchyParent.add(targetId);
+        }
+      }
+    });
+
+    // Track nodes that are "orphan rescued" via lateral edges
+    // These should be positioned as hierarchy children, not as lateral targets
+    const orphanRescuedNodes = new Set<string>();
+
+    // Second pass: include lateral edges that connect orphaned subtrees
+    // These are lateral edges (codeFirst, codeAlso, useAdditionalCode) where the target
+    // has no hierarchy parent and would otherwise be disconnected from the tree
+    edges.forEach(e => {
+      const sourceId = String(e.source);
+      const targetId = String(e.target);
+
+      // Only process lateral edges (not sevenChrDef which is handled separately)
+      const isLateral = e.edge_type === 'lateral' && e.rule !== 'sevenChrDef';
+      if (!isLateral) return;
+
+      // If target already has a hierarchy parent, skip (it's already positioned)
+      if (hasHierarchyParent.has(targetId)) return;
+
+      // For orphaned subtrees, always add the lateral edge regardless of depth ordering
+      // This rescues subtrees that are connected via lateral links (codeFirst, codeAlso, etc.)
+      // We don't use alphabetical ordering here because the whole point is to rescue orphans
+      if (!hierarchyChildren.has(sourceId)) hierarchyChildren.set(sourceId, []);
+      if (!hierarchyChildren.get(sourceId)!.includes(targetId)) {
         hierarchyChildren.get(sourceId)!.push(targetId);
+        hasHierarchyParent.add(targetId);
+        orphanRescuedNodes.add(targetId);  // Track for hierarchyParent mapping
       }
     });
 
@@ -379,31 +472,29 @@ export function GraphViewer({
       sevenChrDefParentMap.set(String(e.target), String(e.source));
     });
 
-    // Helper to get ancestor label for activator nodes
-    const getActivatorAncestorLabel = (nodeId: string): string => {
-      const parentId = sevenChrDefParentMap.get(nodeId);
-      if (!parentId) return '';
+    // Helper to get the display code for a node
+    // For sevenChrDef targets, combines parent code + 7th character (e.g., "T36.1X5" + "A" = "T36.1X5A")
+    const getDisplayCode = (node: GraphNode): string => {
+      // If this is a depth-7 finalized node, the code is already complete
+      // Backend now sends full code (e.g., "T36.1X5A") in both id and code fields
+      if (node.depth === 7) {
+        return node.code;
+      }
 
-      // Traverse up to find non-placeholder ancestor
-      let currentId = parentId;
-      while (currentId && currentId !== 'ROOT') {
-        const node = nodeMap.get(currentId);
-        if (node && node.category !== 'placeholder') {
-          return node.label;
-        }
-        // Find parent via hierarchy edges
-        const parentEdge = hierarchyEdges.find(e => String(e.target) === currentId);
-        if (parentEdge) {
-          currentId = String(parentEdge.source);
-        } else {
-          break;
+      // For older-style nodes where code might be just the 7th char
+      const parentId = sevenChrDefParentMap.get(node.id);
+      if (parentId) {
+        const parentNode = nodeMap.get(parentId);
+        if (parentNode) {
+          // Combine parent code with 7th character
+          return parentNode.code + node.code;
         }
       }
-      return '';
+      return node.code;
     };
 
     // Calculate positions using subtree width algorithm (from reference)
-    const positions = calculatePositions(nodes, hierarchyChildren, allChildren, width, nodeMap, edges.filter(e => e.edge_type === 'lateral'), NODE_WIDTH, NODE_HEIGHT, LEVEL_HEIGHT);
+    const positions = calculatePositions(nodes, hierarchyChildren, allChildren, width, nodeMap, edges.filter(e => e.edge_type === 'lateral'), NODE_WIDTH, NODE_HEIGHT, LEVEL_HEIGHT, finalizedCodesSet, orphanRescuedNodes);
 
     // Create lateral edges group FIRST (rendered behind everything else)
     const lateralEdgesGroup = g.append('g').attr('class', 'lateral-edges');
@@ -483,7 +574,6 @@ export function GraphViewer({
 
     // Create nodes group
     const nodesGroup = g.append('g').attr('class', 'nodes');
-    const finalizedCodesSet = new Set(finalizedCodes);
 
     // Only show ROOT node when there are child nodes to connect to
     const hasNonRootNodes = nodes.some(n => n.id !== 'ROOT');
@@ -519,977 +609,99 @@ export function GraphViewer({
     // Create expanded overlay group (rendered on top of everything)
     const expandedOverlayGroup = g.append('g').attr('class', 'expanded-overlay');
 
-    // Helper function to show expanded node overlay
-    const showExpandedNode = (d: GraphNode, _nodeGroup: SVGGElement) => {
-      // Remove any existing expanded overlays
-      expandedOverlayGroup.selectAll('*').remove();
-
-      const pos = positions.get(d.id);
-      if (!pos) return;
-
-      // Check if this is a traversed benchmark node with decisions
-      const benchmarkNode = d as BenchmarkGraphNode;
-      const isTraversedInBenchmark = benchmarkMode &&
-        benchmarkNode.benchmarkStatus &&
-        benchmarkNode.benchmarkStatus !== 'expected';
-
-      // Find ALL decisions for this node (multiple batches possible)
-      // Works for BOTH benchmark mode (traversed nodes) and traverse mode
-      const nodeDecisionsRaw = decisions
-        ? decisions.filter(dec => dec.current_node === d.id)
-        : [];
-
-      // Deduplicate panels with identical batch type + selected codes
-      // (Can happen when multiple trajectories converge on the same node due to node deduplication)
-      const nodeDecisions = nodeDecisionsRaw.reduce((acc, dec) => {
-        // Normalize batch label for deduplication
-        const normalizedLabel = normalizeBatchName(dec.current_label);
-        // Normalize selected codes (strip to alphanumeric + dots only, sort, join)
-        const normalizedCodes = (dec.selected_codes || [])
-          .map(c => c.replace(/[^A-Za-z0-9.]/g, ''))
-          .sort()
-          .join(',');
-        const key = `${normalizedLabel}:${normalizedCodes}`;
-        if (!acc.seen.has(key)) {
-          acc.seen.add(key);
-          acc.result.push(dec);
-        }
-        return acc;
-      }, { seen: new Set<string>(), result: [] as typeof nodeDecisionsRaw }).result
-        // Filter out children batches for nodes that can't have children selections
-        .filter(dec => {
-          // Use centralized helper for decision filtering
-          if (!shouldIncludeDecision(dec, d, finalizedCodesSet)) {
-            return false;
-          }
-          // Keep all batches (including empty selections) to allow Add Feedback
-          return true;
-        });
-
-      // Determine if we should show batch panels
-      // Show for: benchmark traversed nodes with decisions, OR traverse mode with decisions
-      const shouldShowBatchPanels = (isTraversedInBenchmark && nodeDecisions.length > 0) ||
-        (!benchmarkMode && nodeDecisions.length > 0);
-
-      // If we have decisions, show batch panels (side-by-side for parallel batches)
-      if (shouldShowBatchPanels) {
-        const panelWidth = 340;
-        const panelGap = 16;
-        const padding = 14;
-        const lineHeight = 15;
-        const maxPanels = Math.min(nodeDecisions.length, 3);
-        const maxCharsPerLine = 45;
-
-        // Get the full label for the parent node
-        let fullLabel = d.label;
-        if (d.category === 'activator' || d.depth === 7) {
-          const ancestorLabel = getActivatorAncestorLabel(d.id);
-          const labelValue = d.label.includes(': ') ? d.label.split(': ').slice(1).join(': ') : d.label;
-          if (ancestorLabel) {
-            fullLabel = `${ancestorLabel}, ${labelValue}`;
-          }
-        }
-
-        const billableText = d.billable ? '(Billable)' : '(Non-Billable)';
-
-        // First pass: calculate content heights for all panels to find the max
-        const panelData: {
-          decision: DecisionPoint;
-          batchName: string;
-          labelLines: string[];
-          selectedCandidates: typeof nodeDecisions[0]['candidates'];
-          selectedItems: { code: string; labelLines: string[] }[];
-          reasoningLines: string[];
-          showBatch: boolean;
-          contentHeight: number;
-        }[] = [];
-
-        nodeDecisions.slice(0, maxPanels).forEach((decision) => {
-          const batchName = normalizeBatchName(decision.current_label);
-          const labelLines = wrapText(fullLabel, maxCharsPerLine);
-          const selectedCandidates = decision.candidates.filter(c => c.selected);
-
-          // Determine if batch section should be shown (use centralized helper)
-          const hasSelections = selectedCandidates.length > 0;
-          const showBatch = shouldShowBatch(batchName, d, finalizedCodesSet);
-
-          // For each selected candidate, wrap the label separately
-          const selectedItems: { code: string; labelLines: string[] }[] = [];
-          selectedCandidates.forEach((candidate) => {
-            // Wrap just the label (code shown separately)
-            const labelMaxChars = maxCharsPerLine - 4; // Account for indentation
-            selectedItems.push({
-              code: candidate.code,
-              labelLines: wrapText(candidate.label, labelMaxChars),
-            });
-          });
-
-          // Wrap reasoning
-          const firstSelected = selectedCandidates[0];
-          const reasoningLines = firstSelected?.reasoning
-            ? wrapText(firstSelected.reasoning, maxCharsPerLine - 2)
-            : [];
-
-          // Calculate content height for this panel
-          let contentHeight = padding; // Top padding
-          contentHeight += 16; // Code + (Billable) row
-          contentHeight += 8; // Gap after code line
-          contentHeight += labelLines.length * lineHeight; // Label lines
-
-          // Batch section (if shown)
-          if (showBatch) {
-            contentHeight += 18; // Gap + batch name header
-            contentHeight += 6; // Gap after header
-
-            if (hasSelections) {
-              // Selected codes with labels
-              selectedItems.forEach((item, idx) => {
-                contentHeight += lineHeight; // Code line
-                contentHeight += item.labelLines.length * lineHeight; // Label lines
-                if (idx < selectedItems.length - 1) {
-                  contentHeight += 6; // Gap between items
-                }
-              });
-            } else {
-              // "None Selected" text
-              contentHeight += lineHeight;
-            }
-
-            // Reasoning section
-            if (reasoningLines.length > 0) {
-              contentHeight += 16; // Gap before "Reasoning:" header
-              contentHeight += lineHeight; // "Reasoning:" header
-              contentHeight += reasoningLines.length * lineHeight; // Reasoning lines
-            }
-
-            // Add Feedback textarea + button (TRAVERSE tab only)
-            if (allowRewind && !benchmarkMode && d.id !== 'ROOT' && onNodeRewindClick) {
-              contentHeight += 12; // Gap before textarea
-              contentHeight += 50; // Textarea height (2 lines)
-              contentHeight += 8; // Gap between textarea and button
-              contentHeight += 26; // Button height
-            }
-          }
-
-          contentHeight += padding; // Bottom padding
-
-          panelData.push({
-            decision,
-            batchName,
-            labelLines,
-            selectedCandidates,
-            selectedItems,
-            reasoningLines,
-            showBatch,
-            contentHeight,
-          });
-        });
-
-        // Use the maximum height across all panels for uniform appearance
-        const panelHeight = Math.max(...panelData.map(p => p.contentHeight), 140);
-
-        const totalWidth = (maxPanels * panelWidth) + ((maxPanels - 1) * panelGap);
-        const startX = pos.x - totalWidth / 2;
-        const startY = pos.y - panelHeight / 2;
-
-        // Second pass: render panels with equal heights
-        panelData.forEach((data, idx) => {
-          const panelX = startX + idx * (panelWidth + panelGap);
-
-          // Create panel group
-          const panel = expandedOverlayGroup.append('g')
-            .attr('class', 'batch-panel')
-            .attr('transform', `translate(${panelX}, ${startY})`)
-            .on('click', (event: MouseEvent) => event.stopPropagation());
-
-          // Panel background with uniform height
-          panel.append('rect')
-            .attr('width', panelWidth)
-            .attr('height', panelHeight)
-            .attr('rx', 6)
-            .attr('fill', 'rgba(255, 255, 255, 0.98)')
-            .attr('stroke', '#7c3aed')
-            .attr('stroke-width', 2)
-            .attr('filter', 'drop-shadow(0 2px 8px rgba(0, 0, 0, 0.15))');
-
-          let yPos = padding + 14;
-
-          // Line 1: <Parent Code> (Billable/Non-Billable)
-          const codeLineText = panel.append('text')
-            .attr('x', padding)
-            .attr('y', yPos)
-            .attr('font-size', 13);
-
-          codeLineText.append('tspan')
-            .attr('font-weight', 700)
-            .attr('font-family', 'ui-monospace, monospace')
-            .attr('fill', '#0f172a')
-            .text(d.code);
-
-          codeLineText.append('tspan')
-            .attr('font-weight', 500)
-            .attr('fill', d.billable ? '#15803d' : '#64748b')
-            .text(` ${billableText}`);
-
-          // Parent label (wrapped, complete)
-          yPos += 10;
-          data.labelLines.forEach((line) => {
-            yPos += lineHeight;
-            panel.append('text')
-              .attr('x', padding)
-              .attr('y', yPos)
-              .attr('font-size', 11)
-              .attr('fill', '#334155')
-              .text(line);
-          });
-
-          // Batch section (conditional based on node type)
-          if (data.showBatch) {
-            // Batch name header (e.g., "children:", "codeFirst:", etc.)
-            yPos += 20;
-            panel.append('text')
-              .attr('x', padding)
-              .attr('y', yPos)
-              .attr('font-size', 11)
-              .attr('font-weight', 600)
-              .attr('fill', '#7c3aed')
-              .text(`${data.batchName}:`);
-
-            // Selected codes with labels, or "None Selected"
-            yPos += 6;
-            if (data.selectedItems.length > 0) {
-              data.selectedItems.forEach((item, itemIdx) => {
-                // Code on its own line (bold, monospace)
-                yPos += lineHeight;
-                panel.append('text')
-                  .attr('x', padding + 8)
-                  .attr('y', yPos)
-                  .attr('font-size', 11)
-                  .attr('font-weight', 600)
-                  .attr('font-family', 'ui-monospace, monospace')
-                  .attr('fill', '#1e293b')
-                  .text(item.code);
-
-                // Label lines (wrapped, indented)
-                item.labelLines.forEach((line) => {
-                  yPos += lineHeight;
-                  panel.append('text')
-                    .attr('x', padding + 16)
-                    .attr('y', yPos)
-                    .attr('font-size', 10)
-                    .attr('fill', '#475569')
-                    .text(line);
-                });
-
-                // Gap between selected items
-                if (itemIdx < data.selectedItems.length - 1) {
-                  yPos += 4;
-                }
-              });
-            } else {
-              // No selections made for this batch
-              yPos += lineHeight;
-              panel.append('text')
-                .attr('x', padding + 8)
-                .attr('y', yPos)
-                .attr('font-size', 11)
-                .attr('font-style', 'italic')
-                .attr('fill', '#94a3b8')
-                .text('None Selected');
-            }
-
-            // Reasoning section with header
-            if (data.reasoningLines.length > 0) {
-              yPos += 18;
-              panel.append('text')
-                .attr('x', padding)
-                .attr('y', yPos)
-                .attr('font-size', 11)
-                .attr('font-weight', 600)
-                .attr('fill', '#64748b')
-                .text('Reasoning:');
-
-              data.reasoningLines.forEach((line) => {
-                yPos += lineHeight;
-                panel.append('text')
-                  .attr('x', padding + 8)
-                  .attr('y', yPos)
-                  .attr('font-size', 10)
-                  .attr('font-style', 'italic')
-                  .attr('fill', '#64748b')
-                  .text(line);
-              });
-            }
-
-            // Add Feedback textarea + button for TRAVERSE tab (inside each panel)
-            if (allowRewind && !benchmarkMode && d.id !== 'ROOT' && onNodeRewindClick) {
-              const textareaWidth = panelWidth - padding * 2;
-              const textareaHeight = 50;
-              const buttonWidth = 100;
-              const buttonHeight = 24;
-
-              // Construct batchId from decision
-              const batchType = data.decision.current_label.match(/^(\w+)\s+batch$/)?.[1] || 'children';
-              const batchId = `${d.id}|${batchType}`;
-              const textareaId = `feedback-textarea-${d.id}-${batchType}`;
-
-              // Gap before textarea
-              yPos += 12;
-
-              // Textarea using foreignObject
-              const fo = panel.append('foreignObject')
-                .attr('x', padding)
-                .attr('y', yPos)
-                .attr('width', textareaWidth)
-                .attr('height', textareaHeight);
-
-              fo.append('xhtml:textarea')
-                .attr('id', textareaId)
-                .attr('placeholder', 'Enter feedback for this batch...')
-                .style('width', '100%')
-                .style('height', '100%')
-                .style('resize', 'none')
-                .style('background-color', '#f8fafc')
-                .style('border', '1px solid #d1d5db')
-                .style('border-radius', '4px')
-                .style('padding', '6px 8px')
-                .style('font-size', '11px')
-                .style('font-family', 'inherit')
-                .style('line-height', '1.4')
-                .style('overflow-y', 'auto')
-                .style('box-sizing', 'border-box')
-                .on('click', (event: MouseEvent) => event.stopPropagation())
-                .on('mousedown', (event: MouseEvent) => event.stopPropagation());
-
-              yPos += textareaHeight + 8; // Textarea height + gap before button
-
-              const feedbackBtn = panel.append('g')
-                .attr('class', 'feedback-button')
-                .attr('transform', `translate(${padding}, ${yPos})`)
-                .style('cursor', 'pointer')
-                .on('click', (event: MouseEvent) => {
-                  event.stopPropagation();
-                  // Get textarea value
-                  const textareaEl = document.getElementById(textareaId) as HTMLTextAreaElement | null;
-                  const feedbackText = textareaEl?.value || '';
-                  onNodeRewindClick(d.id, batchId, feedbackText);
-                });
-
-              feedbackBtn.append('rect')
-                .attr('width', buttonWidth)
-                .attr('height', buttonHeight)
-                .attr('rx', 4)
-                .attr('fill', '#7c3aed');
-
-              feedbackBtn.append('text')
-                .attr('x', buttonWidth / 2)
-                .attr('y', buttonHeight / 2 + 4)
-                .attr('text-anchor', 'middle')
-                .attr('fill', '#fff')
-                .attr('font-size', 11)
-                .attr('font-weight', 600)
-                .text('Add Feedback');
-
-              // Hover effect
-              feedbackBtn.on('mouseenter', function () {
-                d3.select(this).select('rect').attr('fill', '#6d28d9');
-              });
-              feedbackBtn.on('mouseleave', function () {
-                d3.select(this).select('rect').attr('fill', '#7c3aed');
-              });
-            }
-          }
-        });
-
-        // Show indicator if more panels exist
-        if (nodeDecisions.length > maxPanels) {
-          const indicatorX = startX + totalWidth + 10;
-          expandedOverlayGroup.append('text')
-            .attr('x', indicatorX)
-            .attr('y', startY + panelHeight / 2)
-            .attr('font-size', 12)
-            .attr('fill', '#7c3aed')
-            .attr('font-weight', 600)
-            .text(`+${nodeDecisions.length - maxPanels}`);
-        }
-
-        return; // Don't show regular overlay
-      }
-
-      // === Regular overlay (for non-traversed benchmark nodes or traverse mode) ===
-
-      // Get the full label (for activator nodes, combine with ancestor)
-      let fullLabel = d.label;
-      if (d.category === 'activator' || d.depth === 7) {
-        const ancestorLabel = getActivatorAncestorLabel(d.id);
-        const labelValue = d.label.includes(': ') ? d.label.split(': ').slice(1).join(': ') : d.label;
-        if (ancestorLabel) {
-          fullLabel = `${ancestorLabel}, ${labelValue}`;
-        }
-      }
-
-      // Find decision for this node (traverse mode - show batch info with selected codes)
-      // Use centralized helper to filter out children batches for leaf nodes
-      const nodeDecision = !benchmarkMode && decisions
-        ? decisions.find(dec => {
-          if (dec.current_node !== d.id) return false;
-          return shouldIncludeDecision(dec, d, finalizedCodesSet);
-        })
-        : null;
-
-      // Layout constants
-      const padding = 16;
-      const lineHeight = 15;
-      const maxCharsPerLine = 45;
-
-      // Wrap text for display
-      const labelLines = wrapText(fullLabel, maxCharsPerLine);
-      const billableText = d.billable ? '(Billable)' : '(Non-Billable)';
-
-      // If we have a decision, show the detailed batch format (same as benchmark)
-      if (nodeDecision) {
-        const batchName = normalizeBatchName(nodeDecision.current_label);
-        const selectedCandidates = nodeDecision.candidates.filter(c => c.selected);
-
-        // Prepare selected items with wrapped labels
-        const selectedItems: { code: string; labelLines: string[] }[] = [];
-        selectedCandidates.forEach((candidate) => {
-          selectedItems.push({
-            code: candidate.code,
-            labelLines: wrapText(candidate.label, maxCharsPerLine - 4),
-          });
-        });
-
-        // Wrap reasoning
-        const firstSelected = selectedCandidates[0];
-        const reasoningLines = firstSelected?.reasoning
-          ? wrapText(firstSelected.reasoning, maxCharsPerLine - 2)
-          : [];
-
-        // Calculate content height
-        let contentHeight = padding; // Top padding
-        contentHeight += 16; // Code + (Billable) row
-        contentHeight += 8; // Gap after code line
-        contentHeight += labelLines.length * lineHeight; // Label lines
-        contentHeight += 18; // Gap + batch name header
-        contentHeight += 6; // Gap after header
-
-        // Selected codes with labels
-        selectedItems.forEach((item, idx) => {
-          contentHeight += lineHeight; // Code line
-          contentHeight += item.labelLines.length * lineHeight; // Label lines
-          if (idx < selectedItems.length - 1) {
-            contentHeight += 6; // Gap between items
-          }
-        });
-
-        // Reasoning section
-        if (reasoningLines.length > 0) {
-          contentHeight += 16; // Gap before "Reasoning:" header
-          contentHeight += lineHeight; // "Reasoning:" header
-          contentHeight += reasoningLines.length * lineHeight; // Reasoning lines
-        }
-
-        // Add Feedback textarea + button (TRAVERSE tab only)
-        if (allowRewind && !benchmarkMode && d.id !== 'ROOT' && onNodeRewindClick) {
-          contentHeight += 12; // Gap before textarea
-          contentHeight += 50; // Textarea height (2 lines)
-          contentHeight += 8; // Gap between textarea and button
-          contentHeight += 26; // Button height
-        }
-
-        contentHeight += padding; // Bottom padding
-
-        const overlayWidth = 340;
-        const overlayHeight = Math.max(contentHeight, 140);
-        const overlayX = pos.x - overlayWidth / 2;
-        const overlayY = pos.y - overlayHeight / 2;
-
-        // Determine colors using centralized helper (includes finalizedCodesSet check)
-        const { bgColor, borderColor } = getOverlayColors(d, finalizedCodesSet);
-
-        // Create overlay group
-        const overlay = expandedOverlayGroup.append('g')
-          .attr('class', `expanded-node node-${d.category}`)
-          .attr('transform', `translate(${overlayX}, ${overlayY})`)
-          .on('click', (event: MouseEvent) => event.stopPropagation());
-
-        // Background
-        overlay.append('rect')
-          .attr('class', 'expanded-bg')
-          .attr('width', overlayWidth)
-          .attr('height', overlayHeight)
-          .attr('rx', 6)
-          .attr('ry', 6)
-          .attr('fill', bgColor)
-          .attr('stroke', borderColor)
-          .attr('stroke-width', 2)
-          .attr('filter', 'drop-shadow(0 2px 8px rgba(0, 0, 0, 0.15))');
-
-        let yPos = padding + 14;
-
-        // Line 1: <Parent Code> (Billable/Non-Billable)
-        const codeLineText = overlay.append('text')
-          .attr('x', padding)
-          .attr('y', yPos)
-          .attr('font-size', 13);
-
-        codeLineText.append('tspan')
-          .attr('font-weight', 700)
-          .attr('font-family', 'ui-monospace, monospace')
-          .attr('fill', '#0f172a')
-          .text(d.code);
-
-        codeLineText.append('tspan')
-          .attr('font-weight', 500)
-          .attr('fill', d.billable ? '#15803d' : '#64748b')
-          .text(` ${billableText}`);
-
-        // Parent label (wrapped, complete)
-        yPos += 10;
-        labelLines.forEach((line) => {
-          yPos += lineHeight;
-          overlay.append('text')
-            .attr('x', padding)
-            .attr('y', yPos)
-            .attr('font-size', 11)
-            .attr('fill', '#334155')
-            .text(line);
-        });
-
-        // Batch name header
-        yPos += 20;
-        overlay.append('text')
-          .attr('x', padding)
-          .attr('y', yPos)
-          .attr('font-size', 11)
-          .attr('font-weight', 600)
-          .attr('fill', '#7c3aed')
-          .text(`${batchName}:`);
-
-        // Selected codes with labels
-        yPos += 6;
-        selectedItems.forEach((item, itemIdx) => {
-          // Code on its own line
-          yPos += lineHeight;
-          overlay.append('text')
-            .attr('x', padding + 8)
-            .attr('y', yPos)
-            .attr('font-size', 11)
-            .attr('font-weight', 600)
-            .attr('font-family', 'ui-monospace, monospace')
-            .attr('fill', '#1e293b')
-            .text(item.code);
-
-          // Label lines (wrapped, indented)
-          item.labelLines.forEach((line) => {
-            yPos += lineHeight;
-            overlay.append('text')
-              .attr('x', padding + 16)
-              .attr('y', yPos)
-              .attr('font-size', 10)
-              .attr('fill', '#475569')
-              .text(line);
-          });
-
-          // Gap between selected items
-          if (itemIdx < selectedItems.length - 1) {
-            yPos += 4;
-          }
-        });
-
-        // Reasoning section with header
-        if (reasoningLines.length > 0) {
-          yPos += 18;
-          overlay.append('text')
-            .attr('x', padding)
-            .attr('y', yPos)
-            .attr('font-size', 11)
-            .attr('font-weight', 600)
-            .attr('fill', '#64748b')
-            .text('Reasoning:');
-
-          reasoningLines.forEach((line) => {
-            yPos += lineHeight;
-            overlay.append('text')
-              .attr('x', padding + 8)
-              .attr('y', yPos)
-              .attr('font-size', 10)
-              .attr('font-style', 'italic')
-              .attr('fill', '#64748b')
-              .text(line);
-          });
-        }
-
-        // Add Feedback textarea + button for TRAVERSE tab (below reasoning)
-        if (allowRewind && !benchmarkMode && d.id !== 'ROOT' && onNodeRewindClick) {
-          const textareaWidth = overlayWidth - padding * 2;
-          const textareaHeight = 50;
-          const buttonWidth = 100;
-          const buttonHeight = 24;
-
-          // Construct batchId from decision
-          const batchType = nodeDecision.current_label.match(/^(\w+)\s+batch$/)?.[1] || 'children';
-          const batchId = `${d.id}|${batchType}`;
-          const textareaId = `feedback-textarea-single-${d.id}-${batchType}`;
-
-          // Gap before textarea
-          yPos += 12;
-
-          // Textarea using foreignObject
-          const fo = overlay.append('foreignObject')
-            .attr('x', padding)
-            .attr('y', yPos)
-            .attr('width', textareaWidth)
-            .attr('height', textareaHeight);
-
-          fo.append('xhtml:textarea')
-            .attr('id', textareaId)
-            .attr('placeholder', 'Enter feedback for this batch...')
-            .style('width', '100%')
-            .style('height', '100%')
-            .style('resize', 'none')
-            .style('background-color', '#f8fafc')
-            .style('border', '1px solid #d1d5db')
-            .style('border-radius', '4px')
-            .style('padding', '6px 8px')
-            .style('font-size', '11px')
-            .style('font-family', 'inherit')
-            .style('line-height', '1.4')
-            .style('overflow-y', 'auto')
-            .style('box-sizing', 'border-box')
-            .on('click', (event: MouseEvent) => event.stopPropagation())
-            .on('mousedown', (event: MouseEvent) => event.stopPropagation());
-
-          yPos += textareaHeight + 8; // Textarea height + gap before button
-
-          const feedbackBtn = overlay.append('g')
-            .attr('class', 'feedback-button')
-            .attr('transform', `translate(${padding}, ${yPos})`)
-            .style('cursor', 'pointer')
-            .on('click', (event: MouseEvent) => {
-              event.stopPropagation();
-              // Get textarea value
-              const textareaEl = document.getElementById(textareaId) as HTMLTextAreaElement | null;
-              const feedbackText = textareaEl?.value || '';
-              onNodeRewindClick(d.id, batchId, feedbackText);
-            });
-
-          feedbackBtn.append('rect')
-            .attr('width', buttonWidth)
-            .attr('height', buttonHeight)
-            .attr('rx', 4)
-            .attr('fill', '#7c3aed');
-
-          feedbackBtn.append('text')
-            .attr('x', buttonWidth / 2)
-            .attr('y', buttonHeight / 2 + 4)
-            .attr('text-anchor', 'middle')
-            .attr('fill', '#fff')
-            .attr('font-size', 11)
-            .attr('font-weight', 600)
-            .text('Add Feedback');
-
-          // Hover effect
-          feedbackBtn.on('mouseenter', function () {
-            d3.select(this).select('rect').attr('fill', '#6d28d9');
-          });
-          feedbackBtn.on('mouseleave', function () {
-            d3.select(this).select('rect').attr('fill', '#7c3aed');
-          });
-        }
-
-        return; // Don't continue to basic overlay
-      }
-
-      // === Benchmark Expected overlay (expected nodes not yet traversed) ===
-      // Shows: code, billable, label, checkered flag if finalized leaf
-      // No children data (expected graph doesn't show traversal-discovered children)
-      const benchmarkExpected = benchmarkMode &&
-        (d as BenchmarkGraphNode).benchmarkStatus === 'expected';
-
-      if (benchmarkExpected) {
-        const isExpectedLeaf = expectedLeaves.has(d.id);
-
-        // Calculate content dimensions (no children section)
-        const codeText = d.code;
-        const longestLabelLine = labelLines.reduce((a, b) => a.length > b.length ? a : b, '');
-        const estimatedCodeWidth = codeText.length * 11 + 100;
-        const estimatedLabelWidth = longestLabelLine.length * 8;
-        const minWidth = 280;
-        const maxWidth = 420;
-        const overlayWidth = Math.min(maxWidth, Math.max(minWidth, Math.max(estimatedCodeWidth, estimatedLabelWidth) + padding * 2));
-
-        // Calculate height (no children, but may have flag)
-        let contentHeight = padding;
-        contentHeight += 18; // Code line
-        contentHeight += 10; // Gap after code
-        contentHeight += labelLines.length * lineHeight; // Label lines
-        if (isExpectedLeaf) {
-          contentHeight += 22; // Gap + checkered flag row
-        }
-        contentHeight += padding;
-        const overlayHeight = contentHeight;
-
-        const overlayX = pos.x - overlayWidth / 2;
-        const overlayY = pos.y - overlayHeight / 2;
-
-        // Black outline, white background (expected/not-yet-traversed style)
-        const bgColor = 'rgba(255, 255, 255, 0.98)';
-        const borderColor = '#1e293b';
-
-        // Create overlay group
-        const overlay = expandedOverlayGroup.append('g')
-          .attr('class', `expanded-node node-${d.category}`)
-          .attr('transform', `translate(${overlayX}, ${overlayY})`)
-          .on('click', (event: MouseEvent) => event.stopPropagation());
-
-        // Background
-        overlay.append('rect')
-          .attr('class', 'expanded-bg')
-          .attr('width', overlayWidth)
-          .attr('height', overlayHeight)
-          .attr('rx', 6)
-          .attr('ry', 6)
-          .attr('fill', bgColor)
-          .attr('stroke', borderColor)
-          .attr('stroke-width', 2)
-          .attr('filter', 'drop-shadow(0 2px 8px rgba(0, 0, 0, 0.15))');
-
-        let yPos = padding + 14;
-
-        // Line 1: <Code> (Billable/Non-Billable)
-        const codeLineText = overlay.append('text')
-          .attr('x', padding)
-          .attr('y', yPos)
-          .attr('font-size', 13);
-
-        codeLineText.append('tspan')
-          .attr('font-weight', 700)
-          .attr('font-family', 'ui-monospace, monospace')
-          .attr('fill', '#0f172a')
-          .text(codeText);
-
-        codeLineText.append('tspan')
-          .attr('font-weight', 500)
-          .attr('fill', d.billable ? '#15803d' : '#64748b')
-          .text(` ${billableText}`);
-
-        // Label lines
-        yPos += 10;
-        labelLines.forEach((line) => {
-          yPos += lineHeight;
-          overlay.append('text')
-            .attr('x', padding)
-            .attr('y', yPos)
-            .attr('font-size', 11)
-            .attr('fill', '#334155')
-            .text(line);
-        });
-
-        // Checkered flag for expected leaves
-        if (isExpectedLeaf) {
-          yPos += 20;
-          overlay.append('text')
-            .attr('x', padding)
-            .attr('y', yPos)
-            .attr('font-size', 14)
-            .text('🏁 Expected Finalized');
-        }
-
-        return; // Don't continue to basic overlay
-      }
-
-      // === Basic overlay (no decision data - show code, label, children) ===
-
-      // Get children codes for "Children:" section
-      const childIds = allChildren.get(d.id) || [];
-      const nextCodes: { code: string; rule?: string }[] = [];
-      for (const childId of childIds) {
-        const childNode = nodeMap.get(childId);
-        if (childNode) {
-          const lateralEdge = [...sevenChrDefEdges, ...otherLateralEdges].find(
-            e => String(e.source) === d.id && String(e.target) === childId
-          );
-          nextCodes.push({ code: childNode.code, rule: lateralEdge?.rule ?? undefined });
-        }
-      }
-
-      // Calculate content dimensions
-      const codeText = d.code;
-
-      const longestLabelLine = labelLines.reduce((a, b) => a.length > b.length ? a : b, '');
-      const estimatedCodeWidth = codeText.length * 11 + 100;
-      const estimatedLabelWidth = longestLabelLine.length * 8;
-      const minWidth = 280;
-      const maxWidth = 420;
-      const overlayWidth = Math.min(maxWidth, Math.max(minWidth, Math.max(estimatedCodeWidth, estimatedLabelWidth) + padding * 2));
-
-      // Calculate height
-      let contentHeight = padding;
-      contentHeight += 18; // Code line
-      contentHeight += 10; // Gap after code
-      contentHeight += labelLines.length * lineHeight; // Label lines
-      if (nextCodes.length > 0) {
-        contentHeight += 16; // Gap + header
-        contentHeight += Math.min(nextCodes.length, 4) * lineHeight; // Children items
-        if (nextCodes.length > 4) contentHeight += lineHeight; // "+N more"
-      }
-      contentHeight += padding;
-      const overlayHeight = contentHeight;
-
-      const overlayX = pos.x - overlayWidth / 2;
-      const overlayY = pos.y - overlayHeight / 2;
-
-      // Determine colors using centralized helper (includes finalizedCodesSet check)
-      const { bgColor, borderColor } = getOverlayColors(d, finalizedCodesSet);
-
-      // Create overlay group
-      const overlay = expandedOverlayGroup.append('g')
-        .attr('class', `expanded-node node-${d.category}`)
-        .attr('transform', `translate(${overlayX}, ${overlayY})`)
-        .on('click', (event: MouseEvent) => event.stopPropagation());
-
-      // Background
-      overlay.append('rect')
-        .attr('class', 'expanded-bg')
-        .attr('width', overlayWidth)
-        .attr('height', overlayHeight)
-        .attr('rx', 6)
-        .attr('ry', 6)
-        .attr('fill', bgColor)
-        .attr('stroke', borderColor)
-        .attr('stroke-width', 2)
-        .attr('filter', 'drop-shadow(0 2px 8px rgba(0, 0, 0, 0.15))');
-
-      let yPos = padding + 14;
-
-      // Line 1: <Code> (Billable/Non-Billable)
-      const codeLineText = overlay.append('text')
-        .attr('x', padding)
-        .attr('y', yPos)
-        .attr('font-size', 13);
-
-      codeLineText.append('tspan')
-        .attr('font-weight', 700)
-        .attr('font-family', 'ui-monospace, monospace')
-        .attr('fill', '#0f172a')
-        .text(codeText);
-
-      codeLineText.append('tspan')
-        .attr('font-weight', 500)
-        .attr('fill', d.billable ? '#15803d' : '#64748b')
-        .text(` ${billableText}`);
-
-      // Label lines (wrapped, complete)
-      yPos += 10;
-      labelLines.forEach((line) => {
-        yPos += lineHeight;
-        overlay.append('text')
-          .attr('x', padding)
-          .attr('y', yPos)
-          .attr('font-size', 11)
-          .attr('fill', '#334155')
-          .text(line);
-      });
-
-      // Children codes section
-      if (nextCodes.length > 0) {
-        yPos += 18;
-        overlay.append('text')
-          .attr('x', padding)
-          .attr('y', yPos)
-          .attr('font-size', 11)
-          .attr('font-weight', 600)
-          .attr('fill', '#64748b')
-          .text('Children:');
-
-        const displayCount = Math.min(nextCodes.length, 4);
-        nextCodes.slice(0, displayCount).forEach((nc) => {
-          yPos += lineHeight;
-          const nextText = overlay.append('text')
-            .attr('x', padding + 8)
-            .attr('y', yPos)
-            .attr('font-size', 11)
-            .attr('fill', '#475569');
-
-          nextText.append('tspan').text(nc.code);
-          if (nc.rule) {
-            nextText.append('tspan')
-              .attr('fill', '#ea580c')
-              .attr('font-weight', 500)
-              .text(` (${nc.rule})`);
-          }
-        });
-
-        if (nextCodes.length > 4) {
-          yPos += lineHeight;
-          overlay.append('text')
-            .attr('x', padding + 8)
-            .attr('y', yPos)
-            .attr('font-size', 11)
-            .attr('fill', '#94a3b8')
-            .attr('font-style', 'italic')
-            .text(`+${nextCodes.length - 4} more...`);
-        }
-      }
-    };
-
     // Helper to hide expanded overlay
     const hideExpandedNode = () => {
       expandedOverlayGroup.selectAll('*').remove();
+      activeOverlayNodeRef.current = null;
     };
 
-    // Render non-ROOT nodes
-    const nodeGroups = nodesGroup.selectAll('.node:not(.node-root)')
-      .data(nodes.filter(n => n.id !== 'ROOT'))
+    // Helper to cancel any pending show timeout
+    const cancelShowTimeout = () => {
+      if (showTimeoutRef.current) {
+        clearTimeout(showTimeoutRef.current);
+        showTimeoutRef.current = null;
+      }
+    };
+
+    // Helper to cancel any pending hide timeout
+    const cancelHideTimeout = () => {
+      if (hideTimeoutRef.current) {
+        clearTimeout(hideTimeoutRef.current);
+        hideTimeoutRef.current = null;
+      }
+    };
+
+    // Build overlay context for the extracted renderer
+    const overlayContext: OverlayContext = {
+      overlayGroup: expandedOverlayGroup,
+      positions,
+      nodeMap,
+      decisions,
+      finalizedCodesSet,
+      nodesWithSevenChrDefChildren,
+      sevenChrDefParentMap,
+      hierarchyEdges,
+      expectedLeaves,
+      benchmarkMode,
+      allowRewind,
+      pinnedNodeIdRef,
+      hideTimeoutRef,
+      activeOverlayNodeRef,
+      lastInteractionTime,
+      onNodeRewindClick: onNodeRewindClickRef.current,
+      hideExpandedNode,
+      cancelHideTimeout,
+      allChildren,
+      sevenChrDefEdges,
+      otherLateralEdges,
+    };
+
+    // Helper function to show expanded node overlay (uses extracted renderer)
+    const showExpandedNode = (d: GraphNode, _nodeGroup: SVGGElement) => {
+      showNodeOverlay(d, overlayContext, cancelShowTimeout);
+    };
+
+    // Render non-ROOT nodes with simple join pattern
+    const nonRootNodes = nodes.filter(n => n.id !== 'ROOT');
+
+    const nodeGroups = nodesGroup.selectAll<SVGGElement, GraphNode>('.node:not(.node-root)')
+      .data(nonRootNodes, d => d.id)
       .join('g')
       .attr('class', d => `node node-${d.category}`)
       .attr('transform', d => {
         const pos = positions.get(d.id);
         return pos ? `translate(${pos.x - NODE_WIDTH / 2}, ${pos.y - NODE_HEIGHT / 2})` : '';
       })
-      .style('cursor', 'pointer')
-      .on('click', function (event: MouseEvent, d) {
-        event.stopPropagation(); // Prevent SVG background click handler
-        // Pin this node's overlay (clicking another node will pin that one instead)
-        setPinnedNodeId(d.id);
-        showExpandedNode(d, this as SVGGElement);
-        onNodeClick(d.id);
-      })
-      .on('mouseenter', function (_, d) {
-        showExpandedNode(d, this as SVGGElement);
-      })
-      .on('mouseleave', () => {
-        // Only hide if not pinned
-        if (!pinnedNodeIdRef.current) {
-          hideExpandedNode();
-        }
-      });
+      .style('cursor', 'pointer');
 
-    // Node rectangles - uniform height
+    // Add node rectangle
     nodeGroups.append('rect')
+      .attr('class', d => d.id === rewindingNodeId ? 'node-rect rewinding' : 'node-rect')
       .attr('width', NODE_WIDTH)
       .attr('height', NODE_HEIGHT)
       .attr('rx', 4)
       .attr('ry', 4)
-      .attr('fill', d => benchmarkMode ? getBenchmarkNodeFill(d as BenchmarkGraphNode) : getNodeFill(d, finalizedCodesSet))
+      .attr('fill', d => benchmarkMode ? getBenchmarkNodeFill(d as BenchmarkGraphNode, streamingTraversedIds) : getNodeFill(d, finalizedCodesSet))
       .attr('stroke', d => {
+        if (d.id === rewindingNodeId) return '#7c3aed';
         if (d.id === selectedNode) return '#0f172a';
-        return benchmarkMode ? getBenchmarkNodeStroke(d as BenchmarkGraphNode) : getNodeStroke(d, finalizedCodesSet);
+        return benchmarkMode ? getBenchmarkNodeStroke(d as BenchmarkGraphNode, streamingTraversedIds) : getNodeStroke(d, finalizedCodesSet);
       })
       .attr('stroke-width', d => {
+        if (d.id === rewindingNodeId) return 3;
         if (d.id === selectedNode) return 2.5;
-        return benchmarkMode ? getBenchmarkNodeStrokeWidth(d as BenchmarkGraphNode) : getNodeStrokeWidth(d, finalizedCodesSet);
+        return benchmarkMode ? getBenchmarkNodeStrokeWidth(d as BenchmarkGraphNode, streamingTraversedIds) : getNodeStrokeWidth(d, finalizedCodesSet);
       })
       .attr('stroke-dasharray', d => {
         if (benchmarkMode) {
-          return getBenchmarkNodeStrokeDasharray(d as BenchmarkGraphNode);
+          return getBenchmarkNodeStrokeDasharray(d as BenchmarkGraphNode, streamingTraversedIds);
         }
+        if (isSevenChrDefFinalizedNode(d, finalizedCodesSet)) return null;
+        if (isFinalizedNode(d, finalizedCodesSet)) return null;
         return d.category === 'placeholder' ? '4,2' : null;
       });
 
-    // Node code text - positioned at top
+    // Add node code text
     nodeGroups.append('text')
       .attr('class', 'node-code')
       .attr('x', NODE_WIDTH / 2)
@@ -1499,11 +711,10 @@ export function GraphViewer({
       .attr('font-weight', 600)
       .attr('font-family', 'ui-monospace, monospace')
       .attr('fill', '#1e293b')
-      .text(d => d.code);
+      .text(d => getDisplayCode(d));
 
-    // Billable indicator
-    nodeGroups.filter(d => d.billable)
-      .append('text')
+    // Add billable indicator
+    nodeGroups.append('text')
       .attr('class', 'node-billable')
       .attr('x', NODE_WIDTH - 6)
       .attr('y', 16)
@@ -1511,9 +722,63 @@ export function GraphViewer({
       .attr('font-size', 12)
       .attr('font-weight', 700)
       .attr('fill', '#16a34a')
-      .text('$');
+      .text(d => d.billable ? '$' : '');
 
-    // Checkered flag indicator for expected leaves (benchmark mode only)
+    // Add label line 1
+    nodeGroups.append('text')
+      .attr('class', 'node-label node-label-1')
+      .attr('x', NODE_WIDTH / 2)
+      .attr('y', 32)
+      .attr('text-anchor', 'middle')
+      .attr('font-size', 9)
+      .attr('fill', '#64748b')
+      .text(d => wrapNodeLabel(d.label, 22)[0]);
+
+    // Add label line 2
+    nodeGroups.append('text')
+      .attr('class', 'node-label node-label-2')
+      .attr('x', NODE_WIDTH / 2)
+      .attr('y', 44)
+      .attr('text-anchor', 'middle')
+      .attr('font-size', 9)
+      .attr('fill', '#64748b')
+      .text(d => wrapNodeLabel(d.label, 22)[1]);
+
+    // Add event handlers
+    nodeGroups
+      .on('click', function (event: MouseEvent, d) {
+        event.stopPropagation();
+        setPinnedNodeId(d.id);
+        pinnedNodeIdRef.current = d.id;
+        showExpandedNode(d, this as SVGGElement);
+        onNodeClick(d.id);
+      })
+      .on('mouseenter', function (_, d) {
+        if (activeOverlayNodeRef.current === d.id) {
+          cancelHideTimeout();
+          return;
+        }
+        cancelShowTimeout();
+        cancelHideTimeout();
+        const nodeGroup = this as SVGGElement;
+        if (pinnedNodeIdRef.current === d.id) {
+          showExpandedNode(d, nodeGroup);
+          return;
+        }
+        showTimeoutRef.current = setTimeout(() => {
+          showExpandedNode(d, nodeGroup);
+        }, 1000);
+      })
+      .on('mouseleave', () => {
+        cancelShowTimeout();
+        if (!pinnedNodeIdRef.current) {
+          hideTimeoutRef.current = setTimeout(() => {
+            hideExpandedNode();
+          }, 500);
+        }
+      });
+
+    // Add expected leaf flags in benchmark mode
     if (benchmarkMode && expectedLeaves.size > 0) {
       nodeGroups.filter(d => expectedLeaves.has(d.id))
         .append('text')
@@ -1525,26 +790,23 @@ export function GraphViewer({
         .text('🏁');
     }
 
-    // Node label text - word-wrapped, two lines max
-    nodeGroups.append('text')
-      .attr('class', 'node-label')
-      .attr('x', NODE_WIDTH / 2)
-      .attr('y', 32)
-      .attr('text-anchor', 'middle')
-      .attr('font-size', 9)
-      .attr('fill', '#64748b')
-      .text(d => wrapNodeLabel(d.label, 22)[0]);
+    // Add simple throbber below rewinding node
+    if (rewindingNodeId) {
+      const throbberGroup = nodeGroups.filter(d => d.id === rewindingNodeId)
+        .append('g')
+        .attr('class', 'rewind-throbber')
+        .attr('transform', `translate(${NODE_WIDTH / 2}, ${NODE_HEIGHT + 12})`);
 
-    nodeGroups.append('text')
-      .attr('class', 'node-label')
-      .attr('x', NODE_WIDTH / 2)
-      .attr('y', 44)
-      .attr('text-anchor', 'middle')
-      .attr('font-size', 9)
-      .attr('fill', '#64748b')
-      .text(d => wrapNodeLabel(d.label, 22)[1]);
-
-    // Note: Native title tooltip removed - using expanded overlay on hover instead
+      // Three dots throbber with staggered animation classes
+      [-12, 0, 12].forEach((x, i) => {
+        throbberGroup.append('circle')
+          .attr('cx', x)
+          .attr('cy', 0)
+          .attr('r', 3)
+          .attr('fill', '#7c3aed')
+          .attr('class', `throbber-dot throbber-dot-${i + 1}`);
+      });
+    }
 
     // Render overshoot markers (red arrows + optional X) in benchmark mode
     if (benchmarkMode && overshootMarkers.length > 0) {
@@ -1658,6 +920,15 @@ export function GraphViewer({
     // Set up zoom with interaction tracking
     const zoom = d3.zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.1, 4])
+      .filter((event) => {
+        // Block zoom for events originating from expanded overlay elements
+        // This allows buttons and textareas in overlays to receive click events
+        const target = event.target as Element;
+        if (target && target.closest('.expanded-overlay')) {
+          return false; // Don't zoom - let the overlay handle the event
+        }
+        return true; // Allow zoom for all other events
+      })
       .on('start', (event) => {
         // Only track ACTUAL user interactions, not programmatic transforms
         // event.sourceEvent is null for programmatic calls, defined for user interactions
@@ -1676,9 +947,27 @@ export function GraphViewer({
     svg.call(zoom);
     zoomRef.current = zoom;
 
+    // Restore overlay for pinned node if it exists (handles redraws)
+    if (pinnedNodeIdRef.current) {
+      const pinnedNode = nodes.find(n => n.id === pinnedNodeIdRef.current);
+      if (pinnedNode) {
+        // Pass null for nodeGroup as it's not actually used for positioning (positions map is used)
+        showExpandedNode(pinnedNode, null as unknown as SVGGElement);
+      }
+    }
+
     // Click on SVG background (any click not stopped by nodes/buttons) releases the pinned overlay
-    svg.on('click', () => {
+    svg.on('click', (event: MouseEvent) => {
       if (pinnedNodeIdRef.current) {
+        // Don't unpin if clicking inside the overlay (foreignObject clicks may not stop propagation correctly)
+        const target = event.target as Element;
+        const isInsideOverlay = target.closest('.expanded-overlay') !== null ||
+          target.closest('.expanded-node') !== null ||
+          target.closest('.batch-panel') !== null ||
+          target.tagName.toLowerCase() === 'textarea' ||
+          target.closest('foreignObject') !== null;
+        if (isInsideOverlay) return;
+
         setPinnedNodeId(null);
         hideExpandedNode();
       }
@@ -1690,13 +979,39 @@ export function GraphViewer({
     g.attr('transform', currentTransform.toString());
 
     // Determine if we should re-center the graph
-    // Only re-center on: initial render, traversal completion, or new graph loaded
+    // Only re-center on: initial render or new graph loaded (not during/after traversal)
     const traversalJustCompleted = prevIsTraversing.current && !isTraversing;
-    const traversalJustStarted = !prevIsTraversing.current && isTraversing;
     const graphJustLoaded = prevNodeCount.current === 0 && nodes.length > 0;
 
-    // Reset zoom initialization when a new traversal starts or new graph loads
-    if (traversalJustStarted || graphJustLoaded) {
+    // Detect if a rewind traversal just started
+    // (rewindingNodeId was null but now is set, AND traversal just started)
+    const rewindJustStarted = prevRewindingNodeId.current === null && rewindingNodeId !== null;
+
+    // Detect if a rewind traversal just completed
+    // (rewindingNodeId was set but now is null)
+    const rewindJustCompleted = prevRewindingNodeId.current !== null && rewindingNodeId === null;
+
+    // Track when rewind activity happens for grace period
+    if (rewindJustCompleted || rewindJustStarted) {
+      rewindCompletedTimeRef.current = Date.now();
+    }
+
+    // Track when nodes are added during or right after a rewind
+    // This triggers a 5-second delay before allowing fit-to-window after the node appears
+    const nodesWereAdded = nodes.length > prevNodeCount.current;
+    const duringOrJustAfterRewind = rewindingNodeId !== null || rewindJustCompleted;
+    if (nodesWereAdded && duringOrJustAfterRewind) {
+      lastRewindNodeAddedTimeRef.current = Date.now();
+    }
+
+    // Track when traversal completes for grace period
+    if (traversalJustCompleted) {
+      traversalCompletedTimeRef.current = Date.now();
+    }
+
+    // Reset zoom initialization only when a completely NEW graph loads (not traversal/rewind)
+    // Don't reset during traversal or rewind - user may be watching the graph grow
+    if (graphJustLoaded && !isTraversing && rewindingNodeId === null) {
       hasInitializedZoom.current = false;
     }
 
@@ -1704,11 +1019,32 @@ export function GraphViewer({
     const timeSinceLastInteraction = Date.now() - lastInteractionTime.current;
     const userRecentlyInteracted = lastInteractionTime.current > 0 && timeSinceLastInteraction < 3000;
 
-    const shouldRecenter = ((!hasInitializedZoom.current && nodes.length > 0) || traversalJustCompleted || graphJustLoaded) && !userRecentlyInteracted;
+    // Don't recenter if an overlay is currently open
+    const overlayIsOpen = activeOverlayNodeRef.current !== null || pinnedNodeIdRef.current !== null;
+
+    // Block fit-to-window during active rewind
+    const isActiveRewind = rewindingNodeId !== null;
+
+    // Extended grace period after rewind (10 seconds) to let user review results
+    const timeSinceRewindActivity = Date.now() - rewindCompletedTimeRef.current;
+    const rewindRecentlyActive = rewindCompletedTimeRef.current > 0 && timeSinceRewindActivity < 10000;
+
+    // Grace period after traversal completes (10 seconds) to let user review results
+    const timeSinceTraversalCompleted = Date.now() - traversalCompletedTimeRef.current;
+    const traversalRecentlyCompleted = traversalCompletedTimeRef.current > 0 && timeSinceTraversalCompleted < 10000;
+
+    // 5-second grace period after a node is added during rewind (so user can see the new node)
+    const timeSinceRewindNodeAdded = Date.now() - lastRewindNodeAddedTimeRef.current;
+    const rewindNodeRecentlyAdded = lastRewindNodeAddedTimeRef.current > 0 && timeSinceRewindNodeAdded < 5000;
+
+    // Skip automatic fit-to-window during active traversal/rewind or within grace period
+    // This prevents jarring zoom changes when user is watching nodes being added or reviewing results
+    const shouldRecenter = ((!hasInitializedZoom.current && nodes.length > 0) || graphJustLoaded) && !userRecentlyInteracted && !overlayIsOpen && !isActiveRewind && !rewindRecentlyActive && !isTraversing && !traversalRecentlyCompleted && !rewindNodeRecentlyAdded;
 
     // Update prev tracking
     prevIsTraversing.current = isTraversing;
     prevNodeCount.current = nodes.length;
+    prevRewindingNodeId.current = rewindingNodeId;
 
     if (shouldRecenter) {
       // Use fit-to-window for proper centering
@@ -1716,7 +1052,63 @@ export function GraphViewer({
       hasInitializedZoom.current = true;
     }
 
-  }, [nodes, edges, selectedNode, onNodeClick, finalizedCodes, isTraversing, benchmarkMode, overshootMarkers, missedEdgeMarkers, expectedLeaves, nodeReasoningMap, handleFitToWindow, showXMarkers]);
+    // Cleanup: cancel any pending show timeout
+    return () => {
+      if (showTimeoutRef.current) {
+        clearTimeout(showTimeoutRef.current);
+      }
+      if (hideTimeoutRef.current) {
+        clearTimeout(hideTimeoutRef.current);
+      }
+    };
+
+  }, [nodes, edges, selectedNode, onNodeClick, finalizedCodes, isTraversing, benchmarkMode, overshootMarkers, missedEdgeMarkers, expectedLeaves, handleFitToWindow, showXMarkers, rewindingNodeId]);
+
+  // Separate useEffect for streaming traversal style updates (avoids full re-render)
+  // This only runs when streamingTraversedIds changes, updating node styles efficiently
+  // Uses requestAnimationFrame to batch DOM updates and sync with browser paint cycle
+  useEffect(() => {
+    if (!svgRef.current || !benchmarkMode || !streamingTraversedIds) return;
+
+    const svg = d3.select(svgRef.current);
+
+    // Helper to get node data from a rect's parent group
+    const getNodeData = (rect: SVGRectElement): BenchmarkGraphNode | null => {
+      const nodeGroup = rect.parentElement as unknown as SVGGElement | null;
+      if (!nodeGroup) return null;
+      return d3.select<SVGGElement, BenchmarkGraphNode>(nodeGroup).datum();
+    };
+
+    // Wrap in RAF to batch DOM updates and sync with browser paint cycle
+    // This prevents layout thrashing when updates arrive rapidly
+    const rafId = requestAnimationFrame(() => {
+      // Update only the node rectangles' visual properties without recreating them
+      svg.selectAll<SVGRectElement, BenchmarkGraphNode>('.node-rect')
+        .attr('fill', function() {
+          const nodeData = getNodeData(this);
+          if (!nodeData) return '#ffffff';
+          return getBenchmarkNodeFill(nodeData, streamingTraversedIds);
+        })
+        .attr('stroke', function() {
+          const nodeData = getNodeData(this);
+          if (!nodeData) return '#1e293b';
+          return getBenchmarkNodeStroke(nodeData, streamingTraversedIds);
+        })
+        .attr('stroke-width', function() {
+          const nodeData = getNodeData(this);
+          if (!nodeData) return 1.5;
+          return getBenchmarkNodeStrokeWidth(nodeData, streamingTraversedIds);
+        })
+        .attr('stroke-dasharray', function() {
+          const nodeData = getNodeData(this);
+          if (!nodeData) return null;
+          return getBenchmarkNodeStrokeDasharray(nodeData, streamingTraversedIds);
+        });
+    });
+
+    // Cleanup: cancel RAF if component unmounts or deps change before it executes
+    return () => cancelAnimationFrame(rafId);
+  }, [streamingTraversedIds, benchmarkMode]);
 
   return (
     <div className="graph-container" ref={containerRef}>
@@ -1963,617 +1355,36 @@ export function GraphViewer({
   );
 }
 
-// Wrap node label into two lines with word boundaries (no mid-word breaks)
-// Returns [line1, line2] where line2 has ellipsis if there's overflow
-function wrapNodeLabel(label: string | undefined, maxCharsPerLine: number): [string, string] {
-  if (!label) return ['', ''];
-
-  const words = label.split(' ');
-  let line1 = '';
-  let line2 = '';
-  let wordIndex = 0;
-
-  // Build first line - fit complete words only
-  for (; wordIndex < words.length; wordIndex++) {
-    const word = words[wordIndex];
-    const testLine = line1 ? line1 + ' ' + word : word;
-    if (testLine.length <= maxCharsPerLine) {
-      line1 = testLine;
-    } else {
-      break;
-    }
-  }
-
-  // If no words fit on line1, put the first word (even if too long)
-  if (!line1 && words.length > 0) {
-    line1 = words[0].length > maxCharsPerLine
-      ? words[0].substring(0, maxCharsPerLine - 1) + '…'
-      : words[0];
-    wordIndex = 1;
-  }
-
-  // Build second line from remaining words
-  for (; wordIndex < words.length; wordIndex++) {
-    const word = words[wordIndex];
-    const testLine = line2 ? line2 + ' ' + word : word;
-    if (testLine.length <= maxCharsPerLine - 1) { // Reserve space for potential ellipsis
-      line2 = testLine;
-    } else {
-      // More words remain - add ellipsis
-      if (line2) {
-        line2 = line2 + '…';
-      } else {
-        // First word of line2 is too long
-        line2 = word.substring(0, maxCharsPerLine - 1) + '…';
-      }
-      return [line1, line2];
-    }
-  }
-
-  // Check if there were more words that didn't fit
-  // (This happens when we break out of the first loop with remaining words)
-  if (wordIndex < words.length && line2 && !line2.endsWith('…')) {
-    line2 = line2 + '…';
-  }
-
-  return [line1, line2];
-}
-
-// Check if two node positions collide (with padding)
-function hasCollision(
-  x1: number, y1: number,
-  x2: number, y2: number,
-  nodeWidth: number,
-  nodeHeight: number,
-  padding: number = 20
-): boolean {
-  return Math.abs(x1 - x2) < nodeWidth + padding &&
-    Math.abs(y1 - y2) < nodeHeight + padding;
-}
-
-// Find a non-colliding X position for a node
-function findNonCollidingX(
-  startX: number,
-  y: number,
-  positions: Map<string, { x: number; y: number }>,
-  nodeWidth: number,
-  nodeHeight: number,
-  excludeId?: string
-): number {
-  let x = startX;
-  let maxAttempts = 30;
-
-  while (maxAttempts-- > 0) {
-    let collision = false;
-
-    for (const [id, pos] of positions.entries()) {
-      if (id === excludeId) continue;
-      if (hasCollision(x, y, pos.x, pos.y, nodeWidth, nodeHeight)) {
-        collision = true;
-        // Move to the right of the colliding node
-        x = pos.x + nodeWidth + 30;
-        break;
-      }
-    }
-
-    if (!collision) return x;
-  }
-
-  return x;
-}
-
-// Calculate positions using subtree width algorithm (from reference)
-function calculatePositions(
-  _nodes: GraphNode[],
-  hierarchyChildren: Map<string, string[]>,  // Only hierarchy edges - for Phase 2 tree structure
-  allChildren: Map<string, string[]>,         // All edges - for width calculation and lateral children
-  containerWidth: number,
-  nodeMap: Map<string, GraphNode>,
-  lateralEdges: GraphEdge[],
-  nodeWidth: number,
-  nodeHeight: number,
-  levelHeight: number
-): Map<string, { x: number; y: number }> {
-  const positions = new Map<string, { x: number; y: number }>();
-  const hierarchyNodeIds = new Set<string>(); // Track nodes that are part of hierarchy columns (Phase 2)
-
-  // Build set of nodes that have hierarchy parents (connected via hierarchy/sevenChrDef from above)
-  // These nodes should stay in their columns even if they're also lateral targets
-  const nodesWithHierarchyParent = new Set<string>();
-  for (const [, children] of hierarchyChildren.entries()) {
-    for (const childId of children) {
-      nodesWithHierarchyParent.add(childId);
-    }
-  }
-
-  const layoutWidth = 160;
-  const nodePadding = 15;
-
-  // Helper to get Y position for a node based on depth
-  const getYForDepth = (depth: number): number => {
-    return depth * levelHeight + 50;
-  };
-
-  // Phase 1: Calculate subtree widths for ALL nodes that have children
-  // Use allChildren to include lateral subtrees in width calculation
-  const subtreeWidth = new Map<string, number>();
-
-  function calcSubtreeWidth(nodeId: string, visited = new Set<string>()): number {
-    if (subtreeWidth.has(nodeId)) return subtreeWidth.get(nodeId)!;
-    if (visited.has(nodeId)) return layoutWidth + nodePadding; // Cycle detection
-    visited.add(nodeId);
-
-    const childIds = allChildren.get(nodeId) || [];
-    if (childIds.length === 0) {
-      subtreeWidth.set(nodeId, layoutWidth + nodePadding);
-      return layoutWidth + nodePadding;
-    }
-
-    let totalWidth = 0;
-    for (const childId of childIds) {
-      totalWidth += calcSubtreeWidth(childId, visited);
-    }
-    totalWidth = Math.max(totalWidth, layoutWidth + nodePadding);
-    subtreeWidth.set(nodeId, totalWidth);
-    return totalWidth;
-  }
-
-  // Calculate widths starting from ROOT
-  calcSubtreeWidth('ROOT');
-
-  // Also calculate widths for any nodes introduced via lateral edges
-  for (const edge of lateralEdges) {
-    const targetId = String(edge.target);
-    if (!subtreeWidth.has(targetId)) {
-      calcSubtreeWidth(targetId);
-    }
-  }
-
-  // Phase 2: Position subtree helper - positions a node and all its hierarchy children
-  // parentDepth is used to infer depth for nodes not in nodeMap (edge targets from streaming)
-  // isHierarchyPhase: true for Phase 2 (main tree), false for Phase 3 (lateral subtrees)
-  //
-  // COLUMNAR LAYOUT: Single-child chains are vertically aligned (same X) for straight edges.
-  // Multi-child nodes spread children horizontally while keeping the layout balanced.
-  function positionSubtree(nodeId: string, x: number, visited: Set<string>, parentDepth: number = -1, isHierarchyPhase: boolean = true) {
-    if (visited.has(nodeId)) return;
-    visited.add(nodeId);
-
-    const node = nodeMap.get(nodeId);
-    // Use node's depth if available, otherwise infer from parent (tree depth)
-    const nodeDepth = node?.depth ?? (parentDepth >= 0 ? parentDepth + 1 : 0);
-
-    // Position this node if it hasn't been positioned yet
-    // Position even if not in nodeMap - the node might be an edge target that hasn't been
-    // added to the nodes array yet (streaming race condition)
-    if (!positions.has(nodeId) && nodeId !== 'ROOT') {
-      const y = getYForDepth(nodeDepth) + nodeHeight / 2;
-      positions.set(nodeId, { x, y });
-      // Track hierarchy nodes so they're never moved later
-      if (isHierarchyPhase) {
-        hierarchyNodeIds.add(nodeId);
-      }
-    }
-
-    // Use hierarchyChildren for Phase 2, allChildren for lateral subtrees
-    const childrenMap = isHierarchyPhase ? hierarchyChildren : allChildren;
-    const childIds = childrenMap.get(nodeId) || [];
-    if (childIds.length === 0) return;
-
-    const sortedChildren = [...childIds].sort();
-
-    // COLUMNAR LAYOUT: If single child, position directly below parent (same X)
-    // This creates straight vertical edges for hierarchy and sevenChrDef relationships
-    if (sortedChildren.length === 1) {
-      positionSubtree(sortedChildren[0], x, visited, nodeDepth, isHierarchyPhase);
-      return;
-    }
-
-    // Multiple children: spread horizontally centered under parent
-    let totalChildWidth = 0;
-    for (const childId of sortedChildren) {
-      totalChildWidth += subtreeWidth.get(childId) || (layoutWidth + nodePadding);
-    }
-
-    let childX = x - totalChildWidth / 2;
-
-    for (const childId of sortedChildren) {
-      const childWidth = subtreeWidth.get(childId) || (layoutWidth + nodePadding);
-      const childCenterX = childX + childWidth / 2;
-      positionSubtree(childId, childCenterX, visited, nodeDepth, isHierarchyPhase);
-      childX += childWidth;
-    }
-  }
-
-  // Position the full tree starting from ROOT (use hierarchyChildren for vertical column layout)
-  positionSubtree('ROOT', containerWidth / 2, new Set<string>(), -1, true);
-
-  // Add ROOT as a virtual positioned node at top center for edge rendering
-  positions.set('ROOT', { x: containerWidth / 2, y: 25 });
-  hierarchyNodeIds.add('ROOT');
-
-  // Phase 3: Lateral node positioning
-  // Position lateral nodes close to their sources by shifting hierarchy columns if needed
-  const minGap = 20;
-  const step = nodeWidth + minGap;
-
-  // Track lateral targets already processed - each should only be positioned ONCE
-  // to prevent accumulated shifts from multiple passes
-  const processedLateralTargets = new Set<string>();
-
-  // Track how many lateral nodes have been placed from each source
-  // Used to offset multiple lateral targets from the same parent incrementally
-  const lateralCountPerSource = new Map<string, number>();
-
-  let maxPasses = 15;
-  let madeProgress = true;
-
-  while (madeProgress && maxPasses-- > 0) {
-    madeProgress = false;
-
-    for (const edge of lateralEdges) {
-      const targetId = String(edge.target);
-      const sourceId = String(edge.source);
-
-      // Skip if already processed in Phase 3 - prevents accumulated shifts
-      if (processedLateralTargets.has(targetId)) continue;
-
-      // Skip if already positioned AND has hierarchy parent (ancestor linking to it)
-      // Nodes with hierarchy parents should stay in their columns
-      if (positions.has(targetId) && nodesWithHierarchyParent.has(targetId)) continue;
-
-      // If already positioned but no hierarchy parent, we'll reposition it closer to lateral source
-      if (positions.has(targetId)) {
-        // This node was positioned but has no hierarchy ancestor - reposition it
-        hierarchyNodeIds.delete(targetId);  // Allow Phase 4 to move if needed
-      }
-
-      // Need source to be positioned first
-      const sourcePos = positions.get(sourceId);
-      if (!sourcePos) continue;
-
-      const targetNode = nodeMap.get(targetId);
-
-      // Determine depth: from node if available, otherwise calculate from code structure
-      // ICD depth rules: Chapter_* = 1, Ranges (X##-X##) = 2, Codes = length without dots
-      const targetDepth = targetNode?.depth ?? calculateDepthFromCode(targetId);
-      const targetY = getYForDepth(targetDepth) + nodeHeight / 2;
-
-      // Get how many lateral nodes already placed from this source
-      const lateralIndex = lateralCountPerSource.get(sourceId) || 0;
-
-      // Ideal position: to the right of source, offset by how many laterals already placed
-      // First lateral at +step, second at +2*step, etc.
-      const idealX = sourcePos.x + step * (lateralIndex + 1);
-
-      // Check for ACTUAL collision at the lateral node's position (both X and Y)
-      // This determines IF we need to shift - only shift when the lateral node truly collides
-      let collidingColumnX: number | null = null;
-      for (const [id, pos] of positions.entries()) {
-        if (id === sourceId) continue;
-        if (hasCollision(idealX, targetY, pos.x, pos.y, nodeWidth, nodeHeight)) {
-          collidingColumnX = pos.x;
-          break;
-        }
-      }
-
-      // If there's actual collision, shift the ENTIRE hierarchy column (all Y depths)
-      // and everything to its right - columns move as a unit
-      if (collidingColumnX !== null) {
-        const updates: Array<[string, { x: number; y: number }]> = [];
-        for (const [id, pos] of positions.entries()) {
-          if (id === sourceId) continue;
-          // Shift all nodes at or to the right of the colliding column's X position
-          if (pos.x >= collidingColumnX - nodeWidth / 2) {
-            updates.push([id, { x: pos.x + step, y: pos.y }]);
-          }
-        }
-        for (const [id, newPos] of updates) {
-          positions.set(id, newPos);
-        }
-      }
-
-      // Place the lateral node at its ideal position (close to source)
-      positions.set(targetId, { x: idealX, y: targetY });
-      processedLateralTargets.add(targetId);  // Mark as processed to prevent reprocessing
-      lateralCountPerSource.set(sourceId, lateralIndex + 1);  // Increment for next lateral from same source
-      madeProgress = true;
-
-      // If this lateral node has HIERARCHY children, position them in a column below
-      const hierarchyChildIds = hierarchyChildren.get(targetId);
-      if (hierarchyChildIds && hierarchyChildIds.length > 0) {
-        // Clear positions of all hierarchy descendants so they get repositioned
-        // under the lateral target's new position (not their old Phase 2 positions)
-        const clearDescendantPositions = (nodeId: string, visited: Set<string>) => {
-          if (visited.has(nodeId)) return;
-          visited.add(nodeId);
-          const children = hierarchyChildren.get(nodeId) || [];
-          for (const childId of children) {
-            positions.delete(childId);
-            hierarchyNodeIds.delete(childId);
-            clearDescendantPositions(childId, visited);
-          }
-        };
-        clearDescendantPositions(targetId, new Set<string>());
-
-        positionSubtree(targetId, idealX, new Set<string>(), targetDepth, true);
-      }
-    }
-  }
-
-  // Log any nodes without positions
-  for (const node of _nodes) {
-    if (!positions.has(node.id)) {
-      console.warn(`[POSITION] Node ${node.id} has no position - will not render edges to/from it`);
-    }
-  }
-
-  // Phase 4: Final collision resolution pass - ONLY move non-hierarchy nodes
-  const allPositionedNodes = [...positions.entries()];
-
-  for (let i = 0; i < allPositionedNodes.length; i++) {
-    const [idA, posA] = allPositionedNodes[i];
-
-    for (let j = i + 1; j < allPositionedNodes.length; j++) {
-      const [idB, posB] = allPositionedNodes[j];
-
-      if (hasCollision(posA.x, posA.y, posB.x, posB.y, nodeWidth, nodeHeight)) {
-        // Determine which node to move - NEVER move hierarchy nodes
-        const aIsHierarchy = hierarchyNodeIds.has(idA);
-        const bIsHierarchy = hierarchyNodeIds.has(idB);
-
-        if (aIsHierarchy && bIsHierarchy) {
-          // Both are hierarchy - this shouldn't happen, but don't move either
-          console.warn(`[COLLISION] Two hierarchy nodes collide: ${idA} and ${idB}`);
-          continue;
-        }
-
-        // Move the non-hierarchy node (or B if neither is hierarchy)
-        const nodeToMove = aIsHierarchy ? idB : (bIsHierarchy ? idA : idB);
-        const posToMove = nodeToMove === idA ? posA : posB;
-        const otherPos = nodeToMove === idA ? posB : posA;
-
-        const newX = findNonCollidingX(otherPos.x + nodeWidth + 30, posToMove.y, positions, nodeWidth, nodeHeight, nodeToMove);
-        posToMove.x = newX;
-        positions.set(nodeToMove, posToMove);
-
-        // Update the array entry
-        if (nodeToMove === idA) {
-          allPositionedNodes[i] = [idA, posA];
-        } else {
-          allPositionedNodes[j] = [idB, posB];
-        }
-      }
-    }
-  }
-
-  return positions;
-}
-
-// Create straight edge path for hierarchy edges
-function createEdgePath(
-  edge: GraphEdge,
-  positions: Map<string, { x: number; y: number }>,
-  nodeHeight: number
-): string {
-  const src = positions.get(String(edge.source));
-  const tgt = positions.get(String(edge.target));
-
-  if (!src || !tgt) return '';
-
-  const ARROW_PADDING = 6;
-
-  const x1 = src.x;
-  const y1 = src.y + nodeHeight / 2;
-  const x2 = tgt.x;
-  const y2 = tgt.y - nodeHeight / 2 - ARROW_PADDING;
-
-  return `M${x1},${y1} L${x2},${y2}`;
-}
-
-// Create curved edge path for lateral edges (quadratic Bezier)
-function createCurvedEdgePath(
-  edge: GraphEdge,
-  positions: Map<string, { x: number; y: number }>,
-  nodeHeight: number
-): string {
-  const src = positions.get(String(edge.source));
-  const tgt = positions.get(String(edge.target));
-
-  if (!src || !tgt) return '';
-
-  const ARROW_PADDING = 8;
-
-  const x1 = src.x;
-  const y1 = src.y + nodeHeight / 2;
-  const x2 = tgt.x;
-  const y2 = tgt.y - nodeHeight / 2 - ARROW_PADDING;
-
-  // Control point for quadratic Bezier curve
-  const dx = x2 - x1;
-  const cx = x1 + dx / 2;
-  const cy = Math.min(y1, y2) - Math.abs(dx) * 0.2 - 20;
-
-  return `M${x1},${y1} Q${cx},${cy} ${x2},${y2}`;
-}
-
-// ============================================================================
-// Node Type Helpers - Centralized node classification logic
-// ============================================================================
-
-// Check if node is a leaf node (billable, finalized category, or in finalized codes list)
-function isLeafNode(node: GraphNode, finalizedCodes: Set<string>): boolean {
-  return node.billable || node.category === 'finalized' || finalizedCodes.has(node.code);
-}
-
-// Check if node should be styled as finalized (same logic as isLeafNode for consistency)
-function isFinalizedNode(node: GraphNode, finalizedCodes: Set<string>): boolean {
-  return node.category === 'finalized' || node.billable || finalizedCodes.has(node.code);
-}
-
-function isActivatorNode(node: GraphNode): boolean {
-  return node.category === 'activator';
-}
-
-function isPlaceholderNode(node: GraphNode): boolean {
-  return node.category === 'placeholder';
-}
-
-// ============================================================================
-// Batch/Decision Helpers - Centralized batch filtering and normalization
-// ============================================================================
-
-// Normalize batch label to lowercase name without " batch" suffix
-function normalizeBatchName(label: string | undefined): string {
-  return (label || '').replace(' batch', '').toLowerCase();
-}
-
-// Check if a decision should be included for overlay display
-// Filters out children batches for nodes that can't have children selections
-function shouldIncludeDecision(
-  dec: DecisionPoint,
-  node: GraphNode,
-  finalizedCodes: Set<string>
-): boolean {
-  const batchName = normalizeBatchName(dec.current_label);
-  const leaf = isLeafNode(node, finalizedCodes);
-  const placeholderOrActivator = isPlaceholderNode(node) || isActivatorNode(node);
-
-  // Filter out children batches for leaf, placeholder, and activator nodes
-  if ((leaf || placeholderOrActivator) && batchName === 'children') {
-    return false;
-  }
+// Custom comparison function for memo - prevents unnecessary re-renders from parent
+// The key optimization: streamingTraversedIds changes are ALLOWED through because:
+// 1. They're already throttled to 10/sec in App.tsx
+// 2. The main D3 useEffect doesn't depend on streamingTraversedIds (won't rebuild graph)
+// 3. Only the lightweight style-update useEffect runs (just updates fill/stroke)
+function arePropsEqual(prev: GraphViewerProps, next: GraphViewerProps): boolean {
+  // Core data changes - always re-render
+  if (prev.nodes !== next.nodes) return false;
+  if (prev.edges !== next.edges) return false;
+  if (prev.status !== next.status) return false;
+
+  // streamingTraversedIds - ALLOW through (throttled in App.tsx, lightweight update)
+  if (prev.streamingTraversedIds !== next.streamingTraversedIds) return false;
+
+  // Other props that affect rendering
+  if (prev.selectedNode !== next.selectedNode) return false;
+  if (prev.rewindingNodeId !== next.rewindingNodeId) return false;
+  if (prev.triggerFitToWindow !== next.triggerFitToWindow) return false;
+  if (prev.finalizedCodes !== next.finalizedCodes) return false;
+  if (prev.isTraversing !== next.isTraversing) return false;
+  if (prev.benchmarkMode !== next.benchmarkMode) return false;
+  if (prev.benchmarkMetrics !== next.benchmarkMetrics) return false;
+  if (prev.overshootMarkers !== next.overshootMarkers) return false;
+  if (prev.missedEdgeMarkers !== next.missedEdgeMarkers) return false;
+  if (prev.showXMarkers !== next.showXMarkers) return false;
+  if (prev.allowRewind !== next.allowRewind) return false;
+  if (prev.decisionCount !== next.decisionCount) return false;
+  if (prev.elapsedTime !== next.elapsedTime) return false;
 
   return true;
 }
 
-// Check if a batch section should be shown in overlay
-// Returns false for children batches on leaf/placeholder nodes
-function shouldShowBatch(batchName: string, node: GraphNode, finalizedCodes: Set<string>): boolean {
-  const leaf = isLeafNode(node, finalizedCodes);
-  const activator = isActivatorNode(node);
-  const placeholder = isPlaceholderNode(node);
-
-  // Activator nodes (6th char with sevenChrDef) should show the batch
-  if (activator) return true;
-
-  // Leaf nodes with 'children' batch - don't show (no children to select)
-  // But DO show lateral batches (useAdditionalCode, codeFirst, codeAlso)
-  if (leaf && batchName === 'children') return false;
-
-  // Placeholder nodes with 'children' batch - don't show (implicit)
-  if (placeholder && batchName === 'children') return false;
-
-  // All other cases - show the batch section
-  return true;
-}
-
-// ============================================================================
-// Overlay Color Helpers - Centralized color determination for overlays
-// ============================================================================
-
-function getOverlayColors(node: GraphNode, finalizedCodes: Set<string>): { bgColor: string; borderColor: string } {
-  const finalized = isFinalizedNode(node, finalizedCodes);
-  const activator = isActivatorNode(node);
-  const placeholder = isPlaceholderNode(node);
-
-  const bgColor = finalized ? 'rgba(240, 253, 244, 0.98)' :
-    activator ? 'rgba(239, 246, 255, 0.98)' :
-      placeholder ? 'rgba(248, 250, 252, 0.98)' :
-        'rgba(255, 255, 255, 0.98)';
-
-  const borderColor = finalized ? '#16a34a' :
-    activator ? '#2563eb' :
-      placeholder ? '#94a3b8' :
-        '#475569';
-
-  return { bgColor, borderColor };
-}
-
-// ============================================================================
-// Node Styling Helpers - For graph node rendering
-// ============================================================================
-// Priority: activator (blue) > finalized (green) > placeholder (dashed gray) > ancestor (black)
-
-function getNodeFill(node: GraphNode, finalizedCodes: Set<string>): string {
-  // Activator nodes (have sevenChrDef) are NOT finalized - they need 7th char
-  if (isActivatorNode(node)) return '#ffffff';
-  if (isFinalizedNode(node, finalizedCodes)) return '#f0fdf4';
-  if (isPlaceholderNode(node)) return '#ffffff';
-  // ROOT styled same as ancestor
-  return '#ffffff';
-}
-
-function getNodeStroke(node: GraphNode, finalizedCodes: Set<string>): string {
-  // Activator nodes get blue border (7th Char Rule indicator)
-  if (isActivatorNode(node)) return '#3b82f6';
-  if (isFinalizedNode(node, finalizedCodes)) return '#22c55e';
-  if (isPlaceholderNode(node)) return '#94a3b8';
-  // ROOT and ancestor nodes use same stroke
-  return '#334155';
-}
-
-function getNodeStrokeWidth(node: GraphNode, finalizedCodes: Set<string>): number {
-  if (isActivatorNode(node)) return 2;
-  if (isFinalizedNode(node, finalizedCodes)) return 2.5;
-  return 1.5;
-}
-
-// Calculate ICD depth from code structure
-// Chapter_* = 1, Ranges (X##-X##) = 2, Codes = character count without dots
-function calculateDepthFromCode(code: string): number {
-  if (code.startsWith('Chapter_')) return 1;
-  if (code.includes('-')) return 2; // Range like I20-I25
-  // For actual codes: count characters excluding dots
-  return code.replace(/\./g, '').length;
-}
-
-// Benchmark mode node styling
-// Styles based on benchmarkStatus: expected, traversed, matched, undershoot
-// NOTE: Use white fill (not transparent) to hide lateral edges behind nodes
-function getBenchmarkNodeFill(node: BenchmarkGraphNode): string {
-  switch (node.benchmarkStatus) {
-    case 'expected':
-      return '#ffffff';  // White fill - hides edges behind, dashed stroke shows status
-    case 'traversed':
-      return '#ffffff';  // White fill - hides edges behind, solid green stroke shows status
-    case 'matched':
-      return '#dcfce7';  // Light green fill - correct finalization
-    case 'undershoot':
-      return '#fef3c7';  // Amber fill - finalized too early
-    default:
-      return '#ffffff';  // White fill for any other status
-  }
-}
-
-function getBenchmarkNodeStroke(node: BenchmarkGraphNode): string {
-  switch (node.benchmarkStatus) {
-    case 'expected':
-      return '#1e293b';  // Black - waiting to be traversed
-    case 'traversed':
-      return '#16a34a';  // Green - traversed, not finalized
-    case 'matched':
-      return '#16a34a';  // Green - correct finalization
-    case 'undershoot':
-      return '#16a34a';  // Green - finalized (but too early)
-    default:
-      return '#1e293b';
-  }
-}
-
-function getBenchmarkNodeStrokeWidth(node: BenchmarkGraphNode): number {
-  switch (node.benchmarkStatus) {
-    case 'matched':
-      return 4.5;
-    case 'traversed':
-    case 'undershoot':
-      return 4;
-    default:
-      return 1.5;
-  }
-}
-
-// Get stroke dasharray for benchmark nodes (only expected is dashed)
-function getBenchmarkNodeStrokeDasharray(node: BenchmarkGraphNode): string | null {
-  return node.benchmarkStatus === 'expected' ? '4,2' : null;
-}
+export const GraphViewer = memo(GraphViewerInner, arePropsEqual);

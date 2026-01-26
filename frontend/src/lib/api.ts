@@ -5,51 +5,21 @@
  * for incremental graph updates.
  */
 
-import type { GraphNode, GraphEdge } from './types';
+// Re-export types for backwards compatibility
+export type {
+  AGUIEventType,
+  JsonPatchOp,
+  GraphStateSnapshot,
+  AGUIEvent,
+  TraversalConfig,
+  RewindConfig,
+  GraphResponse,
+  DeleteCacheConfig,
+  DeleteCacheResponse,
+} from './api.types';
 
-// AG-UI Event Types
-export type AGUIEventType =
-  | 'RUN_STARTED'
-  | 'RUN_FINISHED'
-  | 'STEP_STARTED'
-  | 'STEP_FINISHED'
-  | 'STATE_SNAPSHOT'
-  | 'STATE_DELTA';
-
-// JSON Patch operation (RFC 6902)
-export interface JsonPatchOp {
-  op: 'add' | 'remove' | 'replace';
-  path: string;
-  value?: unknown;
-}
-
-// Graph state for STATE_SNAPSHOT
-export interface GraphStateSnapshot {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
-}
-
-// AG-UI Event
-export interface AGUIEvent {
-  type: AGUIEventType;
-  step_id?: string;
-  state?: GraphStateSnapshot;
-  delta?: JsonPatchOp[];
-  metadata?: Record<string, unknown>;
-}
-
-export interface TraversalConfig {
-  clinical_note: string;
-  provider?: 'openai' | 'cerebras' | 'sambanova' | 'anthropic' | 'vertexai' | 'other';
-  api_key?: string;
-  model?: string;
-  selector?: 'llm' | 'manual';
-  max_tokens?: number;
-  temperature?: number;
-  extra?: Record<string, string>;  // Provider-specific config (e.g., Vertex AI location/project_id)
-  system_prompt?: string;  // Custom system prompt (uses default if empty)
-  scaffolded?: boolean;    // true = tree traversal (default), false = single-shot
-}
+import type { AGUIEvent, TraversalConfig, RewindConfig, GraphResponse, DeleteCacheResponse, DeleteCacheConfig } from './api.types';
+import { processSSEStream, buildTraversalRequestBody } from './sse';
 
 /**
  * Stream ICD-10-CM traversal results using AG-UI protocol over SSE.
@@ -57,7 +27,6 @@ export interface TraversalConfig {
  * @param config - Traversal configuration
  * @param onEvent - Called for each AG-UI event
  * @param onError - Called on error
- *
  * @returns AbortController to cancel the stream
  *
  * @example
@@ -96,18 +65,7 @@ export function streamTraversal(
           'Content-Type': 'application/json',
           Accept: 'text/event-stream',
         },
-        body: JSON.stringify({
-          clinical_note: config.clinical_note,
-          provider: config.provider ?? 'openai',
-          api_key: config.api_key ?? '',
-          model: config.model ?? null,
-          selector: config.selector ?? 'llm',
-          max_tokens: config.max_tokens ?? null,
-          temperature: config.temperature ?? null,
-          extra: config.extra ?? null,  // Provider-specific config (e.g., Vertex AI location/project_id)
-          system_prompt: config.system_prompt ?? null,
-          scaffolded: config.scaffolded ?? true,
-        }),
+        body: JSON.stringify(buildTraversalRequestBody(config)),
         signal: controller.signal,
       });
 
@@ -115,38 +73,12 @@ export function streamTraversal(
         throw new Error(`HTTP error: ${response.status}`);
       }
 
-      if (!response.body) {
-        throw new Error('No response body');
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) {
-          break;
-        }
-
-        buffer += decoder.decode(value, { stream: true });
-
-        // Parse SSE events from buffer
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? ''; // Keep incomplete line in buffer
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6)) as AGUIEvent;
-              onEvent(data);
-            } catch (parseError) {
-              console.error('Failed to parse SSE event:', parseError);
-            }
-          }
-        }
-      }
+      await processSSEStream(response, {
+        onEvent,
+        onError,
+        signal: controller.signal,
+        logPrefix: 'API',
+      });
     } catch (error) {
       if (error instanceof Error && error.name !== 'AbortError') {
         onError(error);
@@ -171,18 +103,7 @@ export async function runTraversal(
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      clinical_note: config.clinical_note,
-      provider: config.provider ?? 'openai',
-      api_key: config.api_key ?? '',
-      model: config.model ?? null,
-      selector: config.selector ?? 'llm',
-      max_tokens: config.max_tokens ?? null,
-      temperature: config.temperature ?? null,
-      extra: config.extra ?? null,  // Provider-specific config (e.g., Vertex AI location/project_id)
-      system_prompt: config.system_prompt ?? null,
-      scaffolded: config.scaffolded ?? true,
-    }),
+    body: JSON.stringify(buildTraversalRequestBody(config)),
   });
 
   if (!response.ok) {
@@ -190,21 +111,6 @@ export async function runTraversal(
   }
 
   return response.json();
-}
-
-// Rewind configuration for spot rewind feature
-export interface RewindConfig {
-  batch_id: string;
-  feedback: string;
-  provider?: 'openai' | 'cerebras' | 'sambanova' | 'anthropic' | 'vertexai' | 'other';
-  api_key?: string;
-  model?: string;
-  selector?: 'llm' | 'manual';
-  max_tokens?: number;
-  temperature?: number;
-  extra?: Record<string, string>;
-  system_prompt?: string;  // Custom system prompt (uses default if empty)
-  scaffolded?: boolean;    // true = tree traversal (default), false = single-shot
 }
 
 /**
@@ -216,7 +122,6 @@ export interface RewindConfig {
  * @param config - Rewind configuration (batch_id, feedback, LLM settings)
  * @param onEvent - Called for each AG-UI event
  * @param onError - Called on error
- *
  * @returns AbortController to cancel the stream
  *
  * @example
@@ -254,19 +159,12 @@ export function streamRewind(
           'Content-Type': 'application/json',
           Accept: 'text/event-stream',
         },
-        body: JSON.stringify({
+        body: JSON.stringify(buildTraversalRequestBody({
+          ...config,
           batch_id: config.batch_id,
           feedback: config.feedback,
-          provider: config.provider ?? 'openai',
-          api_key: config.api_key ?? '',
-          model: config.model ?? null,
-          selector: config.selector ?? 'llm',
-          max_tokens: config.max_tokens ?? null,
-          temperature: config.temperature ?? null,
-          extra: config.extra ?? null,
-          system_prompt: config.system_prompt ?? null,
-          scaffolded: config.scaffolded ?? true,
-        }),
+          existing_nodes: config.existing_nodes ?? [],
+        })),
         signal: controller.signal,
       });
 
@@ -274,38 +172,12 @@ export function streamRewind(
         throw new Error(`HTTP error: ${response.status}`);
       }
 
-      if (!response.body) {
-        throw new Error('No response body');
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) {
-          break;
-        }
-
-        buffer += decoder.decode(value, { stream: true });
-
-        // Parse SSE events from buffer
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6)) as AGUIEvent;
-              onEvent(data);
-            } catch (parseError) {
-              console.error('Failed to parse SSE event:', parseError);
-            }
-          }
-        }
-      }
+      await processSSEStream(response, {
+        onEvent,
+        onError,
+        signal: controller.signal,
+        logPrefix: 'API Rewind',
+      });
     } catch (error) {
       if (error instanceof Error && error.name !== 'AbortError') {
         onError(error);
@@ -314,13 +186,6 @@ export function streamRewind(
   })();
 
   return controller;
-}
-
-// Graph API response for VISUALIZE tab
-export interface GraphResponse {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
-  stats: { input_count: number; node_count: number };
 }
 
 /**
@@ -341,6 +206,37 @@ export async function buildGraph(codes: string[]): Promise<GraphResponse> {
   if (!response.ok) {
     const error = await response.json();
     throw new Error(error.detail || 'Failed to build graph');
+  }
+
+  return response.json();
+}
+
+/**
+ * Delete a cached traversal state.
+ *
+ * Use this when a traversal is cancelled or reset to ensure a fresh run.
+ *
+ * @param config - The same config used for the traversal (to generate matching partition key)
+ * @returns Promise with deletion result
+ */
+export async function deleteCacheEntry(config: DeleteCacheConfig): Promise<DeleteCacheResponse> {
+  const response = await fetch('/api/cache/delete', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      clinical_note: config.clinical_note,
+      provider: config.provider,
+      model: config.model,
+      temperature: config.temperature ?? 0.0,
+      scaffolded: config.scaffolded ?? true,
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || 'Failed to delete cache entry');
   }
 
   return response.json();

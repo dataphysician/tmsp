@@ -245,15 +245,9 @@ class SpawnParallelBatches(MapStates):
         state_persister = _cascade_adapter(self.state_persister(), context.state_persister)
         state_initializer = _cascade_adapter(self.state_initializer(), context.state_initializer)
 
-        # Detect retry context
-        _app_id_check = "_retry" in context.app_id if hasattr(context, "app_id") else False
-        try:
-            _fm = state.get("feedback_map", {})
-            _feedback_map_check = _fm and len(_fm) > 0
-        except Exception:
-            _feedback_map_check = False
-
-        is_retry = _app_id_check or _feedback_map_check
+        # Detect retry context (rewind- prefix set by retry_node)
+        _app_id = getattr(context, "app_id", "") or ""
+        is_retry = "rewind-" in _app_id
 
         for substate in self.states(state, context, inputs):
             batch_id = substate.get("current_batch_id")
@@ -375,6 +369,8 @@ class SpawnSevenChr(MapStates):
         # Extract batch_name from authority dict
         authority_node_id = authority["batch_name"] if authority else None
 
+        print(f"\n[SPAWN7CHR DEBUG] batch={current_batch_id}, base_node={base_node_id}, authority={authority}")
+
         if not authority_node_id:
             print(f"\n{'=' * 60}")
             print(f"[{current_batch_id}] No sevenChrDef authority - skipping")
@@ -395,6 +391,43 @@ class SpawnSevenChr(MapStates):
         else:
             # For codes without dot (shouldn't happen for sevenChrDef candidates)
             subcategory = base_node_id[3:] if len(base_node_id) > 3 else ""
+
+        # ALSO check: if the potential placeholder (base + X) exists in the index with real children,
+        # we should NOT create a placeholder - instead let the traversal continue through the real node
+        potential_placeholder = base_node_id + "X"
+        placeholder_exists_with_children = (
+            potential_placeholder in ICD_INDEX and
+            bool(ICD_INDEX[potential_placeholder].get("children"))
+        )
+
+        if placeholder_exists_with_children:
+            print(f"\n{'=' * 60}")
+            print(f"[7CHR REVITALIZE] {potential_placeholder} exists in index with real children!")
+            print(f"Children: {list(ICD_INDEX[potential_placeholder].get('children', {}).keys())[:5]}...")
+            print(f"Spawning {potential_placeholder}|children instead of placeholder")
+            print(f"{'=' * 60}\n")
+
+            # Spawn the real node's children batch instead of treating as placeholder
+            child_batch_id = f"{potential_placeholder}|children"
+
+            if child_batch_id in batch_data:
+                print(f"[{current_batch_id}] -> Skipping duplicate batch: {child_batch_id}")
+                return
+
+            child_batch_data = batch_data.copy()
+            child_batch_data[child_batch_id] = {
+                "node_id": potential_placeholder,
+                "parent_id": base_node_id,
+                "seven_chr_authority": authority,
+                "depth": ICD_INDEX[potential_placeholder].get("depth", 0),
+            }
+
+            yield state.update(
+                current_batch_id=child_batch_id,
+                batch_data=child_batch_data,
+                final_nodes=[],
+            )
+            return
 
         # ICD-10-CM: subcategory needs 3 chars before 7th char can be added
         needs_placeholder = len(subcategory) < 3 and not node_has_real_children
@@ -543,15 +576,9 @@ class SpawnSevenChr(MapStates):
         state_persister = _cascade_adapter(self.state_persister(), context.state_persister)
         state_initializer = _cascade_adapter(self.state_initializer(), context.state_initializer)
 
-        # Detect retry context
-        _app_id_check = "_retry" in context.app_id if hasattr(context, "app_id") else False
-        try:
-            _fm = state.get("feedback_map", {})
-            _feedback_map_check = _fm and len(_fm) > 0
-        except Exception:
-            _feedback_map_check = False
-
-        is_retry = _app_id_check or _feedback_map_check
+        # Detect retry context (rewind- prefix set by retry_node)
+        _app_id = getattr(context, "app_id", "") or ""
+        is_retry = "rewind-" in _app_id
 
         for substate in self.states(state, context, inputs):
             batch_id = substate.get("current_batch_id")

@@ -52,12 +52,18 @@ from agent.zero_shot import (
     ZERO_SHOT_PERSISTER,
 )
 
-# Scaffolded traversal cache key generator
-from agent.traversal import generate_traversal_cache_key
+# Scaffolded traversal cache key generator and state management
+from agent.traversal import generate_traversal_cache_key, delete_persisted_state, PERSISTER, initialize_persister
 
-# Helper to check if a node has sevenChrDef metadata
+# Helper to check if a node DIRECTLY has sevenChrDef metadata
+# Note: This is for visual "activator" category only - NOT for sevenChrDef processing
+# Nodes that inherit sevenChrDef from ancestors (self-activation) are NOT activators visually
 def node_has_seven_chr_def(code: str) -> bool:
-    """Check if a node has sevenChrDef metadata."""
+    """Check if a node directly has sevenChrDef metadata.
+
+    Only returns True for nodes like T36, T88 that have sevenChrDef in their own metadata.
+    Returns False for descendants like T36.1, T88.7 that inherit via self-activation.
+    """
     if code not in data:
         return False
     entry = data[code]
@@ -221,30 +227,57 @@ async def get_graph(request: GraphRequest) -> GraphResponse:
             )
         )
 
-    # Build set of lateral link edges
+    # Build lookup from lateral links for edge rules
     lateral_links = result.get("lateral_links", [])
-    lateral_edge_set = {(src, tgt) for src, tgt, _ in lateral_links}
+    lateral_link_rules: dict[tuple[str, str], str] = {
+        (src, tgt): rule for src, tgt, rule in lateral_links
+    }
 
     # Add tree edges (parent-child relationships)
+    # Lateral links ARE in tree for connectivity - mark them as LATERAL edge type
     seventh_char = result.get("seventh_char", {})
     tree = result["tree"]
+    added_edges: set[tuple[str, str]] = set()
 
     for parent in tree:
         for child in tree[parent]:
-            # Skip if this is a lateral link
-            if (parent, child) in lateral_edge_set:
-                continue
+            added_edges.add((parent, child))
 
-            # Check if this is a sevenChrDef edge
-            if child in seventh_char:
+            # Check if this is a lateral link (codeFirst, codeAlso, useAdditionalCode)
+            if (parent, child) in lateral_link_rules:
                 edges.append(
                     GraphEdge(
                         source=parent,
                         target=child,
                         edge_type=EdgeType.LATERAL,
-                        rule="sevenChrDef",
+                        rule=lateral_link_rules[(parent, child)],
                     )
                 )
+            # Check if this is a sevenChrDef edge
+            # Only mark as sevenChrDef if this is the edge from depth-6 to depth-7
+            # (the immediate parent of the 7th char code, not any ancestor)
+            elif child in seventh_char:
+                parent_depth = node_depths.get(parent, 0)
+                child_depth = node_depths.get(child, 0)
+                if parent_depth == 6 and child_depth == 7:
+                    edges.append(
+                        GraphEdge(
+                            source=parent,
+                            target=child,
+                            edge_type=EdgeType.LATERAL,
+                            rule="sevenChrDef",
+                        )
+                    )
+                else:
+                    # Regular hierarchy edge from ancestors to 7th char codes
+                    edges.append(
+                        GraphEdge(
+                            source=parent,
+                            target=child,
+                            edge_type=EdgeType.HIERARCHY,
+                            rule=None,
+                        )
+                    )
             else:
                 edges.append(
                     GraphEdge(
@@ -255,16 +288,18 @@ async def get_graph(request: GraphRequest) -> GraphResponse:
                     )
                 )
 
-    # Add lateral link edges
+    # Add remaining lateral link edges that aren't in tree
+    # (annotation-only links where both nodes exist but aren't parent-child)
     for source, target, key in lateral_links:
-        edges.append(
-            GraphEdge(
-                source=source,
-                target=target,
-                edge_type=EdgeType.LATERAL,
-                rule=key,
+        if (source, target) not in added_edges:
+            edges.append(
+                GraphEdge(
+                    source=source,
+                    target=target,
+                    edge_type=EdgeType.LATERAL,
+                    rule=key,
+                )
             )
-        )
 
     return GraphResponse(
         nodes=nodes,
@@ -344,6 +379,76 @@ class TraversalCompleteEvent(BaseModel):
     type: str = "complete"
     final_nodes: list[str]
     batch_count: int
+
+
+class DeleteCacheRequest(BaseModel):
+    """Request to delete a cached traversal state."""
+
+    clinical_note: str
+    provider: str
+    model: str
+    temperature: float = 0.0
+    scaffolded: bool = True  # True for tree traversal, False for zero-shot
+
+
+class DeleteCacheResponse(BaseModel):
+    """Response from cache deletion."""
+
+    deleted: bool
+    partition_key: str
+    message: str
+
+
+@app.post("/api/cache/delete", response_model=DeleteCacheResponse)
+async def delete_cache_entry(request: DeleteCacheRequest):
+    """Delete a specific cached traversal state.
+
+    Use this when a traversal is cancelled or reset to ensure a fresh run.
+    Generates the partition key from the same parameters used during traversal.
+    """
+    from agent.zero_shot import generate_zero_shot_cache_key
+
+    if request.scaffolded:
+        # Generate the same partition key used for scaffolded traversal
+        partition_key = generate_traversal_cache_key(
+            clinical_note=request.clinical_note,
+            provider=request.provider,
+            model=request.model,
+            temperature=request.temperature,
+        )
+        deleted = await delete_persisted_state(
+            partition_key=partition_key,
+            app_id="ROOT",
+            db_path="./cache.db",
+            table_name="burr_state",
+        )
+    else:
+        # Generate the same partition key used for zero-shot
+        partition_key = generate_zero_shot_cache_key(
+            clinical_note=request.clinical_note,
+            provider=request.provider,
+            model=request.model,
+            temperature=request.temperature,
+        )
+        deleted = await delete_persisted_state(
+            partition_key=partition_key,
+            app_id="zero_shot",
+            db_path="./cache.db",
+            table_name="zero_shot_state",
+        )
+
+    if deleted:
+        return DeleteCacheResponse(
+            deleted=True,
+            partition_key=partition_key,
+            message="Cache entry deleted successfully",
+        )
+    else:
+        return DeleteCacheResponse(
+            deleted=False,
+            partition_key=partition_key,
+            message="Cache entry not found or already deleted",
+        )
 
 
 @app.post("/api/traverse/stream")
@@ -458,14 +563,22 @@ async def stream_traversal(request: TraversalRequest):
                     batch_edges.append(base_edge_data)
 
         # Special handling for sevenChrDef batches:
-        # - selected_ids already contains full codes (e.g., ["T36.1X5A"]) - transformed by actions.py
+        # - selected_ids contains full codes (e.g., ["T36.1X5A"]) - transformed by actions.py
         # - For codes at depth 3-5, create placeholder nodes (with X padding) until depth 6
         # - The 7th char node is added via lateral edge from the depth-6 node
         if batch_type == "sevenChrDef" and selected_ids and node_id:
-            # selected_ids[0] is already the full code (e.g., "T36.1X5A"), not just the character
-            full_code = selected_ids[0]
-            # Extract the 7th character for label lookup in candidates
-            seventh_char = full_code[-1] if full_code else ""
+            # Extract the 7th character from selected_ids (last char of full code)
+            seventh_char = selected_ids[0][-1] if selected_ids[0] else ""
+
+            # CRITICAL FIX: Compute full_code from node_id + 7th char
+            # This ensures the code matches the batch's node, preventing cross-batch contamination
+            if "." in node_id:
+                base_category, base_subcategory = node_id.split(".", 1)
+            else:
+                base_category = node_id[:3] if len(node_id) >= 3 else node_id
+                base_subcategory = node_id[3:] if len(node_id) > 3 else ""
+            # Pad subcategory to 3 chars and add 7th character
+            full_code = f"{base_category}.{base_subcategory.ljust(3, 'X')}{seventh_char}"
 
             # Get base code depth to determine if placeholder nodes are needed
             base_depth = data.get(node_id, {}).get("depth", depth)
@@ -475,6 +588,7 @@ async def stream_traversal(request: TraversalRequest):
             # Depth 3 = category (T36), depth 4 = 4-char (T36.1), depth 5 = 5-char (T36.1X)
             # depth 6 = 6-char (T36.1X5), depth 7 = 7-char (T36.1X5A)
             prev_node = node_id
+            print(f"[SEVENCHRDEF] node_id={node_id}, full_code={full_code}, base_depth={base_depth}, seventh_char={seventh_char}")
             if base_depth < 6:
                 # Parse base code to determine how many X's to add
                 if "." in node_id:
@@ -485,10 +599,12 @@ async def stream_traversal(request: TraversalRequest):
 
                 # Create placeholder nodes from current length to depth 6
                 current_sub = subcategory
+                print(f"[SEVENCHRDEF] Creating placeholders: subcategory={subcategory}, range({len(subcategory)}, 3)")
                 for i in range(len(subcategory), 3):  # Pad to 3 chars (positions 4-6)
                     current_sub += "X"
                     placeholder_code = f"{category}.{current_sub}"
                     placeholder_depth = base_depth + (i - len(subcategory) + 1)
+                    print(f"[SEVENCHRDEF] Creating placeholder: {placeholder_code} at depth {placeholder_depth}, prev_node={prev_node}")
 
                     # Always collect for batch data (reconciliation)
                     placeholder_node_data = {
@@ -521,20 +637,43 @@ async def stream_traversal(request: TraversalRequest):
                             value=placeholder_node_data,
                         ))
 
-                        edge_key = (prev_node, placeholder_code)
-                        if edge_key not in seen_edges:
-                            seen_edges.add(edge_key)
-                            ops.append(JsonPatchOp(
-                                op="add",
-                                path="/edges/-",
-                                value=placeholder_edge_data,
-                            ))
+                    # Edge creation is OUTSIDE node check - edges need to be created
+                    # even if node already exists (e.g., created by placeholder children batch)
+                    edge_key = (prev_node, placeholder_code)
+                    if edge_key not in seen_edges:
+                        seen_edges.add(edge_key)
+                        ops.append(JsonPatchOp(
+                            op="add",
+                            path="/edges/-",
+                            value=placeholder_edge_data,
+                        ))
 
                     prev_node = placeholder_code
 
             # Create the final 7th character node
             # candidates is keyed by full code (transformed by actions.py), e.g. {"T36.1X5A": "description"}
             label = f"{seventh_char}: {candidates.get(full_code, seventh_char)}"
+
+            # Use prev_node as edge source - it's the depth-6 node computed from node_id
+            # (either the original node_id if already depth 6, or the last placeholder created)
+            # This is now consistent with full_code since both are derived from node_id
+            correct_edge_source = prev_node
+
+            # Ensure the parent node exists in the graph (create placeholder if needed)
+            if correct_edge_source not in seen_nodes:
+                seen_nodes[correct_edge_source] = node_count
+                node_count += 1
+                parent_depth = 6  # 7th char parent is always depth 6
+                parent_node_data = {
+                    "id": correct_edge_source,
+                    "code": correct_edge_source,
+                    "label": "Placeholder" if correct_edge_source.endswith("X") else data.get(correct_edge_source, {}).get("label", correct_edge_source),
+                    "depth": parent_depth,
+                    "category": "placeholder" if correct_edge_source.endswith("X") else "ancestor",
+                    "billable": False,
+                }
+                ops.append(JsonPatchOp(op="add", path="/nodes/-", value=parent_node_data))
+                batch_nodes.append(parent_node_data)
 
             # Always collect for batch data (reconciliation)
             final_node_data = {
@@ -548,7 +687,7 @@ async def stream_traversal(request: TraversalRequest):
             batch_nodes.append(final_node_data)
 
             final_edge_data = {
-                "source": prev_node,
+                "source": correct_edge_source,
                 "target": full_code,
                 "edge_type": "lateral",
                 "rule": "sevenChrDef",
@@ -566,7 +705,7 @@ async def stream_traversal(request: TraversalRequest):
                 ))
                 # Note: Don't add to /finalized/- here - authoritative count comes from RUN_FINISHED
 
-                edge_key = (prev_node, full_code)
+                edge_key = (correct_edge_source, full_code)
                 if edge_key not in seen_edges:
                     seen_edges.add(edge_key)
                     ops.append(JsonPatchOp(
@@ -819,13 +958,78 @@ async def stream_traversal(request: TraversalRequest):
                   f"model={llm_config.LLM_CONFIG.model}, base_url={llm_config.LLM_CONFIG.base_url}, "
                   f"temperature={llm_config.LLM_CONFIG.temperature}, max_tokens={llm_config.LLM_CONFIG.max_completion_tokens}")
             print(f"[SERVER] API key set: {'Yes' if llm_config.LLM_CONFIG.api_key else 'NO!'}")
+            print(f"[SERVER] Extra config: {llm_config.LLM_CONFIG.extra}")
+            print(f"[SERVER] Settings hash (for cache): {llm_config.LLM_CONFIG.settings_hash()}")
             print(f"[SERVER] Clinical note length: {len(request.clinical_note)} chars")
             print(f"[SERVER] Scaffolded mode: {request.scaffolded}")
             if request.system_prompt:
                 print(f"[SERVER] Custom system prompt: {len(request.system_prompt)} chars")
 
-            # RUN_STARTED
-            yield f"data: {AGUIEvent(type=AGUIEventType.RUN_STARTED, metadata={'clinical_note': request.clinical_note[:100]}).model_dump_json()}\n\n"
+            # Check cache BEFORE emitting RUN_STARTED
+            # This allows frontend to know upfront if this is a cached replay
+            #
+            # IMPORTANT: For scaffolded mode, we call build_app() here (single source of truth)
+            # rather than doing a separate cache check. This eliminates the dual cache check
+            # issue where the early check and build_app() could disagree about cache status.
+            is_cached = False
+            scaffolded_burr_app = None  # Will be set for scaffolded mode
+            scaffolded_partition_key = None
+
+            if not request.scaffolded:
+                # Zero-shot mode: check cache
+                await initialize_zero_shot_persister(reset=not request.persist_cache)
+                zs_partition_key = generate_zero_shot_cache_key(
+                    clinical_note=request.clinical_note,
+                    provider=request.provider,
+                    model=request.model or "",
+                    temperature=request.temperature or 0.0,
+                    max_completion_tokens=request.max_tokens,
+                    system_prompt=request.system_prompt,
+                )
+                if ZERO_SHOT_PERSISTER is not None:
+                    cached_state = await ZERO_SHOT_PERSISTER.load(
+                        partition_key=zs_partition_key,
+                        app_id="zero_shot",
+                    )
+                    is_cached = (
+                        cached_state is not None
+                        and cached_state.get("state", {}).get("selected_codes") is not None
+                    )
+                print(f"[SERVER] Zero-shot cache check: partition_key={zs_partition_key}, cached={is_cached}")
+            else:
+                # Scaffolded mode: call build_app() directly (single source of truth for cache status)
+                # This eliminates the dual cache check issue - build_app() is the authoritative check
+                scaffolded_partition_key = generate_traversal_cache_key(
+                    clinical_note=request.clinical_note,
+                    provider=request.provider,
+                    model=request.model or "",
+                    temperature=request.temperature or 0.0,
+                    system_prompt=request.system_prompt,
+                )
+                print(f"[SERVER] Scaffolded cache key: {scaffolded_partition_key}")
+
+                # Initialize persister
+                await initialize_persister(reset=not request.persist_cache)
+
+                # Set callback for streaming (needed before build_app for live traversal)
+                set_batch_callback(on_batch_complete)
+                print("[SERVER] Batch callback registered")
+
+                # Build app - this is the SINGLE cache check (no separate early check)
+                scaffolded_burr_app, is_cached = await build_app(
+                    context=request.clinical_note,
+                    default_selector=request.selector,
+                    with_persistence=True,
+                    partition_key=scaffolded_partition_key,
+                )
+                print(f"[SERVER] Scaffolded build_app result: cached={is_cached}")
+
+            # RUN_STARTED with cache flag
+            run_started_event = AGUIEvent(
+                type=AGUIEventType.RUN_STARTED,
+                metadata={'clinical_note': request.clinical_note[:100], 'cached': is_cached}
+            )
+            yield f"data: {run_started_event.model_dump_json()}\n\n"
 
             # STATE_SNAPSHOT with ROOT node
             initial_state = GraphState(
@@ -846,9 +1050,8 @@ async def stream_traversal(request: TraversalRequest):
                 # Zero-shot mode: Burr app with SQLite caching
                 print("[SERVER] Running in ZERO-SHOT mode (Burr app with caching)")
 
-                # Initialize zero-shot persister if needed
-                if ZERO_SHOT_PERSISTER is None:
-                    await initialize_zero_shot_persister()
+                # Initialize zero-shot persister (reset if persist_cache=False)
+                await initialize_zero_shot_persister(reset=not request.persist_cache)
 
                 # Generate cache key from request parameters
                 partition_key = generate_zero_shot_cache_key(
@@ -1008,165 +1211,160 @@ async def stream_traversal(request: TraversalRequest):
                 return  # Exit generator - zero-shot mode complete
 
             # Scaffolded mode: Tree traversal with Burr
-            # Generate partition key for cross-run caching
-            partition_key = generate_traversal_cache_key(
-                clinical_note=request.clinical_note,
-                provider=request.provider,
-                model=request.model or "",
-                temperature=request.temperature or 0.0,
-                system_prompt=request.system_prompt,
-            )
-            print(f"[SERVER] Scaffolded cache key: {partition_key}")
+            # NOTE: build_app() was already called in the early check section above
+            # This ensures RUN_STARTED has the accurate cache status (single source of truth)
+            # Just use the already-built app and cache status
+            burr_app = scaffolded_burr_app
+            partition_key = scaffolded_partition_key
 
-            # Initialize persister (don't reset - preserve cache across runs)
-            await initialize_persister(reset=False)
-
-            # Set callback for streaming
-            set_batch_callback(on_batch_complete)
-            print("[SERVER] Batch callback registered")
-
-            # Build app (checks cache and returns early if hit)
-            burr_app, was_cached = await build_app(
-                context=request.clinical_note,
-                default_selector=request.selector,
-                with_persistence=True,
-                partition_key=partition_key,
-            )
-
-            if was_cached:
-                # Cache hit! Replay cached batches to reconstruct full graph
-                print("[SERVER] Scaffolded CACHE HIT - replaying cached batches")
+            if is_cached:
+                # Cache hit! Emit STATE_SNAPSHOT with complete graph (AG-UI protocol aligned)
+                # Instead of replaying 500+ individual events, send a single snapshot
+                print("[SERVER] Scaffolded CACHE HIT - emitting STATE_SNAPSHOT")
                 final_state = burr_app.state
                 final_nodes = final_state.get("final_nodes", [])
                 batch_data = final_state.get("batch_data", {})
 
-                # Track seen nodes/edges for deduplication (same as live traversal)
-                replay_seen_nodes: dict[str, int] = {"ROOT": 0}
-                replay_seen_edges: set[tuple[str, str]] = set()
-                replay_node_count = 1
+                # Build complete graph from cached state (single pass)
+                # Use different variable names to avoid shadowing outer function's seen_nodes/seen_edges
+                # (which are used by the live traversal path for finalization)
+                snapshot_nodes: list[dict] = [{"id": "ROOT", "code": "ROOT", "label": "ROOT", "depth": 0, "category": "root", "billable": False}]
+                snapshot_edges: list[dict] = []
+                snapshot_seen_nodes: set[str] = {"ROOT"}
+                snapshot_seen_edges: set[tuple[str, str]] = set()
 
-                # Sort batches by depth to replay in correct order (parents before children)
-                # Include ROOT batch - it must be replayed first for tree structure
+                # Sort batches by depth to ensure parents are processed before children
                 sorted_batches = sorted(
                     [(bid, binfo) for bid, binfo in batch_data.items()],
                     key=lambda x: (x[1].get("depth", 0), x[0])
                 )
 
-                print(f"[CACHE REPLAY] Replaying {len(sorted_batches)} batches")
+                print(f"[CACHE SNAPSHOT] Building snapshot from {len(sorted_batches)} batches")
 
-                # Replay each batch with STEP_STARTED, STATE_DELTA, STEP_FINISHED
+                # Build all nodes and edges from cached batch data
                 for batch_id, batch_info in sorted_batches:
                     node_id = batch_info.get("node_id")
                     parent_id = batch_info.get("parent_id")
                     depth = batch_info.get("depth", 0)
                     candidates = batch_info.get("candidates", {})
                     selected_ids = batch_info.get("selected_ids", [])
-                    reasoning = batch_info.get("reasoning", "[CACHED]")
                     seven_chr_authority = batch_info.get("seven_chr_authority")
-
-                    # Parse batch_type from batch_id
                     batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
 
-                    # Emit STEP_STARTED
-                    yield f"data: {AGUIEvent(type=AGUIEventType.STEP_STARTED, step_id=batch_id).model_dump_json()}\n\n"
-
-                    # Build STATE_DELTA ops (mirrors on_batch_complete logic)
-                    ops: list[JsonPatchOp] = []
+                    # Transform selected_ids for sevenChrDef batches
+                    if batch_type == "sevenChrDef" and node_id and selected_ids:
+                        selected_ids = [format_with_seventh_char(node_id, char) for char in selected_ids]
 
                     # Handle sevenChrDef batches
-                    if batch_type == "sevenChrDef" and node_id and node_id not in replay_seen_nodes:
-                        replay_seen_nodes[node_id] = replay_node_count
-                        replay_node_count += 1
-
-                        if node_id in data:
-                            node_label = data[node_id].get("label", node_id)
-                            node_depth = data[node_id].get("depth", depth)
-                            node_category = "activator" if node_has_seven_chr_def(node_id) else "ancestor"
-                        else:
-                            node_label = "Placeholder"
-                            node_depth = depth
-                            node_category = "placeholder"
-
-                        ops.append(JsonPatchOp(op="add", path="/nodes/-", value={
-                            "id": node_id, "code": node_id, "label": node_label,
-                            "depth": node_depth, "category": node_category, "billable": False,
-                        }))
+                    if batch_type == "sevenChrDef" and node_id:
+                        # Add base node if not seen
+                        if node_id not in snapshot_seen_nodes:
+                            snapshot_seen_nodes.add(node_id)
+                            if node_id in data:
+                                node_label = data[node_id].get("label", node_id)
+                                node_depth = data[node_id].get("depth", depth)
+                                node_category = "activator" if node_has_seven_chr_def(node_id) else "ancestor"
+                            else:
+                                node_label = "Placeholder"
+                                node_depth = depth
+                                node_category = "placeholder"
+                            snapshot_nodes.append({
+                                "id": node_id, "code": node_id, "label": node_label,
+                                "depth": node_depth, "category": node_category, "billable": False,
+                            })
 
                         if parent_id and parent_id != node_id:
                             edge_key = (parent_id, node_id)
-                            if edge_key not in replay_seen_edges:
-                                replay_seen_edges.add(edge_key)
-                                ops.append(JsonPatchOp(op="add", path="/edges/-", value={
+                            if edge_key not in snapshot_seen_edges:
+                                snapshot_seen_edges.add(edge_key)
+                                snapshot_edges.append({
                                     "source": parent_id, "target": node_id,
                                     "edge_type": "hierarchy", "rule": None,
-                                }))
+                                })
 
-                    # Handle sevenChrDef final node creation
-                    if batch_type == "sevenChrDef" and selected_ids and node_id:
-                        full_code = selected_ids[0]
-                        seventh_char = full_code[-1] if full_code else ""
-
-                        base_depth = data.get(node_id, {}).get("depth", depth)
-                        prev_node = node_id
-
-                        # Create placeholder nodes if needed
-                        if base_depth < 6:
+                        # Create 7th character node if selected
+                        if selected_ids:
+                            seventh_char = selected_ids[0][-1] if selected_ids[0] else ""
                             if "." in node_id:
-                                category, subcategory = node_id.split(".", 1)
+                                base_category, base_subcategory = node_id.split(".", 1)
                             else:
-                                category = node_id[:3] if len(node_id) >= 3 else node_id
-                                subcategory = node_id[3:] if len(node_id) > 3 else ""
+                                base_category = node_id[:3] if len(node_id) >= 3 else node_id
+                                base_subcategory = node_id[3:] if len(node_id) > 3 else ""
+                            full_code = f"{base_category}.{base_subcategory.ljust(3, 'X')}{seventh_char}"
 
-                            current_sub = subcategory
-                            for i in range(len(subcategory), 3):
-                                current_sub += "X"
-                                placeholder_code = f"{category}.{current_sub}"
-                                placeholder_depth = base_depth + (i - len(subcategory) + 1)
+                            # Transform candidates for label lookup
+                            transformed_candidates = {}
+                            for char, desc in candidates.items():
+                                transformed_code = format_with_seventh_char(node_id, char)
+                                transformed_candidates[transformed_code] = desc
 
-                                if placeholder_code not in replay_seen_nodes:
-                                    replay_seen_nodes[placeholder_code] = replay_node_count
-                                    replay_node_count += 1
-                                    ops.append(JsonPatchOp(op="add", path="/nodes/-", value={
-                                        "id": placeholder_code, "code": placeholder_code,
-                                        "label": "Placeholder", "depth": placeholder_depth,
-                                        "category": "placeholder", "billable": False,
-                                    }))
+                            base_depth = data.get(node_id, {}).get("depth", depth)
+                            prev_node = node_id
+
+                            # Create placeholder nodes if base is shallower than depth 6
+                            if base_depth < 6:
+                                if "." in node_id:
+                                    category, subcategory = node_id.split(".", 1)
+                                else:
+                                    category = node_id[:3] if len(node_id) >= 3 else node_id
+                                    subcategory = node_id[3:] if len(node_id) > 3 else ""
+
+                                current_sub = subcategory
+                                for i in range(len(subcategory), 3):
+                                    current_sub += "X"
+                                    placeholder_code = f"{category}.{current_sub}"
+                                    placeholder_depth = base_depth + (i - len(subcategory) + 1)
+
+                                    if placeholder_code not in snapshot_seen_nodes:
+                                        snapshot_seen_nodes.add(placeholder_code)
+                                        snapshot_nodes.append({
+                                            "id": placeholder_code, "code": placeholder_code,
+                                            "label": "Placeholder", "depth": placeholder_depth,
+                                            "category": "placeholder", "billable": False,
+                                        })
 
                                     edge_key = (prev_node, placeholder_code)
-                                    if edge_key not in replay_seen_edges:
-                                        replay_seen_edges.add(edge_key)
-                                        ops.append(JsonPatchOp(op="add", path="/edges/-", value={
+                                    if edge_key not in snapshot_seen_edges:
+                                        snapshot_seen_edges.add(edge_key)
+                                        snapshot_edges.append({
                                             "source": prev_node, "target": placeholder_code,
                                             "edge_type": "hierarchy", "rule": None,
-                                        }))
+                                        })
+                                    prev_node = placeholder_code
 
-                                prev_node = placeholder_code
+                            # Create depth-6 parent if needed
+                            if prev_node not in snapshot_seen_nodes:
+                                snapshot_seen_nodes.add(prev_node)
+                                snapshot_nodes.append({
+                                    "id": prev_node, "code": prev_node,
+                                    "label": "Placeholder" if prev_node.endswith("X") else data.get(prev_node, {}).get("label", prev_node),
+                                    "depth": 6,
+                                    "category": "placeholder" if prev_node.endswith("X") else "ancestor",
+                                    "billable": False,
+                                })
 
-                        # Create final 7th character node
-                        label = f"{seventh_char}: {candidates.get(full_code, seventh_char)}"
-                        if full_code not in replay_seen_nodes:
-                            replay_seen_nodes[full_code] = replay_node_count
-                            replay_node_count += 1
-                            ops.append(JsonPatchOp(op="add", path="/nodes/-", value={
-                                "id": full_code, "code": full_code, "label": label,
-                                "depth": 7, "category": "finalized", "billable": True,
-                            }))
+                            # Create final 7th character node
+                            label = f"{seventh_char}: {transformed_candidates.get(full_code, seventh_char)}"
+                            if full_code not in snapshot_seen_nodes:
+                                snapshot_seen_nodes.add(full_code)
+                                snapshot_nodes.append({
+                                    "id": full_code, "code": full_code, "label": label,
+                                    "depth": 7, "category": "finalized", "billable": True,
+                                })
 
                             edge_key = (prev_node, full_code)
-                            if edge_key not in replay_seen_edges:
-                                replay_seen_edges.add(edge_key)
-                                ops.append(JsonPatchOp(op="add", path="/edges/-", value={
+                            if edge_key not in snapshot_seen_edges:
+                                snapshot_seen_edges.add(edge_key)
+                                snapshot_edges.append({
                                     "source": prev_node, "target": full_code,
                                     "edge_type": "lateral", "rule": "sevenChrDef",
-                                }))
+                                })
 
                     # Regular batches (children, codeFirst, codeAlso, etc.)
                     elif batch_type != "sevenChrDef":
-                        # Add the traversed node itself
-                        if node_id and node_id != "ROOT" and node_id not in replay_seen_nodes:
-                            replay_seen_nodes[node_id] = replay_node_count
-                            replay_node_count += 1
-
+                        # Add traversed node
+                        if node_id and node_id != "ROOT" and node_id not in snapshot_seen_nodes:
+                            snapshot_seen_nodes.add(node_id)
                             if node_id in data:
                                 node_label = data[node_id].get("label", node_id)
                                 node_depth = data[node_id].get("depth", depth)
@@ -1181,25 +1379,24 @@ async def stream_traversal(request: TraversalRequest):
                             else:
                                 node_category = "ancestor"
 
-                            ops.append(JsonPatchOp(op="add", path="/nodes/-", value={
+                            snapshot_nodes.append({
                                 "id": node_id, "code": node_id, "label": node_label,
                                 "depth": node_depth, "category": node_category, "billable": False,
-                            }))
+                            })
 
-                            if parent_id and parent_id != node_id:
-                                edge_key = (parent_id, node_id)
-                                if edge_key not in replay_seen_edges:
-                                    replay_seen_edges.add(edge_key)
-                                    ops.append(JsonPatchOp(op="add", path="/edges/-", value={
-                                        "source": parent_id, "target": node_id,
-                                        "edge_type": "hierarchy", "rule": None,
-                                    }))
+                        if node_id and parent_id and parent_id != node_id:
+                            edge_key = (parent_id, node_id)
+                            if edge_key not in snapshot_seen_edges:
+                                snapshot_seen_edges.add(edge_key)
+                                snapshot_edges.append({
+                                    "source": parent_id, "target": node_id,
+                                    "edge_type": "hierarchy", "rule": None,
+                                })
 
                         # Add selected children
                         for code in selected_ids:
-                            if code not in replay_seen_nodes:
-                                replay_seen_nodes[code] = replay_node_count
-                                replay_node_count += 1
+                            if code not in snapshot_seen_nodes:
+                                snapshot_seen_nodes.add(code)
                                 label = candidates.get(code, code)
 
                                 if code in data:
@@ -1219,10 +1416,10 @@ async def stream_traversal(request: TraversalRequest):
                                 is_activator = code_category == "activator"
                                 billable = not has_children and not has_authority and not is_activator
 
-                                ops.append(JsonPatchOp(op="add", path="/nodes/-", value={
+                                snapshot_nodes.append({
                                     "id": code, "code": code, "label": label,
                                     "depth": code_depth, "category": code_category, "billable": billable,
-                                }))
+                                })
 
                             # Add edge
                             edge_source = node_id if node_id and node_id != "ROOT" else "ROOT"
@@ -1235,20 +1432,40 @@ async def stream_traversal(request: TraversalRequest):
                                 edge_type = "hierarchy"
                                 rule = None
 
-                            if edge_key not in replay_seen_edges:
-                                replay_seen_edges.add(edge_key)
-                                ops.append(JsonPatchOp(op="add", path="/edges/-", value={
+                            if edge_key not in snapshot_seen_edges:
+                                snapshot_seen_edges.add(edge_key)
+                                snapshot_edges.append({
                                     "source": edge_source, "target": code,
                                     "edge_type": edge_type, "rule": rule,
-                                }))
+                                })
 
-                    # Emit STATE_DELTA if we have ops
-                    if ops:
-                        yield f"data: {AGUIEvent(type=AGUIEventType.STATE_DELTA, delta=ops).model_dump_json()}\n\n"
+                # Build all decisions for benchmark comparison
+                all_decisions: list[dict] = []
+                for batch_id, batch_info in sorted_batches:
+                    node_id = batch_info.get("node_id")
+                    candidates = batch_info.get("candidates", {})
+                    selected_ids = batch_info.get("selected_ids", [])
+                    reasoning = batch_info.get("reasoning", "[CACHED]")
+                    seven_chr_authority = batch_info.get("seven_chr_authority")
+                    depth = batch_info.get("depth", 0)
+                    batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
 
-                    # Compute selected_details for reconciliation
+                    # Transform selected_ids for sevenChrDef
+                    transformed_selected_ids = selected_ids
+                    if batch_type == "sevenChrDef" and node_id and selected_ids:
+                        transformed_selected_ids = [format_with_seventh_char(node_id, char) for char in selected_ids]
+
+                    # Transform candidates for sevenChrDef
+                    step_candidates = candidates
+                    if batch_type == "sevenChrDef" and node_id:
+                        step_candidates = {}
+                        for char, desc in candidates.items():
+                            transformed_code = format_with_seventh_char(node_id, char)
+                            step_candidates[transformed_code] = f"{char}: {desc}"
+
+                    # Compute selected_details
                     selected_details: dict[str, dict] = {}
-                    for code in selected_ids:
+                    for code in transformed_selected_ids:
                         code_data = data.get(code, {})
                         if node_has_seven_chr_def(code):
                             cat = "activator"
@@ -1272,17 +1489,32 @@ async def stream_traversal(request: TraversalRequest):
                             "billable": billable,
                         }
 
-                    # Emit STEP_FINISHED
-                    yield f"data: {AGUIEvent(type=AGUIEventType.STEP_FINISHED, step_id=batch_id, metadata={'node_id': node_id, 'batch_type': batch_type, 'selected_ids': selected_ids, 'reasoning': reasoning, 'candidates': candidates, 'error': False, 'cached': True, 'selected_details': selected_details}).model_dump_json()}\n\n"
+                    all_decisions.append({
+                        'batch_id': batch_id,
+                        'node_id': node_id,
+                        'batch_type': batch_type,
+                        'candidates': step_candidates,
+                        'selected_ids': transformed_selected_ids,
+                        'reasoning': reasoning,
+                        'selected_details': selected_details,
+                    })
 
-                # Skip the normal traversal flow - go straight to RUN_FINISHED
+                # Emit single STATE_SNAPSHOT with complete graph
+                snapshot_state = GraphState(
+                    nodes=[GraphNode(**n) for n in snapshot_nodes],
+                    edges=[GraphEdge(**e) for e in snapshot_edges]
+                )
+                yield f"data: {AGUIEvent(type=AGUIEventType.STATE_SNAPSHOT, state=snapshot_state).model_dump_json()}\n\n"
+
+                # Emit RUN_FINISHED with final_nodes and all decisions
                 run_finished_metadata = {
                     'final_nodes': final_nodes,
                     'batch_count': len(batch_data),
                     'mode': 'scaffolded',
                     'cached': True,
+                    'decisions': all_decisions,
                 }
-                print(f"[SERVER] Scaffolded complete (CACHED): final_nodes={final_nodes}")
+                print(f"[SERVER] Scaffolded complete (CACHED SNAPSHOT): {len(snapshot_nodes)} nodes, {len(snapshot_edges)} edges, {len(all_decisions)} decisions")
                 yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, metadata=run_finished_metadata).model_dump_json()}\n\n"
                 return  # Exit early for cache hit
 
@@ -1348,12 +1580,12 @@ async def stream_traversal(request: TraversalRequest):
                 'final_nodes': final_nodes,
                 'batch_count': len(batch_data),
                 'mode': 'scaffolded',
-                'cached': was_cached,
+                'cached': is_cached,
             }
             if llm_error:
                 run_finished_metadata['error'] = llm_error
 
-            cache_status = "CACHED" if was_cached else "NEW"
+            cache_status = "CACHED" if is_cached else "NEW"
             print(f"[SERVER] Scaffolded complete ({cache_status}): final_nodes={final_nodes}, batch_count={len(batch_data)}, error={bool(llm_error)}")
             yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, metadata=run_finished_metadata).model_dump_json()}\n\n"
             print("[SERVER] Stream complete")
@@ -1398,6 +1630,7 @@ async def run_traversal_sync(request: TraversalRequest):
         selector=request.selector,
         temperature=request.temperature,
         max_tokens=request.max_tokens,
+        use_cache=request.persist_cache,
     )
 
     return result
@@ -1421,6 +1654,8 @@ async def stream_rewind(request: RewindRequest):
     - RUN_FINISHED: Rewind complete with final codes
     """
     from agent import retry_node, initialize_persister, cleanup_persister, set_batch_callback
+    from agent.traversal import PARTITION_KEY, generate_traversal_cache_key
+    import agent.traversal as traversal_module
     from candidate_selector.providers import create_config
     import candidate_selector.config as llm_config
 
@@ -1428,8 +1663,13 @@ async def stream_rewind(request: RewindRequest):
     event_queue: asyncio.Queue[AGUIEvent | None] = asyncio.Queue()
 
     # Track seen nodes to avoid duplicates - dict maps node_id -> index for updates
+    # Pre-populate with existing nodes from the graph (for lateral target parent lookup)
     seen_nodes: dict[str, int] = {"ROOT": 0}
     node_count = 1  # ROOT is index 0
+    for existing_node in request.existing_nodes:
+        if existing_node not in seen_nodes:
+            seen_nodes[existing_node] = node_count
+            node_count += 1
     seen_edges: set[tuple[str, str]] = set()
 
     # Helper to format 7th character code (same logic as actions.py)
@@ -1471,8 +1711,18 @@ async def stream_rewind(request: RewindRequest):
 
         # Special handling for sevenChrDef batches
         if batch_type == "sevenChrDef" and selected_ids and node_id:
-            full_code = selected_ids[0]
-            seventh_char = full_code[-1] if full_code else ""
+            # Extract the 7th character from selected_ids
+            seventh_char = selected_ids[0][-1] if selected_ids[0] else ""
+
+            # CRITICAL FIX: Compute full_code from node_id + 7th char
+            # This ensures the code matches the batch's node
+            if "." in node_id:
+                base_category, base_subcategory = node_id.split(".", 1)
+            else:
+                base_category = node_id[:3] if len(node_id) >= 3 else node_id
+                base_subcategory = node_id[3:] if len(node_id) > 3 else ""
+            full_code = f"{base_category}.{base_subcategory.ljust(3, 'X')}{seventh_char}"
+
             base_depth = data.get(node_id, {}).get("depth", depth)
             prev_node = node_id
 
@@ -1516,18 +1766,38 @@ async def stream_rewind(request: RewindRequest):
                             value=placeholder_node_data,
                         ))
 
-                        edge_key = (prev_node, placeholder_code)
-                        if edge_key not in seen_edges:
-                            seen_edges.add(edge_key)
-                            ops.append(JsonPatchOp(
-                                op="add",
-                                path="/edges/-",
-                                value=placeholder_edge_data,
-                            ))
+                    # Edge creation OUTSIDE node check
+                    edge_key = (prev_node, placeholder_code)
+                    if edge_key not in seen_edges:
+                        seen_edges.add(edge_key)
+                        ops.append(JsonPatchOp(
+                            op="add",
+                            path="/edges/-",
+                            value=placeholder_edge_data,
+                        ))
 
                     prev_node = placeholder_code
 
             label = f"{seventh_char}: {candidates.get(full_code, seventh_char)}"
+            # Use prev_node as edge source - it's derived from node_id
+            correct_edge_source = prev_node
+
+            # Ensure the parent node exists in the graph (create placeholder if needed)
+            if correct_edge_source not in seen_nodes:
+                seen_nodes[correct_edge_source] = node_count
+                node_count += 1
+                parent_depth = 6  # 7th char parent is always depth 6
+                parent_node_data = {
+                    "id": correct_edge_source,
+                    "code": correct_edge_source,
+                    "label": "Placeholder" if correct_edge_source.endswith("X") else data.get(correct_edge_source, {}).get("label", correct_edge_source),
+                    "depth": parent_depth,
+                    "category": "placeholder" if correct_edge_source.endswith("X") else "ancestor",
+                    "billable": False,
+                }
+                ops.append(JsonPatchOp(op="add", path="/nodes/-", value=parent_node_data))
+                batch_nodes.append(parent_node_data)
+
             final_node_data = {
                 "id": full_code,
                 "code": full_code,
@@ -1539,7 +1809,7 @@ async def stream_rewind(request: RewindRequest):
             batch_nodes.append(final_node_data)
 
             final_edge_data = {
-                "source": prev_node,
+                "source": correct_edge_source,
                 "target": full_code,
                 "edge_type": "lateral",
                 "rule": "sevenChrDef",
@@ -1555,7 +1825,7 @@ async def stream_rewind(request: RewindRequest):
                     value=final_node_data,
                 ))
 
-                edge_key = (prev_node, full_code)
+                edge_key = (correct_edge_source, full_code)
                 if edge_key not in seen_edges:
                     seen_edges.add(edge_key)
                     ops.append(JsonPatchOp(
@@ -1621,63 +1891,111 @@ async def stream_rewind(request: RewindRequest):
                         batch_edges.append(traversed_edge_data)
 
             for code in selected_ids:
-                if code not in seen_nodes:
-                    seen_nodes[code] = node_count
-                    node_count += 1
-                    label = candidates.get(code, code)
-
-                    if code in data:
-                        node_depth = data[code].get("depth", depth + 1)
-                    else:
-                        node_depth = depth + 1
-
-                    if node_has_seven_chr_def(code):
-                        category = "activator"
-                    elif code not in data and code.endswith("X"):
-                        category = "placeholder"
-                    else:
-                        category = "ancestor"
-
-                    has_children = bool(data.get(code, {}).get("children"))
-                    has_authority = seven_chr_authority is not None
-                    is_activator = category == "activator"
-                    billable = not has_children and not has_authority and not is_activator
-
-                    ops.append(JsonPatchOp(
-                        op="add",
-                        path="/nodes/-",
-                        value={
-                            "id": code,
-                            "code": code,
-                            "label": label,
-                            "depth": node_depth,
-                            "category": category,
-                            "billable": billable,
-                        }
-                    ))
-
-                edge_source = node_id if node_id and node_id != "ROOT" else "ROOT"
-                edge_key = (edge_source, code)
-
                 if batch_type != "children":
-                    edge_type = "lateral"
-                    rule = batch_type
-                else:
-                    edge_type = "hierarchy"
-                    rule = None
+                    # Add the lateral target code itself
+                    if code not in seen_nodes:
+                        seen_nodes[code] = node_count
+                        node_count += 1
+                        label = candidates.get(code, code)
 
-                if edge_key not in seen_edges:
-                    seen_edges.add(edge_key)
-                    ops.append(JsonPatchOp(
-                        op="add",
-                        path="/edges/-",
-                        value={
-                            "source": edge_source,
-                            "target": code,
-                            "edge_type": edge_type,
-                            "rule": rule,
-                        }
-                    ))
+                        if code in data:
+                            node_depth = data[code].get("depth", depth + 1)
+                        else:
+                            node_depth = depth + 1
+
+                        if node_has_seven_chr_def(code):
+                            category = "activator"
+                        elif code not in data and code.endswith("X"):
+                            category = "placeholder"
+                        else:
+                            category = "ancestor"
+
+                        has_children = bool(data.get(code, {}).get("children"))
+                        has_authority = seven_chr_authority is not None
+                        is_activator = category == "activator"
+                        billable = not has_children and not has_authority and not is_activator
+
+                        ops.append(JsonPatchOp(
+                            op="add",
+                            path="/nodes/-",
+                            value={
+                                "id": code,
+                                "code": code,
+                                "label": label,
+                                "depth": node_depth,
+                                "category": category,
+                                "billable": billable,
+                            }
+                        ))
+
+                    # Create the lateral edge from source node to code
+                    edge_source = node_id if node_id and node_id != "ROOT" else "ROOT"
+                    lateral_edge_key = (edge_source, code)
+                    if lateral_edge_key not in seen_edges:
+                        seen_edges.add(lateral_edge_key)
+                        ops.append(JsonPatchOp(
+                            op="add",
+                            path="/edges/-",
+                            value={
+                                "source": edge_source,
+                                "target": code,
+                                "edge_type": "lateral",
+                                "rule": batch_type,
+                            }
+                        ))
+
+                else:
+                    # Children batch - regular hierarchy handling
+                    if code not in seen_nodes:
+                        seen_nodes[code] = node_count
+                        node_count += 1
+                        label = candidates.get(code, code)
+
+                        if code in data:
+                            node_depth = data[code].get("depth", depth + 1)
+                        else:
+                            node_depth = depth + 1
+
+                        if node_has_seven_chr_def(code):
+                            category = "activator"
+                        elif code not in data and code.endswith("X"):
+                            category = "placeholder"
+                        else:
+                            category = "ancestor"
+
+                        has_children = bool(data.get(code, {}).get("children"))
+                        has_authority = seven_chr_authority is not None
+                        is_activator = category == "activator"
+                        billable = not has_children and not has_authority and not is_activator
+
+                        ops.append(JsonPatchOp(
+                            op="add",
+                            path="/nodes/-",
+                            value={
+                                "id": code,
+                                "code": code,
+                                "label": label,
+                                "depth": node_depth,
+                                "category": category,
+                                "billable": billable,
+                            }
+                        ))
+
+                    edge_source = node_id if node_id and node_id != "ROOT" else "ROOT"
+                    edge_key = (edge_source, code)
+
+                    if edge_key not in seen_edges:
+                        seen_edges.add(edge_key)
+                        ops.append(JsonPatchOp(
+                            op="add",
+                            path="/edges/-",
+                            value={
+                                "source": edge_source,
+                                "target": code,
+                                "edge_type": "hierarchy",
+                                "rule": None,
+                            }
+                        ))
 
         if ops:
             event_queue.put_nowait(AGUIEvent(
@@ -1749,26 +2067,49 @@ async def stream_rewind(request: RewindRequest):
             print(f"[REWIND] Rewinding from batch_id={request.batch_id}")
             print(f"[REWIND] Feedback: {request.feedback[:100]}..." if len(request.feedback) > 100 else f"[REWIND] Feedback: {request.feedback}")
 
+            # Generate partition key from clinical note (must match original traversal)
+            partition_key = generate_traversal_cache_key(
+                clinical_note=request.clinical_note,
+                provider=request.provider,
+                model=request.model or "",
+                temperature=request.temperature or 0.0,
+                system_prompt=request.system_prompt,
+            )
+            # Set global PARTITION_KEY so retry_node can use it for fork
+            traversal_module.PARTITION_KEY = partition_key
+            print(f"[REWIND] Partition key set: {partition_key}")
+
             # RUN_STARTED with rewind metadata
             yield f"data: {AGUIEvent(type=AGUIEventType.RUN_STARTED, metadata={'rewind_from': request.batch_id, 'feedback': request.feedback[:100]}).model_dump_json()}\n\n"
 
-            # Initialize persister (reuse existing DB, don't reset)
-            await initialize_persister(reset=False)
+            # Initialize persister (reset if persist_cache=False)
+            # NOTE: If persist_cache=False, the database is reset and there's nothing to load!
+            print(f"[REWIND] Initializing persister with reset={not request.persist_cache}")
+            if not request.persist_cache:
+                print("[REWIND] WARNING: persist_cache=False will reset database - rewind may fail!")
+            await initialize_persister(reset=not request.persist_cache)
 
             # Set callback for streaming
             set_batch_callback(on_batch_complete)
             print("[REWIND] Batch callback registered")
 
-            # Build feedback_map with the feedback for this batch
-            feedback_map = {request.batch_id: request.feedback}
-
             # Run retry_node in background task so we can stream events
+            # Uses explicit feedback injection (inject_feedback action)
             async def run_retry():
-                return await retry_node(
-                    batch_id=request.batch_id,
-                    selector=request.selector,
-                    feedback_map=feedback_map,
-                )
+                try:
+                    print(f"[REWIND] Starting retry_node...")
+                    result = await retry_node(
+                        batch_id=request.batch_id,
+                        feedback=request.feedback,
+                        selector=request.selector,
+                    )
+                    print(f"[REWIND] retry_node completed successfully")
+                    return result
+                except Exception as e:
+                    print(f"[REWIND] retry_node raised exception: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
 
             task = asyncio.create_task(run_retry())
 

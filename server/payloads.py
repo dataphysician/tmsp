@@ -65,6 +65,7 @@ class TraversalRequest(BaseModel):
     extra: dict[str, str] | None = None  # Provider-specific config (e.g., Vertex AI location/project_id)
     system_prompt: str | None = None  # Optional custom system prompt (uses default if None)
     scaffolded: bool = True  # True=tree traversal, False=zero-shot direct generation
+    persist_cache: bool = True  # True=cache persists in SQLite, False=reset cache each request
 
 
 class RewindRequest(BaseModel):
@@ -76,6 +77,8 @@ class RewindRequest(BaseModel):
 
     batch_id: str  # e.g., "E08.3|children" - identifies the checkpoint to fork from
     feedback: str  # User's corrective feedback text for the LLM
+    clinical_note: str  # Original clinical note (needed to generate partition key for checkpoint lookup)
+    existing_nodes: list[str] = []  # Node IDs already in graph (for lateral target parent lookup)
     provider: str = "openai"  # "openai" | "cerebras" | "sambanova" | "anthropic" | "vertexai" | "other"
     api_key: str = ""
     model: str | None = None  # Optional model override
@@ -85,3 +88,4 @@ class RewindRequest(BaseModel):
     extra: dict[str, str] | None = None  # Provider-specific config (e.g., Vertex AI location/project_id)
     system_prompt: str | None = None  # Optional custom system prompt (uses default if None)
     scaffolded: bool = True  # True=tree traversal, False=zero-shot direct generation
+    persist_cache: bool = True  # True=cache persists in SQLite, False=reset cache each request

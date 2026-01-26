@@ -24,6 +24,13 @@ body {
   color: var(--text);
 }
 
+/* Global: Remove focus ring from all buttons */
+button:focus,
+button:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
 /* Main Layout: sidebar overlays main content */
 .app {
   display: flex;
@@ -884,6 +891,12 @@ body {
   outline: none;
 }
 
+.feature-tab:focus,
+.feature-tab:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
 .feature-tab:hover {
   background: var(--card-bg);
   color: var(--text);
@@ -916,6 +929,13 @@ body {
   border-radius: 0.25rem;
   cursor: pointer;
   transition: all 0.15s ease;
+  outline: none;
+}
+
+.view-btn:focus,
+.view-btn:focus-visible {
+  outline: none;
+  box-shadow: none;
 }
 
 .view-btn:hover {
@@ -1054,8 +1074,12 @@ body {
   pointer-events: none;
 }
 
-.expanded-node {
-  pointer-events: none;
+/* Note: .expanded-node inside .expanded-overlay needs pointer-events: auto
+   to allow hover/click interactions. The overlay group has pointer-events: none
+   but individual panels and nodes override this. */
+.expanded-overlay .expanded-node {
+  pointer-events: auto;
+  cursor: default;
 }
 
 .expanded-node .expanded-bg {
@@ -1064,6 +1088,31 @@ body {
 
 .expanded-node.node-placeholder .expanded-bg {
   stroke-dasharray: 6, 3;
+}
+
+/* Batch Panel Overlay Styles */
+.batch-panel {
+  pointer-events: auto;
+  cursor: default;
+}
+
+.batch-panel-bg {
+  pointer-events: auto;
+}
+
+/* Feedback/Investigate button in overlay */
+.feedback-button {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.feedback-button rect {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.feedback-button:hover rect {
+  filter: brightness(0.9);
 }
 
 /* Shared loading state styles */
@@ -1107,6 +1156,46 @@ body {
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+/* Rewinding node styles */
+.node-rect.rewinding {
+  animation: rewind-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes rewind-pulse {
+  0%, 100% {
+    stroke-opacity: 1;
+  }
+  50% {
+    stroke-opacity: 0.5;
+  }
+}
+
+/* Three-dot throbber animation */
+.throbber-dot {
+  animation: throbber-dot 1s ease-in-out infinite;
+}
+
+.throbber-dot-1 {
+  animation-delay: 0s;
+}
+
+.throbber-dot-2 {
+  animation-delay: 0.15s;
+}
+
+.throbber-dot-3 {
+  animation-delay: 0.3s;
+}
+
+@keyframes throbber-dot {
+  0%, 80%, 100% {
+    opacity: 0.3;
+  }
+  40% {
+    opacity: 1;
   }
 }
 
@@ -1636,8 +1725,27 @@ body {
   transition: all 0.15s ease;
 }
 
-.tree-node-box.expandable:hover {
+.tree-node-box.expandable:hover:not(.expanded) {
+  border-color: #334155;
+}
+
+.tree-node-box.expanded,
+.tree-node-box.expanded:hover {
   border-color: var(--primary);
+  border-width: 2px;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.15);
+}
+
+.tree-node-box.expanded .tree-node-header {
+  background: rgba(99, 102, 241, 0.08);
+  border-radius: 0.3rem 0.3rem 0 0;
+}
+
+.tree-node-content.finalized .tree-node-box.expanded,
+.tree-node-content.finalized .tree-node-box.expanded:hover {
+  border-color: #16a34a;
+  border-width: 2px;
+  box-shadow: 0 0 0 2px rgba(22, 163, 74, 0.15);
 }
 
 .tree-node-content.finalized .tree-node-box {
@@ -3001,7 +3109,9 @@ body {
   max-width: 500px;
   width: 90%;
   max-height: 80vh;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .rewind-modal-header {
@@ -3074,6 +3184,13 @@ body {
   font-size: 0.875rem;
 }
 
+/* Scrollable container for decision, feedback, and actions */
+.rewind-modal-scrollable {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
 /* Decision Section */
 .rewind-modal-decision-section {
   padding: 1rem 1.25rem;
@@ -3117,9 +3234,8 @@ body {
 .rewind-modal-candidate-label {
   color: var(--text-muted);
   flex: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
 }
 
 .rewind-modal-selected-badge {

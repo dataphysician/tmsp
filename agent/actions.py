@@ -140,6 +140,12 @@ async def load_node(state: State) -> tuple[dict, State]:
 
         if batch_type == "children":
             candidates = node_data.get("children", {})
+            # REVITALIZE: Log when X-ending node exists in index with real children
+            if node_id.endswith("X") and candidates:
+                print(
+                    f"[{current_batch_id}] load_node: REVITALIZED {node_id} from index! "
+                    f"Real children: {list(candidates.keys())[:5]}{'...' if len(candidates) > 5 else ''}"
+                )
         elif batch_type in ["codeFirst", "codeAlso", "useAdditionalCode"]:
             candidates = node_data.get("metadata", {}).get(batch_type, {})
         else:
@@ -158,7 +164,8 @@ async def load_node(state: State) -> tuple[dict, State]:
                 f"[{current_batch_id}] load_node: Node {node_id} not in index -> empty candidates"
             )
 
-    if batch_type != "sevenChrDef" and not node_id.endswith("X"):
+    # Log candidates for non-sevenChrDef batches (include X-ending nodes now)
+    if batch_type != "sevenChrDef":
         print(
             f"[{current_batch_id}] load_node: node_id={node_id}, "
             f"batch_type={batch_type} -> candidates={list(candidates.keys())[:5]}"
@@ -171,22 +178,61 @@ async def load_node(state: State) -> tuple[dict, State]:
     return {}, state.update(batch_data=batch_data)
 
 
-@action(reads=["batch_data", "context", "feedback_map"], writes=["batch_data", "feedback_map"])
+@action(reads=["batch_data"], writes=["pending_feedback", "current_batch_id"])
+async def inject_feedback(
+    state: State,
+    batch_id: str,
+    feedback: str,
+) -> tuple[dict, State]:
+    """Explicitly inject feedback before select_candidates.
+
+    Makes feedback injection VISIBLE in the workflow trace, rather than
+    hiding it in generic state manipulation. This is the entrypoint for
+    rewind operations.
+
+    Args:
+        state: Current application state
+        batch_id: The batch to inject feedback for
+        feedback: The feedback string to inject
+
+    Returns:
+        (result_dict, new_state) tuple with pending_feedback set
+    """
+    print(f"\n{'=' * 60}")
+    print("[INJECT_FEEDBACK] Action called!")
+    print(f"  batch_id param: {batch_id}")
+    print(f"  feedback param: {feedback[:100] if feedback else 'None'}{'...' if feedback and len(feedback) > 100 else ''}")
+
+    batch_data = state.get("batch_data", {})
+    print(f"  batch_data keys: {list(batch_data.keys())[:10]}...")
+
+    if batch_id not in batch_data:
+        print(f"  ERROR: batch_id '{batch_id}' not found!")
+        raise KeyError(f"batch_id '{batch_id}' not found in batch_data. Available: {list(batch_data.keys())}")
+
+    print(f"  Setting pending_feedback and current_batch_id in state")
+    print(f"{'=' * 60}\n")
+
+    return {}, state.update(
+        pending_feedback=feedback,
+        current_batch_id=batch_id,
+    )
+
+
+@action(reads=["batch_data", "context", "pending_feedback"], writes=["batch_data", "pending_feedback"])
 async def select_candidates(
     state: State,
     selector: str = "llm",
-    feedback_map: dict[str, str] | None = None,
-    current_batch_id: str | None = None,
 ) -> tuple[dict, State]:
     """SELECTOR: Picks subset from candidates using registry-based selector.
 
     Pure selection logic - delegates to selector functions conforming to SelectorProtocol.
 
-    INJECTION PHASE (if provided via inputs):
-    - feedback_map -> Merged into state's feedback_map dict
+    FEEDBACK SOURCE:
+    - Reads from state["pending_feedback"] (set by inject_feedback action)
+    - After use, pending_feedback is cleared (one-time consumption)
 
     SELECTION PHASE:
-    - Reads feedback from state.get("feedback_map", {})[current_batch_id]
     - If no feedback found, selector runs normally (may use cache)
     - Uses SELECTOR_REGISTRY[selector] (default: "llm")
     - Reads context from state (guides all selectors)
@@ -195,19 +241,17 @@ async def select_candidates(
     Args:
         state: Current application state
         selector: String key for SELECTOR_REGISTRY (default: "llm")
-        feedback_map: Optional dict mapping batch_id to feedback string
-        current_batch_id: Optional override for current_batch_id
 
     Returns:
         (result_dict, new_state) tuple with selected_ids
     """
     batch_data = state.get("batch_data", {})
-
-    # Use input current_batch_id if provided, else read from state
-    if current_batch_id is None:
-        current_batch_id = state.get("current_batch_id", "ROOT")
-
+    current_batch_id = state.get("current_batch_id", "ROOT")
     context = state.get("context", "")
+
+    # Debug: Show state at entry
+    pending_fb = state.get("pending_feedback")
+    print(f"\n[SELECT_CANDIDATES] Entry - batch_id={current_batch_id}, pending_feedback={'set' if pending_fb else 'None'}")
 
     # Handle corrupted checkpoints
     if current_batch_id not in batch_data:
@@ -234,17 +278,15 @@ async def select_candidates(
         f"active={active_selector}"
     )
 
-    # INJECTION: Merge feedback_map into state if provided via inputs
-    state_feedback_map = state.get("feedback_map", {})
-    if feedback_map is not None:
-        state_feedback_map = {**state_feedback_map, **feedback_map}
-
-    # SELECTION: Read feedback from state's feedback_map for current batch
+    # EXPLICIT FEEDBACK: Read from dedicated pending_feedback state field
+    # This is set by inject_feedback action during rewind operations
     candidates = batch_data[current_batch_id]["candidates"]
-    feedback = state_feedback_map.get(current_batch_id)
+    feedback = state.get("pending_feedback")
+    print(f"[SELECT_CANDIDATES] feedback from state: {repr(feedback)[:100] if feedback else 'None'}")
 
     # CACHE-FIRST: If no feedback and previous selection exists, reuse it
     if feedback is None:
+        print(f"[SELECT_CANDIDATES] No feedback, checking cache...")
         previous_selection = batch_data[current_batch_id].get("selected_ids")
         if previous_selection is not None:
             print(f"[CACHE HIT] {current_batch_id} -> Reusing previous selection: {previous_selection}")
@@ -264,11 +306,11 @@ async def select_candidates(
 
                     batch_type = current_batch_id.rsplit("|", 1)[1] if "|" in current_batch_id else "children"
                     if batch_type == "sevenChrDef" and node_id:
-                        # Transform candidates
+                        # Transform candidates with "X: description" format for display
                         cb_candidates = {}
                         for char, desc in candidates.items():
                             full_code = format_with_seventh_char(node_id, char)
-                            cb_candidates[full_code] = desc
+                            cb_candidates[full_code] = f"{char}: {desc}"
 
                         # Transform selected_ids
                         if previous_selection:
@@ -288,7 +330,7 @@ async def select_candidates(
                     print(f"[CACHE CALLBACK ERROR] {current_batch_id}: {e}")
 
             return {"selected_ids": previous_selection}, state.update(
-                batch_data=batch_data, feedback_map=state_feedback_map
+                batch_data=batch_data, pending_feedback=None  # Clear after check
             )
 
     print(f"[SELECT_CANDIDATES] batch_id={current_batch_id}, feedback='{feedback}'")
@@ -325,6 +367,26 @@ async def select_candidates(
     if reasoning:
         batch_data[current_batch_id]["reasoning"] = reasoning
 
+    # CRITICAL: If selection is empty and no seven_chr_authority, check ancestry
+    # and set authority if sevenChrDef exists. This ensures the transition to
+    # spawn_seven_chr is taken instead of finish_batch for depth-6 nodes.
+    batch_type = current_batch_id.rsplit("|", 1)[1] if "|" in current_batch_id else "children"
+    if (not selected_ids and
+        batch_type == "children" and
+        batch_data[current_batch_id].get("seven_chr_authority") is None):
+        node_id = batch_data[current_batch_id].get("node_id")
+        if node_id:
+            from graph import get_seventh_char_def
+            seven_chr_result = get_seventh_char_def(node_id, ICD_INDEX)
+            if seven_chr_result is not None:
+                _, ancestor_with_def = seven_chr_result
+                batch_data[current_batch_id]["seven_chr_authority"] = {
+                    "batch_name": ancestor_with_def,
+                    "resolution_pattern": "sevenChrDef"
+                }
+                print(f"[{current_batch_id}] SELF-ACTIVATE: {node_id} inherits sevenChrDef "
+                      f"from ancestor {ancestor_with_def} - setting authority")
+
     # Call callback if registered (for live UI updates)
     if BATCH_CALLBACK is not None:
         try:
@@ -339,11 +401,11 @@ async def select_candidates(
 
             batch_type = current_batch_id.rsplit("|", 1)[1] if "|" in current_batch_id else "children"
             if batch_type == "sevenChrDef" and node_id:
-                # Transform candidates
+                # Transform candidates with "X: description" format for display
                 cb_candidates = {}
                 for char, desc in candidates.items():
                     full_code = format_with_seventh_char(node_id, char)
-                    cb_candidates[full_code] = desc
+                    cb_candidates[full_code] = f"{char}: {desc}"
 
                 # Transform selected_ids
                 if selected_ids:
@@ -365,7 +427,7 @@ async def select_candidates(
             traceback.print_exc()
 
     return {"selected_ids": selected_ids}, state.update(
-        batch_data=batch_data, feedback_map=state_feedback_map
+        batch_data=batch_data, pending_feedback=None  # Consumed - prevents re-use
     )
 
 
@@ -400,19 +462,14 @@ async def finish_batch(state: State) -> tuple[dict, State]:
             final_code = node_id
             print(f"[{current_batch_id}] No 7th char selected, using base code: {final_code}")
 
-        # Check if base node is a leaf
-        node_data = ICD_INDEX.get(node_id, {})
-        children = node_data.get("children", {})
-        is_leaf = not children or len(children) == 0
-
-        if is_leaf:
-            if final_code not in final_nodes:
-                final_nodes.append(final_code)
-                print(f"[{current_batch_id}] LEAF NODE: Added {final_code} to final_nodes")
-            else:
-                print(f"[{current_batch_id}] LEAF NODE: {final_code} already in final_nodes")
+        # ALWAYS add the 7th char code to final_nodes
+        # When a sevenChrDef is selected, that IS the final code - depth 7 codes are always terminal
+        # regardless of whether the base node has children in the ICD index
+        if final_code not in final_nodes:
+            final_nodes.append(final_code)
+            print(f"[{current_batch_id}] SEVENCHRDEF FINAL: Added {final_code} to final_nodes")
         else:
-            print(f"[{current_batch_id}] NON-LEAF: Skipping {final_code} (has {len(children)} children)")
+            print(f"[{current_batch_id}] SEVENCHRDEF FINAL: {final_code} already in final_nodes")
 
         batch_data[current_batch_id]["status"] = "completed_seven_chr"
 
@@ -426,7 +483,28 @@ async def finish_batch(state: State) -> tuple[dict, State]:
             # When authority exists, spawn_seven_chr handles the final code (e.g., T36.1X5A).
             # For other batch types: don't add parent node (lateral batches don't define termination)
             has_seven_chr_authority = batch_data[current_batch_id].get("seven_chr_authority") is not None
-            should_report = batch_type == "children" and not has_seven_chr_authority
+
+            # SAFETY CHECK: Even if authority wasn't propagated, check if this node
+            # has sevenChrDef in its ancestry. If so, it should NOT be finalized -
+            # the 7th character is mandatory and spawn_seven_chr should handle it.
+            # This prevents incorrect finalization at depth-6 nodes.
+            # Also SET the authority so spawn_seven_chr transition will be taken.
+            has_seven_chr_in_ancestry = False
+            if not has_seven_chr_authority and node_id and batch_type == "children":
+                from graph import get_seventh_char_def
+                seven_chr_result = get_seventh_char_def(node_id, ICD_INDEX)
+                if seven_chr_result is not None:
+                    has_seven_chr_in_ancestry = True
+                    _, ancestor_with_def = seven_chr_result
+                    # Set the authority so spawn_seven_chr can use it
+                    batch_data[current_batch_id]["seven_chr_authority"] = {
+                        "batch_name": ancestor_with_def,
+                        "resolution_pattern": "sevenChrDef"
+                    }
+                    print(f"[{current_batch_id}] SAFETY CHECK: {node_id} has sevenChrDef "
+                          f"from ancestor {ancestor_with_def} - setting authority, NOT finalizing")
+
+            should_report = batch_type == "children" and not has_seven_chr_authority and not has_seven_chr_in_ancestry
 
             if should_report and node_id is not None and node_id not in final_nodes:
                 final_nodes.append(node_id)
@@ -437,6 +515,8 @@ async def finish_batch(state: State) -> tuple[dict, State]:
                 print(f"[{current_batch_id}] EMPTY SELECTION: Natural termination (leaf node)")
             elif has_seven_chr_authority:
                 print(f"[{current_batch_id}] EMPTY SELECTION: sevenChrDef handled termination")
+            elif has_seven_chr_in_ancestry:
+                print(f"[{current_batch_id}] EMPTY SELECTION: sevenChrDef in ancestry - awaiting 7th char")
             else:
                 print(f"[{current_batch_id}] EMPTY SELECTION: non-children batch, not reporting")
 

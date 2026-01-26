@@ -34,6 +34,7 @@ def resolve_code(code: str, index: dict[str, dict]) -> str | None:
     - T36.1X5D -> T36.1X5 (drop 7th char)
     - T84.53XD -> T84.53 (X is placeholder, D is 7th char)
     - V29.9XXS -> V29.9 (drop 7th char and X placeholders)
+    - T88.XXXA -> T88 (drop 7th char, X placeholders, and trailing dot)
 
     Returns the resolved code if found, None if not resolvable.
     """
@@ -50,6 +51,11 @@ def resolve_code(code: str, index: dict[str, dict]) -> str | None:
             base = base[:-1]
             if base in index:
                 return base
+        # Handle trailing dot after stripping all X's (e.g., T88. -> T88)
+        if base.endswith("."):
+            base = base[:-1]
+            if base in index:
+                return base
 
     return None
 
@@ -59,6 +65,7 @@ def build_placeholder_chain(code: str, index: dict[str, dict]) -> list[str]:
 
     For V29.9XXS, returns: ['V29.9XX', 'V29.9X', 'V29.9']
     For T36.1X5D, returns: ['T36.1X5']
+    For T88.XXXA, returns: ['T88.XXX', 'T88.XX', 'T88.X', 'T88']
     For codes without placeholders, returns: [base] if different from code
 
     Returns list of intermediate codes from 7th char code to base (inclusive).
@@ -79,6 +86,16 @@ def build_placeholder_chain(code: str, index: dict[str, dict]) -> list[str]:
 
         # Now drop X placeholders one at a time
         while current.endswith("X"):
+            current = current[:-1]
+            if current in index:
+                chain.append(current)
+                return chain
+            # Don't append trailing dot forms (e.g., T88.)
+            if not current.endswith("."):
+                chain.append(current)
+
+        # Handle trailing dot after stripping all X's (e.g., T88. -> T88)
+        if current.endswith("."):
             current = current[:-1]
             if current in index:
                 chain.append(current)
@@ -219,16 +236,15 @@ def find_nearest_anchor(
     codes: list[str],
     index: dict[str, dict] = data,
 ) -> dict[str, tuple[str, str, str] | None]:
-    """Find the nearest anchor for each code based on lateral metadata links.
+    """Find the nearest anchor for each code using a global 'lowest link' strategy.
 
-    For each code, checks if any other code's ancestry contains a node that
-    links to this code (or an ancestor of this code) via LATERAL_KEYS.
-
-    Supports transitive anchoring: if metadata links to an ancestor of an
-    input code, the input code anchors at that ancestor.
-
-    Note: sevenChrDef is NOT used for anchoring - it only applies to the
-    direct parent-child chain.
+    Algorithm:
+    1. Trace ancestry for all input codes.
+    2. Identify ALL potential lateral links between any node in Chain A and any node in Chain B.
+    3. Sort all potential links by 'closeness' (depth of the anchor node + depth of source node).
+       We want the 'lowest' link (deepest in the tree).
+    4. Assign anchors greedily from the sorted list, ensuring no cycles are created.
+    5. Once a code is anchored, ignore higher links for that code (truncation).
 
     Args:
         codes: List of codes to analyze
@@ -236,63 +252,162 @@ def find_nearest_anchor(
 
     Returns:
         dict mapping code -> (anchor_code, metadata_key, source_node) or None
-        - anchor_code: the node where the input code's ancestry is truncated
-        - metadata_key: the lateral key (useAdditionalCode, codeFirst, codeAlso)
-        - source_node: the node that has the metadata linking to anchor_code
     """
     code_set = set(codes)
     anchors: dict[str, tuple[str, str, str] | None] = {c: None for c in codes}
-
-    # Pre-compute full ancestry for each input code (as sets for fast lookup)
+    
+    # 1. Trace ancestries
     code_ancestors: dict[str, list[str]] = {}
     code_ancestor_sets: dict[str, set[str]] = {}
+    
     for code in codes:
         ancestors = trace_ancestors(code, index)
-        code_ancestors[code] = ancestors
-        code_ancestor_sets[code] = set(ancestors)
+        # Store full chain: [code, parent, grandparent, ...]
+        code_ancestors[code] = [code] + ancestors
+        code_ancestor_sets[code] = set(code_ancestors[code])
 
-    def update_anchor(target_code: str, anchor_code: str, key: str, source_node: str) -> None:
-        """Update anchor if this one is deeper (nearer)."""
-        current = anchors[target_code]
-        anchor_depth = index.get(anchor_code, {}).get("depth", 0)
+    # 2. Find all candidate links
+    # Candidate: (target_code, anchor_code, key, source_node, weight)
+    # We want to anchor 'target_code' onto 'anchor_code'.
+    # 'source_node' is the node in target_code's chain that has the metadata link.
+    candidates = []
 
-        if current is None:
-            anchors[target_code] = (anchor_code, key, source_node)
-        else:
-            existing_depth = index.get(current[0], {}).get("depth", 0)
-            if anchor_depth > existing_depth:
-                anchors[target_code] = (anchor_code, key, source_node)
-
-    # For each code, trace its ancestry and check metadata links
-    for code in codes:
-        chain = [code] + code_ancestors[code]
-
-        for node in chain:
-            if node not in index:
+    for target_code in codes:
+        chain = code_ancestors[target_code]
+        for source_node in chain:
+            if source_node not in index:
                 continue
 
-            metadata = index[node].get("metadata", {})
+            metadata = index[source_node].get("metadata", {})
             for key in LATERAL_KEYS:
                 if key not in metadata:
                     continue
 
                 linked_codes = metadata[key]
-                if not isinstance(linked_codes, dict):
-                    continue
+                # Normalize to dict keys iterator if needed
+                if isinstance(linked_codes, dict):
+                    linked_targets = linked_codes.keys()
+                else:
+                    linked_targets = linked_codes
 
-                for linked in linked_codes:
-                    # Case 1: Direct match - linked code is in input batch
-                    if linked in code_set and linked != code:
-                        update_anchor(linked, node, key, node)
+                for link_target in linked_targets:
+                    # check if this link_target points to the ancestry of ANY OTHER input code
+                    # If link_target is in ancestry of 'dest_code', then 'target_code' anchors to 'dest_code's chain' at 'link_target'.
 
-                    # Case 2: Transitive - linked code is an ancestor of an input code
-                    for other_code in code_set:
-                        if other_code == code:
+                    for potential_anchor_root in codes:
+                        if potential_anchor_root == target_code:
                             continue
-                        if linked in code_ancestor_sets[other_code]:
-                            # linked is an ancestor of other_code
-                            # other_code should anchor at linked, source is node
-                            update_anchor(other_code, linked, key, node)
+
+                        # CRITICAL: Check if link_target is actually in this code's ancestry
+                        if link_target not in code_ancestor_sets[potential_anchor_root]:
+                            continue
+
+                        # We found a valid link! link_target is in the ancestry of potential_anchor_root
+                        # So target_code (via source_node) -> link_target (in potential_anchor_root's chain)
+                        # EXACT NODE ANCHORING:
+                        # We always anchor the specific node being referenced (link_target) to the source node.
+                        # This allows ancestors (like I13) to be anchored, carrying their subtrees (I13.0) with them.
+                        # Universal Rule: Parent = Source. Child = Linked Node.
+
+                        c_target = link_target  # The node being moved/anchored
+                        c_anchor = source_node  # The new parent
+                        c_root_provider = potential_anchor_root  # The chain this node belongs to
+
+                        # Calculate Weight: Higher is "lower/deeper" in the tree.
+                        anchor_depth = index.get(c_anchor, {}).get("depth", 0)
+                        source_depth = index.get(c_target, {}).get("depth", 0)
+
+                        weight = (anchor_depth * 100) + source_depth
+
+                        candidates.append({
+                            "target_code": c_target,
+                            "anchor_code": c_anchor,
+                            "anchor_root": c_root_provider,
+                            "key": key,
+                            "source_node": source_node,
+                            "weight": weight,
+                            "anchor_depth": anchor_depth,
+                            "target_depth": index.get(c_target, {}).get("depth", 0)
+                        })
+
+    # Sort DESCENDING by weight (deepest links first), then deterministic tie-breaker
+    # This ensures leaf-adjacent links are established first, cleaving their ancestries
+    # before those ancestors can participate as sources for other links
+    candidates.sort(key=lambda x: (x["weight"], x["target_code"], x["anchor_code"]), reverse=True)
+
+    # Dynamic Graph Rewiring Implementation
+    # 1. Build Initial Parent Map from Chains
+    parent = {}
+    valid_nodes = set()
+    
+    for code in codes:
+        chain = code_ancestors[code]
+        valid_nodes.update(chain) # All chain nodes initially valid
+        for i in range(len(chain) - 1):
+            child = chain[i]
+            par = chain[i+1]
+            if child not in parent: 
+                 parent[child] = par
+
+    # Track original parents to allow upward tracing for invalidation
+    original_parent = parent.copy()
+
+    def invalidate_ancestors(node):
+        # Trace UP from node using ORIGINAL parents.
+        # Mark nodes as invalid (meaning they can no longer be SOURCES for new links).
+        # This prevents cycles like N18 -> N18.9 -> I13.0 -> I13 -> N18.
+        curr = node
+        while curr in original_parent:
+            par = original_parent[curr]
+            valid_nodes.discard(par)
+            curr = par
+
+    def is_descendant(p, node):
+        # Check if 'node' is an ancestor of 'p' (i.e. p is descendant of node) using CURRENT parents
+        curr = p
+        visited = set()
+        while curr in parent:
+            if curr == node: return True
+            if curr in visited: break
+            visited.add(curr)
+            curr = parent[curr]
+        return curr == node
+
+    cleaved_nodes = set()
+    anchors = {} 
+
+    for cand in candidates:
+        t = cand["target_code"] 
+        s = cand["anchor_code"] 
+        
+        # Check Validity of S and T
+        # T (Target) must persist, so we don't strictly check if T is in valid_nodes?
+        # Actually user said "For every node that was targetted... remove ancestors".
+        # If T was already invalidated, can it be targeted? 
+        # T is an ancestor of X, and X moved. T is gone.
+        # So T should effectively be dead. But maybe we can salvage it?
+        # Let's trust valid_nodes.
+             
+        if s not in valid_nodes:
+             continue # Source is Invalid/Pruned
+
+        if s in cleaved_nodes:
+            continue # Source was previously moved, so it can't steal others? (Heuristic)
+            
+        if t in cleaved_nodes:
+             continue # Target already moved. Deepest link wins.
+
+        if is_descendant(s, t):
+             continue # Cycle prevention
+             
+        # Apply Move
+        parent[t] = s
+        cleaved_nodes.add(t)
+        
+        # Invalidate Old Ancestors of T (cleave them away)
+        invalidate_ancestors(t)
+        
+        anchors[t] = (s, cand["key"], cand["source_node"])
 
     return anchors
 
@@ -323,30 +438,76 @@ def trace_with_nearest_anchor(
     anchors = find_nearest_anchor(codes, index)
     result: dict[str, dict] = {}
 
+    # Helper to get parent from index (uses same logic as get_parent_code)
+    def get_parent_from_index(node_code: str) -> str | None:
+        if node_code == "ROOT":
+            return None
+        node_info = index.get(node_code)
+        if not node_info:
+            return None
+        parent = node_info.get("parent")
+        if not parent or not isinstance(parent, dict):
+            return None
+        parent_codes = list(parent.keys())
+        parent_code = parent_codes[0] if parent_codes else None
+        # Don't return ROOT - it's a virtual node added by the graph builder
+        if parent_code == "ROOT":
+            return None
+        return parent_code
+
     for code in codes:
-        full_ancestors = trace_ancestors(code, index)
-        anchor = anchors[code]
+        new_chain: list[str] = []
+        visited_path_nodes: set[str] = set()
+        chain_lateral_links: list[tuple[str, str, str]] = []
 
-        if anchor is None:
-            # No anchor - full trace to ROOT
-            ancestors = full_ancestors
-        else:
-            # Truncate at anchor point
-            anchor_code = anchor[0]
-            if anchor_code in full_ancestors:
-                # Anchor is in the ancestry chain - truncate there
-                idx = full_ancestors.index(anchor_code)
-                ancestors = full_ancestors[: idx + 1]  # Include anchor
+        # Resolve 7th char codes to their base form
+        resolved = resolve_code(code, index)
+        if resolved is None:
+            result[code] = {
+                "ancestors": [],
+                "anchor": None,
+                "visited": {code},
+                "lateral_links": [],
+            }
+            continue
+
+        # Handle 7th char codes: add placeholder chain first
+        if resolved != code:
+            # For 7th char codes, mark the original code as visited
+            visited_path_nodes.add(code)
+            placeholder_chain = build_placeholder_chain(code, index)
+            new_chain.extend(placeholder_chain)
+            visited_path_nodes.update(placeholder_chain)
+
+        # Start walking from the resolved code
+        curr: str | None = resolved
+
+        while curr:
+            # If already visited, get parent and continue (handles 7th char resolved code)
+            if curr in visited_path_nodes:
+                curr = get_parent_from_index(curr)
+                continue
+
+            visited_path_nodes.add(curr)
+
+            # Don't add the input code to ancestors list
+            if curr != code:
+                new_chain.append(curr)
+
+            # Determine next parent
+            if curr in anchors:
+                # Anchored! Jump to anchor source
+                anchor_target, key, source_node = anchors[curr]
+                chain_lateral_links.append((source_node, curr, key))
+                curr = anchor_target
             else:
-                # Anchor is external (direct match case)
-                ancestors = [anchor_code]
-
-        visited = {code} | set(ancestors)
+                curr = get_parent_from_index(curr)
 
         result[code] = {
-            "ancestors": ancestors,
-            "anchor": anchor,
-            "visited": visited,
+            "ancestors": new_chain,
+            "anchor": anchors.get(code),
+            "visited": visited_path_nodes,
+            "lateral_links": chain_lateral_links,
         }
 
     return result
@@ -390,21 +551,19 @@ def build_graph(
         info = provenance[code]
         ancestors = info["ancestors"]
         anchor = info["anchor"]
+        chain_lateral_links = info.get("lateral_links", [])
 
         # Add code and all ancestors to node set
         all_nodes.add(code)
         all_nodes.update(ancestors)
 
+        # Record direct anchor for this code
         if anchor:
             anchored[code] = anchor
-            anchor_code, key, source_node = anchor
-            # Track lateral link for visualization
-            if anchor_code == source_node:
-                # Direct match - link from source to the anchored code
-                lateral_links.append((source_node, code, key))
-            else:
-                # Transitive match - link from source to the linked ancestor
-                lateral_links.append((source_node, anchor_code, key))
+
+        # Collect ALL lateral links from this chain (including intermediate ancestors)
+        for src, tgt, key in chain_lateral_links:
+            lateral_links.append((src, tgt, key))
 
         # Check for 7th character in leaf nodes (all input codes)
         char = extract_seventh_char(code)
@@ -418,6 +577,8 @@ def build_graph(
             placeholders.update(get_placeholder_codes(code, index))
 
         # Build tree edges (child -> parent relationship, but we store parent -> children)
+        # Lateral links ARE included in tree for connectivity - they're marked as LATERAL
+        # edge type in the server for styling purposes
         chain = [code] + ancestors
         for i in range(len(chain) - 1):
             child, parent = chain[i], chain[i + 1]
@@ -425,14 +586,17 @@ def build_graph(
                 tree[parent] = set()
             tree[parent].add(child)
 
-        # Identify root of this chain (only for non-anchored codes)
-        # Anchored codes attach to existing nodes, not to ROOT
-        if anchor is None:
+        # Identify root of this chain
+        # If the chain has any lateral links, the root is determined by the first non-lateral ancestor
+        # Otherwise, use the top of the chain
+        if not chain_lateral_links:
+            # No lateral links - use top ancestor as root
             if ancestors:
                 root = ancestors[-1]
             else:
                 root = code
             roots.add(root)
+        # If there are lateral links, the chain connects to an existing tree via lateral edge
 
     # Filter lateral links to only show when both endpoints are in the graph
     lateral_links = [

@@ -92,13 +92,13 @@ function buildTreeFromGraph(
     const ruleKey = parentCode ? `${parentCode}->${code}` : null;
     const rule = ruleKey ? childRuleMap.get(ruleKey) || null : null;
 
-    // Determine tag: rule name or INPUT if it's an input code
+    // Determine tag: rule name or FINAL if it's an input code
     let tag: string | undefined;
     let tagStyle: 'default' | 'input' | undefined;
     if (rule) {
       tag = rule;
     } else if (inputCodes.has(code)) {
-      tag = 'INPUT';
+      tag = 'FINAL';
       tagStyle = 'input';
     }
 

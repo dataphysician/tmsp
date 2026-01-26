@@ -111,6 +111,21 @@ The caching system ensures identical contexts produce identical selections. Runn
 - Context window sensitivity
 - Provider-specific biases
 
+## Zero Shot Mode
+
+In addition to stepwise traversal, TMSP supports **zero-shot code generation** for comparison:
+
+| Aspect | Scaffolded Traversal | Zero Shot |
+|--------|---------------------|-----------|
+| Approach | Hierarchical tree traversal with selection at each level | Direct code generation in single LLM call |
+| Transparency | Full decision tree with reasoning at each step | Single reasoning explanation |
+| API Flag | `scaffolded: true` (default) | `scaffolded: false` |
+
+Zero-shot mode is useful for:
+- **Baseline comparisons**: Compare scaffolded accuracy against direct generation
+- **Speed**: Single LLM call vs. multiple hierarchy traversals
+- **Traditional evaluation**: When you just need final codes without decision trace
+
 ## Architecture
 
 ```
@@ -149,6 +164,24 @@ The caching system ensures identical contexts produce identical selections. Runn
 | `server/` | FastAPI backend with SSE streaming |
 | `frontend/` | React visualization of traversal trees |
 
+## Caching
+
+TMSP implements two-layer caching to avoid redundant LLM calls:
+
+### Cross-Run Persistence
+
+Results are cached in SQLite based on a deterministic key derived from:
+- Clinical note text
+- Provider and model
+- Temperature
+- System prompt (if custom)
+
+Separate tables store scaffolded (`burr_state`) and zero-shot (`zero_shot_state`) results.
+
+### In-Memory Selector Cache
+
+During a single traversal, identical selection requests return cached results. This ensures consistency when the same batch is encountered in parallel branches.
+
 ## Installation
 
 ```bash
@@ -185,6 +218,23 @@ print(result["final_nodes"])  # ['E11.65', 'N18.3']
 print(result["batch_data"])   # Full decision tree with reasoning
 ```
 
+#### Zero-Shot Mode
+
+```python
+# Zero-shot mode (direct generation)
+from agent import run_zero_shot
+
+codes, reasoning, was_cached = await run_zero_shot(
+    clinical_note="Patient with type 2 diabetes and chronic kidney disease stage 3",
+    provider="openai",
+    model="gpt-4o",
+    temperature=0.0,
+)
+
+print(codes)      # ['E11.65', 'N18.3']
+print(reasoning)  # Full reasoning explanation
+```
+
 ## Supported LLM Providers
 
 | Provider | Structured Output | Notes |
@@ -206,20 +256,34 @@ TMSP enables measurement of:
 - **Reasoning Quality**: Clinical logic in selection explanations
 - **Consistency**: Same input → same output across runs
 
-## Retry and Feedback
+## Rewind and Feedback
 
-Checkpoint persistence allows targeted correction:
+Checkpoint persistence enables targeted correction without full re-traversal:
+
+### retry_node() API
+
+Fork from any batch checkpoint and inject corrective feedback:
 
 ```python
 from agent import retry_node
 
-# Retry from specific decision point with feedback
 result = await retry_node(
     batch_id="E11|children",
     feedback_map={
         "E11|children": "Select E11.3 for ophthalmic complications, not E11.65"
     }
 )
+```
+
+### REST Endpoint
+
+```
+POST /api/traverse/rewind
+{
+  "batch_id": "E11|children",
+  "feedback": "Select E11.3 for ophthalmic complications",
+  ...
+}
 ```
 
 This tests whether LLMs can incorporate corrective feedback—a key capability for medical AI systems.

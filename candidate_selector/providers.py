@@ -190,7 +190,7 @@ def vertexai_config(
         timeout: Request timeout in seconds (default: 180.0)
         extra: Provider-specific config:
                - "auth_type": "api_key" (default) or "adc"
-               - "location": GCP region (required for ADC mode)
+               - "location": GCP region (default: "global")
                - "project_id": GCP project ID (required for ADC mode)
 
     Returns:
@@ -199,9 +199,13 @@ def vertexai_config(
     Raises:
         ValueError: If ADC mode but missing location or project_id
     """
-    # Default extra if not provided
+    # Default extra if not provided, and ensure location has a default
     if not extra:
-        extra = {"auth_type": "api_key"}
+        extra = {"auth_type": "api_key", "location": "global"}
+    else:
+        # Ensure location has a default value
+        if "location" not in extra or not extra.get("location"):
+            extra = {**extra, "location": "global"}
 
     auth_type = extra.get("auth_type", "api_key")
 
@@ -298,7 +302,7 @@ def create_config(
         config = create_config(
             "vertexai",
             api_key="<access_token>",
-            extra={"location": "us-central1", "project_id": "my-project"}
+            extra={"location": "global", "project_id": "my-project"}
         )
     """
     provider = provider.lower()

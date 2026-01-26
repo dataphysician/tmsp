@@ -84,7 +84,7 @@ export function NodeRewindModal({
       >
         {/* Header */}
         <div className="rewind-modal-header">
-          <h2>Rewind from {node.code}</h2>
+          <h2>Details for {node.code}</h2>
           <button
             className="rewind-modal-close-btn"
             onClick={onClose}
@@ -95,7 +95,7 @@ export function NodeRewindModal({
           </button>
         </div>
 
-        {/* Node Info Section */}
+        {/* Node Info Section (fixed, not scrollable) */}
         <div className="rewind-modal-node-info">
           <div className="rewind-modal-code-line">
             <span className="rewind-modal-code">{node.code}</span>
@@ -106,67 +106,70 @@ export function NodeRewindModal({
           <div className="rewind-modal-label">{node.label}</div>
         </div>
 
-        {/* Previous Decision Section */}
-        {decision && decision.candidates.length > 0 && (
-          <div className="rewind-modal-decision-section">
-            <h3>Previous Selection ({decision.current_label})</h3>
-            <div className="rewind-modal-candidates-list">
-              {decision.candidates.map(c => (
-                <div
-                  key={c.code}
-                  className={`rewind-modal-candidate ${c.selected ? 'selected' : ''}`}
-                >
-                  <span className="rewind-modal-candidate-code">{c.code}</span>
-                  <span className="rewind-modal-candidate-label">{c.label}</span>
-                  {c.selected && <span className="rewind-modal-selected-badge">selected</span>}
-                </div>
-              ))}
-            </div>
-            {selectedReasoning && (
-              <div className="rewind-modal-reasoning">
-                <h4>Previous Reasoning</h4>
-                <p>{selectedReasoning}</p>
+        {/* Scrollable container for decision, feedback, and actions */}
+        <div className="rewind-modal-scrollable">
+          {/* Previous Decision Section */}
+          {decision && decision.candidates.length > 0 && (
+            <div className="rewind-modal-decision-section">
+              <h3>Selection ({decision.current_label})</h3>
+              <div className="rewind-modal-candidates-list">
+                {decision.candidates.map(c => (
+                  <div
+                    key={c.code}
+                    className={`rewind-modal-candidate ${c.selected ? 'selected' : ''}`}
+                  >
+                    <span className="rewind-modal-candidate-code">{c.code}</span>
+                    <span className="rewind-modal-candidate-label">{c.label}</span>
+                    {c.selected && <span className="rewind-modal-selected-badge">selected</span>}
+                  </div>
+                ))}
               </div>
-            )}
+              {selectedReasoning && (
+                <div className="rewind-modal-reasoning">
+                  <h4>Reasoning</h4>
+                  <p>{selectedReasoning}</p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Feedback Input */}
+          <div className="rewind-modal-feedback-section">
+            <label htmlFor="rewind-feedback">Provide Node-Level Feedback</label>
+            <textarea
+              id="rewind-feedback"
+              value={feedback}
+              onChange={e => setFeedback(e.target.value)}
+              placeholder="e.g., 'The clinical note mentions that the injury has already been checked in the past, implying a subsequent encounter.'"
+              disabled={isSubmitting}
+              rows={3}
+              autoFocus
+            />
+            <p className="rewind-modal-hint">
+              Provide specific guidance for the LLM to make a different selection. Press Ctrl+Enter to submit.
+            </p>
           </div>
-        )}
 
-        {/* Feedback Input */}
-        <div className="rewind-modal-feedback-section">
-          <label htmlFor="rewind-feedback">Correction Feedback</label>
-          <textarea
-            id="rewind-feedback"
-            value={feedback}
-            onChange={e => setFeedback(e.target.value)}
-            placeholder="e.g., 'Select E08.32 instead - patient has diabetic retinopathy'"
-            disabled={isSubmitting}
-            rows={3}
-            autoFocus
-          />
-          <p className="rewind-modal-hint">
-            Provide specific guidance for the LLM to make a different selection. Press Ctrl+Enter to submit.
-          </p>
-        </div>
+          {/* Error Display */}
+          {error && <div className="rewind-modal-error">{error}</div>}
 
-        {/* Error Display */}
-        {error && <div className="rewind-modal-error">{error}</div>}
-
-        {/* Actions */}
-        <div className="rewind-modal-actions">
-          <button
-            onClick={onClose}
-            disabled={isSubmitting}
-            className="rewind-modal-cancel-btn"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleSubmit}
-            disabled={!feedback.trim() || isSubmitting}
-            className="rewind-modal-submit-btn"
-          >
-            {isSubmitting ? 'Rewinding...' : 'Rewind & Re-traverse'}
-          </button>
+          {/* Actions */}
+          <div className="rewind-modal-actions">
+            <button
+              onClick={onClose}
+              disabled={isSubmitting}
+              className="rewind-modal-cancel-btn"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleSubmit}
+              disabled={!feedback.trim() || isSubmitting}
+              className="rewind-modal-submit-btn"
+            >
+              {isSubmitting ? 'Updating...' : 'Update Node'}
+            </button>
+          </div>
         </div>
       </div>
     </div>

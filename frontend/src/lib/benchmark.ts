@@ -22,18 +22,18 @@ import type {
 
 /**
  * Build a map of code -> set of ancestor codes from graph edges.
- * Considers hierarchy edges AND sevenChrDef lateral edges (which represent
- * parent-child relationships for 7th character codes).
+ * Considers hierarchy edges AND ALL lateral edges (sevenChrDef, codeFirst,
+ * codeAlso, useAdditionalCode) which all represent parent-child relationships.
  */
 export function buildAncestorMap(edges: GraphEdge[]): Map<string, Set<string>> {
-  // Build parent map from hierarchy edges AND sevenChrDef lateral edges
-  // sevenChrDef edges are lateral but still represent ancestry (6th char -> 7th char)
+  // Build parent map from hierarchy edges AND all lateral edges
+  // All lateral edges represent ancestry relationships for benchmark comparison
   const parentMap = new Map<string, string>();
   for (const edge of edges) {
     const isHierarchy = edge.edge_type === 'hierarchy';
-    const isSevenChrDef = edge.edge_type === 'lateral' && edge.rule === 'sevenChrDef';
+    const isLateral = edge.edge_type === 'lateral';
 
-    if (isHierarchy || isSevenChrDef) {
+    if (isHierarchy || isLateral) {
       // edge.source is parent, edge.target is child
       parentMap.set(edge.target, edge.source);
     }
@@ -72,15 +72,32 @@ export function isAncestor(
  *
  * For each expected code, determines the outcome based on endpoint relationships.
  * Also identifies "other" codes (traversed codes unrelated to any expected - hidden from graph).
+ *
+ * Special handling for sevenChrDef codes:
+ * - If expected is a depth-7 code (e.g., T36.1X5D) and traversal finalized at its
+ *   immediate sevenChrDef parent (T36.1X5), this is "missed" not "undershoot"
+ * - Rationale: The sevenChrDef batch was presented to the LLM, so it saw the options
+ *   but made the wrong choice (or chose to stop). This is a missed decision.
  */
 export function compareFinalizedCodes(
   expectedCodes: Set<string>,
   expectedAncestorMap: Map<string, Set<string>>,
   traversedCodes: Set<string>,
-  traversedAncestorMap: Map<string, Set<string>>
+  traversedAncestorMap: Map<string, Set<string>>,
+  expectedEdges?: GraphEdge[]
 ): { outcomes: ExpectedCodeOutcome[]; otherCodes: string[] } {
   const outcomes: ExpectedCodeOutcome[] = [];
   const matchedTraversed = new Set<string>();
+
+  // Build sevenChrDef parent map if edges provided
+  const sevenChrDefParentMap = expectedEdges
+    ? buildSevenChrDefParentMap(expectedEdges)
+    : new Map<string, string>();
+
+  // Build lateral parent map for all lateral edges (codeFirst, codeAlso, useAdditionalCode)
+  const lateralParentMap = expectedEdges
+    ? buildLateralParentMap(expectedEdges)
+    : new Map<string, { parent: string; rule: string }>();
 
   for (const expected of expectedCodes) {
     // Check exact match first (MATCHED status)
@@ -94,7 +111,36 @@ export function compareFinalizedCodes(
       continue;
     }
 
-    // Check undershoot: traversed code is ancestor of expected
+    // Check if expected code was reached via ANY lateral edge (non-sevenChrDef)
+    // If the lateral source was finalized, treat as exact match for lateral targets
+    const lateralInfo = lateralParentMap.get(expected);
+    if (lateralInfo && lateralInfo.rule !== 'sevenChrDef' && traversedCodes.has(lateralInfo.parent)) {
+      // The lateral source was finalized - treat as exact match for lateral targets
+      outcomes.push({
+        expectedCode: expected,
+        status: 'exact',
+        relatedCode: lateralInfo.parent,
+      });
+      matchedTraversed.add(lateralInfo.parent);
+      continue;
+    }
+
+    // Check if this is a sevenChrDef child where the parent was traversed
+    // If so, the sevenChrDef batch was presented - this is "missed" not "undershoot"
+    const sevenChrDefParent = sevenChrDefParentMap.get(expected);
+    if (sevenChrDefParent && traversedCodes.has(sevenChrDefParent)) {
+      // The depth-6 parent was finalized, meaning the sevenChrDef batch was presented
+      // but the correct 7th character wasn't selected. This is a missed decision.
+      outcomes.push({
+        expectedCode: expected,
+        status: 'missed',
+        relatedCode: sevenChrDefParent,
+      });
+      matchedTraversed.add(sevenChrDefParent);
+      continue;
+    }
+
+    // Check undershoot: traversed code is ancestor of expected (but not sevenChrDef parent)
     const expectedAncestors = expectedAncestorMap.get(expected) ?? new Set();
     let foundUndershoot: string | null = null;
     for (const traversed of traversedCodes) {
@@ -211,18 +257,78 @@ export function computeBenchmarkMetrics(
 }
 
 /**
- * Build parent map from edges (hierarchy + sevenChrDef only).
- * Used for ancestor expansion.
+ * Build parent map from edges (hierarchy + all lateral edges).
+ * Used for ancestor expansion. Includes all lateral edges (sevenChrDef,
+ * codeFirst, codeAlso, useAdditionalCode) to properly track lateral pathways.
  */
 function buildParentMap(edges: GraphEdge[]): Map<string, string> {
   const parentMap = new Map<string, string>();
   for (const edge of edges) {
-    if (edge.edge_type === 'hierarchy' ||
-      (edge.edge_type === 'lateral' && edge.rule === 'sevenChrDef')) {
+    if (edge.edge_type === 'hierarchy' || edge.edge_type === 'lateral') {
       parentMap.set(String(edge.target), String(edge.source));
     }
   }
   return parentMap;
+}
+
+/**
+ * Build hierarchy-only ancestor map for overshoot detection.
+ * Overshoot means "went deeper in the HIERARCHY than expected".
+ * Lateral targets should NOT be considered overshoots - they are separate pathways.
+ */
+function buildHierarchyAncestorMap(edges: GraphEdge[]): Map<string, Set<string>> {
+  // Build parent map from hierarchy edges ONLY
+  const parentMap = new Map<string, string>();
+  for (const edge of edges) {
+    if (edge.edge_type === 'hierarchy') {
+      parentMap.set(String(edge.target), String(edge.source));
+    }
+  }
+
+  // Build ancestor set for each node
+  const ancestorMap = new Map<string, Set<string>>();
+  for (const [child] of parentMap) {
+    const ancestors = new Set<string>();
+    let current = child;
+    while (parentMap.has(current)) {
+      const parent = parentMap.get(current)!;
+      ancestors.add(parent);
+      current = parent;
+    }
+    ancestorMap.set(child, ancestors);
+  }
+
+  return ancestorMap;
+}
+
+/**
+ * Build sevenChrDef parent map: child -> parent.
+ * Used to detect when a traversed node is the immediate sevenChrDef parent
+ * of an expected code, which means the sevenChrDef batch was presented.
+ */
+function buildSevenChrDefParentMap(edges: GraphEdge[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const edge of edges) {
+    if (edge.edge_type === 'lateral' && edge.rule === 'sevenChrDef') {
+      map.set(String(edge.target), String(edge.source));
+    }
+  }
+  return map;
+}
+
+/**
+ * Build lateral parent map for all lateral edges: child -> { parent, rule }.
+ * Used to detect when an expected code was reached via any lateral edge
+ * (codeFirst, codeAlso, useAdditionalCode) and its source was finalized.
+ */
+function buildLateralParentMap(edges: GraphEdge[]): Map<string, { parent: string; rule: string }> {
+  const map = new Map<string, { parent: string; rule: string }>();
+  for (const edge of edges) {
+    if (edge.edge_type === 'lateral' && edge.rule) {
+      map.set(String(edge.target), { parent: String(edge.source), rule: edge.rule });
+    }
+  }
+  return map;
 }
 
 /**
@@ -256,8 +362,18 @@ export function computeBenchmarkVisualization(
   const traversedParentMap = buildParentMap(traversedEdges);
   const combinedParentMap = new Map([...expectedParentMap, ...traversedParentMap]);
 
-  // Build ancestor map for undershoot/overshoot detection (expected graph only)
+  // Build ancestor map for undershoot detection (includes all edges including lateral)
   const ancestorMap = buildAncestorMap(expectedEdges);
+
+  // Build hierarchy-only ancestor map for overshoot detection
+  // Overshoot = went deeper in HIERARCHY than expected
+  // Lateral targets should NOT be considered overshoots - they are separate pathways
+  const hierarchyAncestorMap = buildHierarchyAncestorMap(expectedEdges);
+
+  // Build sevenChrDef parent map for special handling
+  // If expected is depth-7 and its sevenChrDef parent was finalized, that's NOT undershoot
+  // because the sevenChrDef batch WAS presented (it IS the children batch for depth-6→7 hop)
+  const sevenChrDefParentMap = buildSevenChrDefParentMap(expectedEdges);
 
   // 1. Build traversedSet = streamedNodes ∪ finalizedCodes ∪ ancestors(all traversed nodes)
   const traversedSet = new Set([...streamedNodeIds, ...finalizedCodes]);
@@ -290,9 +406,18 @@ export function computeBenchmarkVisualization(
       benchmarkStatus = 'matched';
     } else if (isFinalized) {
       // Check if finalized at ancestor of expected leaf → undershoot
+      // EXCEPTION: If this node is the sevenChrDef parent of an expected leaf,
+      // that's NOT undershoot - the sevenChrDef batch was presented (it IS the
+      // children batch for depth-6→7 transitions), so it's a missed decision
       let isUndershoot = false;
       for (const leaf of expectedLeaves) {
         if (ancestorMap.get(leaf)?.has(nodeId)) {
+          // Check if this is the sevenChrDef parent of the leaf
+          const sevenChrDefParent = sevenChrDefParentMap.get(leaf);
+          if (sevenChrDefParent === nodeId) {
+            // This is the sevenChrDef parent - not undershoot, the batch was presented
+            continue;
+          }
           isUndershoot = true;
           break;
         }
@@ -339,6 +464,13 @@ export function computeBenchmarkVisualization(
   for (const edge of expectedEdges) {
     const src = String(edge.source);
     const tgt = String(edge.target);
+
+    // DEFENSIVE CHECK: If target is finalized, it cannot be missed
+    // This handles any edge case where traversedSet construction might differ
+    if (finalizedCodes.has(tgt)) {
+      continue;
+    }
+
     const sourceTraversed = src === 'ROOT' || traversedSet.has(src);
     const targetTraversed = traversedSet.has(tgt);
 
@@ -359,12 +491,13 @@ export function computeBenchmarkVisualization(
   }
 
   // 4. Compute overshoot markers
-  // For each finalized: if descendant of expected leaf → overshoot
+  // For each finalized: if HIERARCHY descendant of expected leaf → overshoot
+  // Use hierarchyAncestorMap to exclude lateral targets (they are separate pathways, not overshoots)
   const overshootMarkers: OvershootMarker[] = [];
   for (const finalized of finalizedCodes) {
-    const ancestors = ancestorMap.get(finalized) ?? new Set();
+    const hierarchyAncestors = hierarchyAncestorMap.get(finalized) ?? new Set();
     for (const leaf of expectedLeaves) {
-      if (ancestors.has(leaf)) {
+      if (hierarchyAncestors.has(leaf)) {
         overshootMarkers.push({
           sourceNode: leaf,
           targetCode: finalized,
@@ -456,13 +589,29 @@ export function computeFinalizedComparison(
 } {
   const { finalizedOnlyMode = false } = options;
 
+  // Build nodeMap for O(1) lookups (avoid O(n) nodes.find() calls)
+  const nodeMap = new Map<string, BenchmarkGraphNode>();
+  for (const node of nodes) {
+    nodeMap.set(node.id, node);
+  }
+
   // Build parent maps for ancestor expansion
   const expectedParentMap = buildParentMap(expectedEdges);
   const traversedParentMap = buildParentMap(traversedEdges);
   const combinedParentMap = new Map([...expectedParentMap, ...traversedParentMap]);
 
-  // Build ancestor map for undershoot/overshoot detection (expected graph only)
+  // Build ancestor map for undershoot detection (includes all edges including lateral)
   const ancestorMap = buildAncestorMap(expectedEdges);
+
+  // Build hierarchy-only ancestor map for overshoot detection
+  // Overshoot = went deeper in HIERARCHY than expected
+  // Lateral targets should NOT be considered overshoots - they are separate pathways
+  const hierarchyAncestorMap = buildHierarchyAncestorMap(expectedEdges);
+
+  // Build sevenChrDef parent map for special handling
+  // If expected is depth-7 and its sevenChrDef parent was finalized, that's "missed" not "undershoot"
+  // because the sevenChrDef batch WAS presented (it IS the children batch for depth-6→7 hop)
+  const sevenChrDefParentMap = buildSevenChrDefParentMap(expectedEdges);
 
   // Build traversedSet
   // In finalizedOnlyMode (zero-shot without infer precursors): only finalized codes, no ancestor expansion
@@ -488,17 +637,30 @@ export function computeFinalizedComparison(
   // First pass: identify undershoot nodes (stopping points)
   // For each missed expected leaf, find its DEEPEST finalized ancestor
   // Only that deepest ancestor is the "undershoot" - other ancestors are just "traversed"
+  //
+  // EXCEPTION: If the expected leaf has a sevenChrDef parent that was finalized,
+  // that's NOT undershoot - it's "missed" because the sevenChrDef batch was presented
+  // (the sevenChrDef batch IS the children batch for depth-6→7 transitions)
   const undershootNodes = new Set<string>();
   for (const leaf of expectedLeaves) {
     if (!finalizedCodes.has(leaf)) {
+      // Check if this is a sevenChrDef child where the parent was finalized
+      // If so, skip undershoot - the sevenChrDef batch was presented, this is "missed"
+      const sevenChrDefParent = sevenChrDefParentMap.get(leaf);
+      if (sevenChrDefParent && finalizedCodes.has(sevenChrDefParent)) {
+        // The depth-6 parent was finalized, sevenChrDef batch was presented
+        // This is a missed decision, not undershoot - skip adding to undershootNodes
+        continue;
+      }
+
       // This leaf was missed - find deepest finalized ancestor (the stopping point)
       const ancestors = ancestorMap.get(leaf) || new Set();
       let deepestFinalized: string | null = null;
       let deepestDepth = -1;
       for (const ancestor of ancestors) {
         if (finalizedCodes.has(ancestor)) {
-          // Get depth from node
-          const ancestorNode = nodes.find((n) => n.id === ancestor);
+          // Get depth from node using O(1) map lookup
+          const ancestorNode = nodeMap.get(ancestor);
           const depth = ancestorNode?.depth ?? 0;
           if (depth > deepestDepth) {
             deepestDepth = depth;
@@ -539,27 +701,23 @@ export function computeFinalizedComparison(
     }
 
     // Expected: nodes not yet visited
-    // In finalizedOnlyMode, explicitly reset to 'expected' to override any 'traversed'
-    // status that was incorrectly set during STEP_FINISHED from intermediate predictions
-    if (finalizedOnlyMode) {
-      return { ...node, benchmarkStatus: 'expected' as const };
-    }
-    return node;
+    // Always reset to 'expected' to ensure stale statuses from previous runs are cleared.
+    // This is critical for cached replays where the RAF to reset nodes is cancelled,
+    // leaving benchmarkCombinedNodesRef with stale statuses from the previous run.
+    return { ...node, benchmarkStatus: 'expected' as const };
   });
 
   // Build descendant map from ancestor map (for missed edge detection)
+  // Single pass: for each node, add it to all its ancestors' descendant sets
   const expectedDescendantsMap = new Map<string, Set<string>>();
-  for (const node of nodes) {
-    expectedDescendantsMap.set(node.id, new Set());
-  }
   for (const node of nodes) {
     const ancestors = ancestorMap.get(node.id);
     if (ancestors) {
       for (const ancestor of ancestors) {
-        const descSet = expectedDescendantsMap.get(ancestor);
-        if (descSet) {
-          descSet.add(node.id);
+        if (!expectedDescendantsMap.has(ancestor)) {
+          expectedDescendantsMap.set(ancestor, new Set());
         }
+        expectedDescendantsMap.get(ancestor)!.add(node.id);
       }
     }
   }
@@ -567,10 +725,18 @@ export function computeFinalizedComparison(
   // Compute missed edge markers
   // Edge is missed if: source ∈ traversedSet AND target ∉ traversedSet
   // AND no descendant of target ∈ traversedSet
+  // DEFENSIVE: Never mark finalized codes as missed (they are by definition traversed)
   const missedEdgeMarkers: EdgeMissMarker[] = [];
   for (const edge of expectedEdges) {
     const src = String(edge.source);
     const tgt = String(edge.target);
+
+    // DEFENSIVE CHECK: If target is finalized, it cannot be missed
+    // This handles any edge case where traversedSet construction might differ
+    if (finalizedCodes.has(tgt)) {
+      continue;
+    }
+
     const sourceTraversed = src === 'ROOT' || traversedSet.has(src);
     const targetTraversed = traversedSet.has(tgt);
 
@@ -589,12 +755,13 @@ export function computeFinalizedComparison(
   }
 
   // Compute overshoot markers
-  // Finalized code is overshoot if it's a descendant of an expected leaf
+  // Finalized code is overshoot if it's a HIERARCHY descendant of an expected leaf
+  // Use hierarchyAncestorMap to exclude lateral targets (they are separate pathways, not overshoots)
   const overshootMarkers: OvershootMarker[] = [];
   for (const finalized of finalizedCodes) {
-    const ancestors = ancestorMap.get(finalized) ?? new Set();
+    const hierarchyAncestors = hierarchyAncestorMap.get(finalized) ?? new Set();
     for (const leaf of expectedLeaves) {
-      if (ancestors.has(leaf)) {
+      if (hierarchyAncestors.has(leaf)) {
         overshootMarkers.push({
           sourceNode: leaf,
           targetCode: finalized,
@@ -619,14 +786,15 @@ export function initializeExpectedNodes(nodes: GraphNode[]): BenchmarkGraphNode[
 }
 
 /**
- * Reset nodes to idle state (remove benchmarkStatus).
- * Used when re-running benchmark to show plain black nodes before traversal starts.
+ * Reset nodes to expected state for re-running benchmark.
+ * All nodes start as 'expected' (black dashed outline), then flip to 'traversed'
+ * (green solid outline) as streaming progresses via streamingTraversedIds.
  */
 export function resetNodesToIdle(nodes: BenchmarkGraphNode[]): BenchmarkGraphNode[] {
-  return nodes.map((node) => {
-    const { benchmarkStatus: _, ...rest } = node;
-    return rest as BenchmarkGraphNode;
-  });
+  return nodes.map((node) => ({
+    ...node,
+    benchmarkStatus: 'expected' as const,
+  }));
 }
 
 /**

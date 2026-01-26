@@ -96,3 +96,67 @@ export function extractBatchType(currentLabel: string): string {
   const match = currentLabel.match(/^(\w+)\s+batch$/);
   return match ? match[1] : 'children';
 }
+
+/**
+ * Get descendants that were produced by a specific batch type.
+ * Used for batch-aware pruning during rewind.
+ *
+ * Unlike getDescendantNodeIds which prunes ALL descendants regardless of batch,
+ * this function only prunes:
+ * 1. Direct children from the specified batch (from decision_history)
+ * 2. All descendants of those direct children
+ *
+ * @param nodeId - The node to find batch-specific descendants of
+ * @param batchType - The batch type to prune (e.g., "children", "codeFirst")
+ * @param decisionHistory - The decision history to find batch-specific selections
+ * @param edges - The graph edges to traverse for recursive descendants
+ * @returns Set of node IDs to prune
+ */
+export function getBatchSpecificDescendants(
+  nodeId: string,
+  batchType: string,
+  decisionHistory: { current_node: string; current_label: string; selected_codes: string[] }[],
+  edges: GraphEdge[]
+): Set<string> {
+  const result = new Set<string>();
+
+  // Find matching decision for this specific batch
+  const matchingDecision = decisionHistory.find(d =>
+    d.current_node === nodeId &&
+    extractBatchType(d.current_label) === batchType
+  );
+
+  // If no decision found for this batch, nothing was selected, nothing to prune
+  if (!matchingDecision) {
+    return result;
+  }
+
+  // Get direct children from this batch only
+  const directChildren = matchingDecision.selected_codes;
+
+  // If no codes were selected from this batch, nothing is displayed, nothing to prune
+  // This is the key fix: batches with empty selected_codes don't need re-rendering
+  if (directChildren.length === 0) {
+    return result;
+  }
+
+  // Build child map for recursive descendant lookup
+  const childMap = new Map<string, string[]>();
+  for (const edge of edges) {
+    const src = edge.source as string;
+    const tgt = edge.target as string;
+    if (!childMap.has(src)) childMap.set(src, []);
+    childMap.get(src)!.push(tgt);
+  }
+
+  // BFS from batch-specific direct children
+  const queue = [...directChildren];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (result.has(current)) continue;
+    result.add(current);
+    queue.push(...(childMap.get(current) || []));
+  }
+
+  return result;
+}

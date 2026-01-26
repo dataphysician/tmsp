@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { applyPatch, type Operation } from 'fast-json-patch';
 import { GraphViewer } from './components/GraphViewer';
 import { TrajectoryViewer } from './components/TrajectoryViewer';
@@ -6,7 +6,7 @@ import { BenchmarkReportViewer } from './components/BenchmarkReportViewer';
 import { VisualizeReportViewer } from './components/VisualizeReportViewer';
 import { LLMSettingsPanel, NodeRewindModal } from './components/shared';
 import { streamTraversal, streamRewind, buildGraph, type AGUIEvent } from './lib/api';
-import { getDescendantNodeIds, extractBatchType } from './lib/graphUtils';
+import { extractBatchType, getBatchSpecificDescendants } from './lib/graphUtils';
 import type {
   TraversalState,
   DecisionPoint,
@@ -27,7 +27,6 @@ import {
   computeFinalizedComparison,
   initializeExpectedNodes,
   resetNodesToIdle,
-  updateTraversedNodes,
 } from './lib/benchmark';
 import {
   INITIAL_TRAVERSAL_STATE,
@@ -76,6 +75,11 @@ function TraversalUI() {
   const [isLoading, setIsLoading] = useState(false);
   const [batchCount, setBatchCount] = useState(0);
   const controllerRef = useRef<AbortController | null>(null);
+  // Refs for traverse tab state (updated during streaming, applied at RUN_FINISHED)
+  const traverseNodesRef = useRef<GraphNode[]>([]);
+  const traverseEdgesRef = useRef<GraphEdge[]>([]);
+  const traverseDecisionsRef = useRef<DecisionPoint[]>([]);
+  const traverseBatchCountRef = useRef<number>(0);
   // Per-feature view tab states (Graph vs Report)
   const [visualizeViewTab, setVisualizeViewTab] = useState<ViewTab>('graph');
   const [traverseViewTab, setTraverseViewTab] = useState<ViewTab>('graph');
@@ -112,12 +116,22 @@ function TraversalUI() {
   const [benchmarkCodeInput, setBenchmarkCodeInput] = useState('');
   const [benchmarkExpectedGraph, setBenchmarkExpectedGraph] = useState<{ nodes: GraphNode[]; edges: GraphEdge[] } | null>(null);
   const [benchmarkTraversedNodes, setBenchmarkTraversedNodes] = useState<GraphNode[]>([]);
-  const [benchmarkTraversedEdges, setBenchmarkTraversedEdges] = useState<GraphEdge[]>([]);
+  const [_benchmarkTraversedEdges, setBenchmarkTraversedEdges] = useState<GraphEdge[]>([]);
   // Refs to track latest values for use in async callbacks (avoid stale closures)
   const benchmarkTraversedNodesRef = useRef<GraphNode[]>([]);
   const benchmarkTraversedEdgesRef = useRef<GraphEdge[]>([]);
+  const benchmarkDecisionsRef = useRef<DecisionPoint[]>([]);
+  const benchmarkCombinedNodesRef = useRef<BenchmarkGraphNode[]>([]);
   // Phase 1: Track all selected_ids during streaming for Phase 2 marker computation
   const benchmarkStreamedIdsRef = useRef<Set<string>>(new Set());
+  // Cache expectedNodeIds to avoid creating a new Set on every STEP_FINISHED event
+  const benchmarkExpectedNodeIdsRef = useRef<Set<string>>(new Set());
+  // Batch count ref for streaming (state only updated at end)
+  const benchmarkBatchCountRef = useRef<number>(0);
+  // Track pending RAF for node reset (to cancel on cached replay completion)
+  const benchmarkResetRafRef = useRef<number | null>(null);
+  // Track if current run is a cached replay (for UI display)
+  const benchmarkIsCachedReplayRef = useRef<boolean>(false);
   const [benchmarkCombinedNodes, setBenchmarkCombinedNodes] = useState<BenchmarkGraphNode[]>([]);
   const [benchmarkCombinedEdges, setBenchmarkCombinedEdges] = useState<GraphEdge[]>([]);
   const [benchmarkOvershootMarkers, setBenchmarkOvershootMarkers] = useState<OvershootMarker[]>([]);
@@ -130,6 +144,13 @@ function TraversalUI() {
   const [benchmarkClinicalNote, setBenchmarkClinicalNote] = useState('');
   const [benchmarkBatchCount, setBenchmarkBatchCount] = useState(0);
   const [benchmarkFitTrigger, setBenchmarkFitTrigger] = useState(0);
+  // Streaming traversed IDs - updated during STEP_FINISHED for real-time visual feedback
+  const [streamingTraversedIds, setStreamingTraversedIds] = useState<Set<string>>(new Set());
+  // Ref to track streaming IDs without triggering re-renders (updated every event, state throttled)
+  const streamingTraversedIdsRef = useRef<Set<string>>(new Set());
+  // Throttle visual updates to prevent UI freezing during rapid event processing
+  const lastVisualUpdateTimeRef = useRef<number>(0);
+  const VISUAL_UPDATE_THROTTLE_MS = 100; // Max 10 visual updates per second
   const benchmarkControllerRef = useRef<AbortController | null>(null);
   const [benchmarkSidebarTab, setBenchmarkSidebarTab] = useState<SidebarTab>('clinical-note');
   const [benchmarkInvalidCodes, setBenchmarkInvalidCodes] = useState<Set<string>>(new Set());
@@ -149,6 +170,7 @@ function TraversalUI() {
   const [benchmarkInferredView, setBenchmarkInferredView] = useState<{
     nodes: BenchmarkGraphNode[];
     edges: GraphEdge[];
+    graphNodes: BenchmarkGraphNode[];  // Inferred graph nodes with benchmark status for Graph view
     metrics: BenchmarkMetrics;
     overshootMarkers: OvershootMarker[];
     missedEdgeMarkers: EdgeMissMarker[];
@@ -159,12 +181,19 @@ function TraversalUI() {
   // The backend caches LLM responses based on (clinical_note, provider, model, temperature, system_prompt)
   // Frontend processes results into comparison views in handleBenchmarkEvent RUN_FINISHED handler
 
+  // Memoize benchmark finalized codes array to prevent unnecessary GraphViewer re-renders
+  // During streaming, benchmarkExpectedCodes doesn't change, so this array stays stable
+  const benchmarkFinalizedCodesArray = useMemo(() => {
+    return [...benchmarkExpectedCodes];
+  }, [benchmarkExpectedCodes]);
+
   // Rewind state (for spot rewind feature in TRAVERSE tab)
   const [rewindTargetNode, setRewindTargetNode] = useState<GraphNode | null>(null);
   const [rewindTargetBatchId, setRewindTargetBatchId] = useState<string | null>(null);
   const [rewindFeedbackText, setRewindFeedbackText] = useState<string>('');
   const [isRewindModalOpen, setIsRewindModalOpen] = useState(false);
   const [isRewinding, setIsRewinding] = useState(false);
+  const [rewindingNodeId, setRewindingNodeId] = useState<string | null>(null);
   const [rewindError, setRewindError] = useState<string | null>(null);
   const rewindControllerRef = useRef<AbortController | null>(null);
 
@@ -221,9 +250,13 @@ function TraversalUI() {
   }, [benchmarkStatus]);
 
   // Handle AG-UI events
+  // For cached replays, server sends STATE_SNAPSHOT (complete graph) instead of individual events
   const handleAGUIEvent = useCallback((event: AGUIEvent) => {
     switch (event.type) {
       case 'RUN_STARTED':
+        if (event.metadata?.cached) {
+          console.log('[Traverse] Cached replay - expecting STATE_SNAPSHOT');
+        }
         setState(prev => ({
           ...prev,
           status: 'traversing',
@@ -232,30 +265,30 @@ function TraversalUI() {
         break;
 
       case 'STATE_SNAPSHOT':
+        // AG-UI Protocol: Complete state replacement for cached replays
+        // Server sends a single snapshot instead of 500+ individual events
         if (event.state) {
+          const nodes = event.state.nodes as GraphNode[];
+          const edges = event.state.edges as GraphEdge[];
+          // Update refs
+          traverseNodesRef.current = nodes;
+          traverseEdgesRef.current = edges;
+          // For cached replays, this is the complete graph - update state immediately
+          // For live traversals, this may be an initial snapshot
           setState(prev => ({
             ...prev,
-            nodes: event.state!.nodes as GraphNode[],
-            edges: event.state!.edges as GraphEdge[],
+            nodes,
+            edges,
           }));
+          console.log(`[STATE_SNAPSHOT] Complete graph: ${nodes.length} nodes, ${edges.length} edges`);
         }
         break;
 
       case 'STATE_DELTA':
+        // Live traversal: Apply JSON Patch for incremental updates
+        // Note: Cached replays use STATE_SNAPSHOT instead, so this only runs for live traversals
         if (event.delta) {
-          // Log all additions for debugging
-          event.delta.forEach((op) => {
-            if (op.op === 'add') {
-              if (op.path === '/edges/-') {
-                console.log('[EDGE ADDED]', op.value);
-              } else if (op.path === '/nodes/-') {
-                console.log('[NODE ADDED]', op.value);
-              }
-            }
-          });
-
           setState(prev => {
-            // Create mutable copy of graph state for JSON Patch
             const graphState = {
               nodes: [...prev.nodes],
               edges: [...prev.edges],
@@ -263,9 +296,10 @@ function TraversalUI() {
             };
 
             try {
-              // Apply JSON Patch operations
               const result = applyPatch(graphState, event.delta as Operation[], true, false);
-              console.log(`[STATE] After delta: ${result.newDocument.nodes.length} nodes, ${result.newDocument.edges.length} edges`);
+              // Update refs as well
+              traverseNodesRef.current = result.newDocument.nodes;
+              traverseEdgesRef.current = result.newDocument.edges;
               return {
                 ...prev,
                 nodes: result.newDocument.nodes,
@@ -281,6 +315,8 @@ function TraversalUI() {
         break;
 
       case 'STEP_STARTED':
+        // Live traversal: Update current step
+        // Note: Cached replays use STATE_SNAPSHOT instead, so this only runs for live traversals
         setState(prev => ({
           ...prev,
           current_step: event.step_id || '',
@@ -288,7 +324,7 @@ function TraversalUI() {
         break;
 
       case 'STEP_FINISHED':
-        setBatchCount(prev => prev + 1);
+        traverseBatchCountRef.current += 1;
 
         // Convert to decision point for history
         if (event.metadata) {
@@ -354,12 +390,17 @@ function TraversalUI() {
             selected_codes: selectedIds,
           };
 
-          // Merge graph data and add decision to history
+          // Live traversal: merge and update state for real-time feedback
+          // Note: Cached replays use STATE_SNAPSHOT + decisions in RUN_FINISHED metadata
+          traverseNodesRef.current = mergeById(traverseNodesRef.current, newNodes);
+          traverseEdgesRef.current = mergeByKey(traverseEdgesRef.current, newEdges);
+          traverseDecisionsRef.current = [...traverseDecisionsRef.current, decision];
+          setBatchCount(traverseBatchCountRef.current);
           setState(prev => ({
             ...prev,
-            nodes: mergeById(prev.nodes, newNodes),
-            edges: mergeByKey(prev.edges, newEdges),
-            decision_history: [...prev.decision_history, decision],
+            nodes: traverseNodesRef.current,
+            edges: traverseEdgesRef.current,
+            decision_history: traverseDecisionsRef.current,
           }));
         }
         break;
@@ -376,9 +417,49 @@ function TraversalUI() {
           // Deduplicate final nodes (in case parallel batches reached same node)
           const finalNodesRaw = (event.metadata?.final_nodes || []) as string[];
           const finalNodes = [...new Set(finalNodesRaw)];
+
+          // AG-UI Protocol: For snapshot mode, decisions come in RUN_FINISHED metadata
+          // This eliminates the need for 500+ STEP_FINISHED events
+          const snapshotDecisions = event.metadata?.decisions as Array<{
+            batch_id: string;
+            node_id: string;
+            batch_type: string;
+            candidates: Record<string, string>;
+            selected_ids: string[];
+            reasoning: string;
+            selected_details?: Record<string, { depth: number; category: string; billable: boolean }>;
+          }> | undefined;
+
+          if (snapshotDecisions && snapshotDecisions.length > 0) {
+            // Convert server decisions to frontend DecisionPoint format
+            const decisions: DecisionPoint[] = snapshotDecisions.map(d => ({
+              current_node: d.node_id,
+              current_label: `${d.batch_type} batch`,
+              depth: (d.batch_id?.split('|').length || 1),
+              candidates: Object.entries(d.candidates).map(([code, label]) => ({
+                code,
+                label,
+                selected: d.selected_ids.includes(code),
+                confidence: d.selected_ids.includes(code) ? 1.0 : 0.0,
+                evidence: null,
+                reasoning: d.selected_ids.includes(code) ? d.reasoning : '',
+                billable: d.selected_details?.[code]?.billable ?? false,
+              })),
+              selected_codes: d.selected_ids,
+            }));
+            traverseDecisionsRef.current = decisions;
+            traverseBatchCountRef.current = decisions.length;
+            console.log(`[RUN_FINISHED] Snapshot mode: ${decisions.length} decisions from metadata`);
+          }
+
+          // Apply data from refs
+          setBatchCount(traverseBatchCountRef.current);
           setState(prev => ({
             ...prev,
             status: 'complete',
+            nodes: traverseNodesRef.current,
+            edges: traverseEdgesRef.current,
+            decision_history: traverseDecisionsRef.current,
             finalized_codes: finalNodes,
             current_step: `Complete - ${finalNodes.length} codes found`,
           }));
@@ -412,6 +493,11 @@ function TraversalUI() {
 
     setIsLoading(true);
     setBatchCount(0);
+    // Reset refs
+    traverseNodesRef.current = [];
+    traverseEdgesRef.current = [];
+    traverseDecisionsRef.current = [];
+    traverseBatchCountRef.current = 0;
     setState({
       ...INITIAL_TRAVERSAL_STATE,
       status: 'traversing',
@@ -455,38 +541,15 @@ function TraversalUI() {
   }, []);
 
   // Rewind handlers (for spot rewind feature in TRAVERSE tab)
-  const handleNodeRewindClick = useCallback((nodeId: string, batchId?: string, feedback?: string) => {
-    // Find the node in current state
-    const node = state.nodes.find(n => n.id === nodeId);
-    if (!node) return;
-
-    // Only allow rewind on non-ROOT nodes during/after traversal
-    if (nodeId === 'ROOT' || state.status === 'idle') return;
-
-    setRewindTargetNode(node);
-    setRewindTargetBatchId(batchId || null);
-    setRewindFeedbackText(feedback || '');
-    setIsRewindModalOpen(true);
-    setRewindError(null);
-  }, [state.nodes, state.status]);
-
-  const handleRewindClose = useCallback(() => {
-    if (!isRewinding) {
-      setIsRewindModalOpen(false);
-      setRewindTargetNode(null);
-      setRewindTargetBatchId(null);
-      setRewindFeedbackText('');
-      setRewindError(null);
-    }
-  }, [isRewinding]);
-
-  const handleRewindSubmit = useCallback(async (nodeId: string, feedback: string) => {
+  const handleRewindSubmit = useCallback(async (nodeId: string, feedback: string, providedBatchId?: string) => {
     setIsRewinding(true);
+    setRewindingNodeId(nodeId);  // Track which node is being rewound
     setRewindError(null);
+    setSelectedNode(null);  // Clear selection to reset SVG state
 
     try {
-      // Use stored batchId if available, otherwise construct from first matching decision
-      let batchId = rewindTargetBatchId;
+      // Use provided batchId, then stored batchId, otherwise construct from first matching decision
+      let batchId = providedBatchId || rewindTargetBatchId;
       if (!batchId) {
         const decision = state.decision_history.find(d => d.current_node === nodeId);
         const batchType = decision ? extractBatchType(decision.current_label) : 'children';
@@ -498,21 +561,60 @@ function TraversalUI() {
         rewindControllerRef.current.abort();
       }
 
-      // Remove descendant nodes immediately (optimistic update)
-      const descendantIds = getDescendantNodeIds(nodeId, state.edges);
+      // Extract batchType from batchId for batch-aware pruning
+      const batchType = batchId.split('|')[1] || 'children';
 
-      setState(prev => ({
-        ...prev,
-        nodes: prev.nodes.filter(n => !descendantIds.has(n.id)),
-        edges: prev.edges.filter(e =>
+      // Use batch-specific pruning inside setState to ensure we use latest state
+      // This prevents stale closure issues when rapid events are being processed
+      setState(prev => {
+        // Calculate descendants to prune using CURRENT state (prev), not stale closure
+        const descendantIds = getBatchSpecificDescendants(
+          nodeId,
+          batchType,
+          prev.decision_history,
+          prev.edges
+        );
+
+        // Filter functions for reuse
+        const filterNodes = (nodes: typeof prev.nodes) => nodes.filter(n => !descendantIds.has(n.id));
+        const filterEdges = (edges: typeof prev.edges) => edges.filter(e =>
           !descendantIds.has(e.source as string) &&
           !descendantIds.has(e.target as string)
-        ),
-        finalized_codes: prev.finalized_codes.filter(c => !descendantIds.has(c)),
-        decision_history: prev.decision_history.filter(d => !descendantIds.has(d.current_node)),
-        status: 'traversing',
-        current_step: `Rewinding from ${nodeId}...`,
-      }));
+        );
+        const filterDecisions = (decisions: typeof prev.decision_history) => decisions.filter(d => {
+          // Remove the specific batch decision being rewound
+          if (d.current_node === nodeId && extractBatchType(d.current_label) === batchType) {
+            return false;
+          }
+          // Remove decisions for pruned descendants
+          if (descendantIds.has(d.current_node)) {
+            return false;
+          }
+          return true;
+        });
+
+        // CRITICAL: Also update refs so STEP_FINISHED events don't append to stale data
+        // Without this, the old batch decision remains in the ref and we get duplicates
+        traverseNodesRef.current = filterNodes(traverseNodesRef.current);
+        traverseEdgesRef.current = filterEdges(traverseEdgesRef.current);
+        traverseDecisionsRef.current = filterDecisions(traverseDecisionsRef.current);
+
+        return {
+          ...prev,
+          nodes: filterNodes(prev.nodes),
+          edges: filterEdges(prev.edges),
+          // Remove only descendants from finalized_codes (not the rewound node)
+          // The backend will compute correct final_nodes after rewind:
+          // - If children selected → rewound node is NOT a leaf → NOT in final_nodes
+          // - If no children selected → rewound node IS a leaf → IN final_nodes
+          // RUN_FINISHED will replace finalized_codes with the correct final_nodes
+          finalized_codes: prev.finalized_codes.filter(c => !descendantIds.has(c)),
+          // Filter decision_history: remove specific batch + pruned descendants
+          decision_history: filterDecisions(prev.decision_history),
+          status: 'traversing',
+          current_step: `Rewinding from ${nodeId} (${batchType} batch)...`,
+        };
+      });
 
       // Close modal
       setIsRewindModalOpen(false);
@@ -520,10 +622,14 @@ function TraversalUI() {
       setRewindTargetBatchId(null);
 
       // Stream the rewind traversal
+      // Pass existing node IDs so backend can link lateral targets to existing ancestors
+      const existingNodeIds = state.nodes.map(n => n.id);
       rewindControllerRef.current = streamRewind(
         {
           batch_id: batchId,
           feedback,
+          clinical_note: clinicalNote,
+          existing_nodes: existingNodeIds,
           provider: llmConfig.provider,
           api_key: llmConfig.apiKey,
           model: llmConfig.model || undefined,
@@ -549,12 +655,48 @@ function TraversalUI() {
       setRewindError(error instanceof Error ? error.message : 'Rewind failed');
       setIsRewinding(false);
     }
-  }, [state.decision_history, state.edges, llmConfig, handleAGUIEvent]);
+  }, [state.decision_history, state.nodes, clinicalNote, llmConfig, handleAGUIEvent, rewindTargetBatchId]);
+
+  const handleRewindClose = useCallback(() => {
+    if (!isRewinding) {
+      setIsRewindModalOpen(false);
+      setRewindTargetNode(null);
+      setRewindTargetBatchId(null);
+      setRewindFeedbackText('');
+      setRewindError(null);
+    }
+  }, [isRewinding]);
+
+  const handleNodeRewindClick = useCallback((nodeId: string, batchType?: string, feedback?: string) => {
+    // Find the node in current state
+    const node = state.nodes.find(n => n.id === nodeId);
+    if (!node) return;
+
+    // Only allow rewind on non-ROOT nodes during/after traversal
+    if (nodeId === 'ROOT' || state.status === 'idle') return;
+
+    // Construct the composite batch_id for backend
+    const batchId = batchType ? `${nodeId}|${batchType}` : null;
+
+    // If feedback is provided directly, skip modal and rewind immediately
+    if (feedback && feedback.trim().length > 0 && batchId) {
+      handleRewindSubmit(nodeId, feedback, batchId);
+      return;
+    }
+
+    // Otherwise, open modal for user to enter feedback
+    setRewindTargetNode(node);
+    setRewindTargetBatchId(batchId);
+    setRewindFeedbackText(feedback || '');
+    setIsRewindModalOpen(true);
+    setRewindError(null);
+  }, [state.nodes, state.status, handleRewindSubmit]);
 
   // Effect to reset isRewinding when traversal completes
   useEffect(() => {
     if (isRewinding && (state.status === 'complete' || state.status === 'error')) {
       setIsRewinding(false);
+      setRewindingNodeId(null);
     }
   }, [isRewinding, state.status]);
 
@@ -669,9 +811,12 @@ function TraversalUI() {
     try {
       const result = await buildGraph([...codes]);
       setBenchmarkExpectedGraph(result);
+      // Cache expectedNodeIds for efficient lookups during STEP_FINISHED events
+      benchmarkExpectedNodeIdsRef.current = new Set(result.nodes.map(n => n.id));
 
       // Initialize combined graph with expected nodes (all marked as 'expected')
       const combinedNodes = initializeExpectedNodes(result.nodes);
+      benchmarkCombinedNodesRef.current = combinedNodes;
       setBenchmarkCombinedNodes(combinedNodes);
       setBenchmarkCombinedEdges(result.edges);
 
@@ -694,7 +839,9 @@ function TraversalUI() {
           try {
             const result = await buildGraph([...validCodes]);
             setBenchmarkExpectedGraph(result);
+            benchmarkExpectedNodeIdsRef.current = new Set(result.nodes.map(n => n.id));
             const combinedNodes = initializeExpectedNodes(result.nodes);
+            benchmarkCombinedNodesRef.current = combinedNodes;
             setBenchmarkCombinedNodes(combinedNodes);
             setBenchmarkCombinedEdges(result.edges);
             setBenchmarkStatus('idle');
@@ -721,6 +868,7 @@ function TraversalUI() {
     if (codes.length > 0) {
       // If benchmark is complete, clear traversal state first (new benchmark setup)
       if (benchmarkStatus === 'complete') {
+        benchmarkCombinedNodesRef.current = [];
         setBenchmarkCombinedNodes([]);
         setBenchmarkCombinedEdges([]);
         setBenchmarkOvershootMarkers([]);
@@ -743,6 +891,7 @@ function TraversalUI() {
   const handleBenchmarkRemoveCode = useCallback(async (code: string) => {
     // If benchmark is complete, clear traversal state first (new benchmark setup)
     if (benchmarkStatus === 'complete') {
+      benchmarkCombinedNodesRef.current = [];
       setBenchmarkCombinedNodes([]);
       setBenchmarkCombinedEdges([]);
       setBenchmarkOvershootMarkers([]);
@@ -768,6 +917,8 @@ function TraversalUI() {
     } else {
       // No codes left - clear the graph
       setBenchmarkExpectedGraph(null);
+      benchmarkExpectedNodeIdsRef.current = new Set();
+      benchmarkCombinedNodesRef.current = [];
       setBenchmarkCombinedNodes([]);
       setBenchmarkCombinedEdges([]);
       setBenchmarkOvershootMarkers([]);
@@ -779,52 +930,83 @@ function TraversalUI() {
   const handleBenchmarkEvent = useCallback((event: AGUIEvent) => {
     switch (event.type) {
       case 'RUN_STARTED':
+        // Track cached status (single source of truth from server)
+        const isCached = event.metadata?.cached === true;
+        benchmarkIsCachedReplayRef.current = isCached;
+
+        if (isCached) {
+          console.log('[Benchmark] Cached replay - expecting STATE_SNAPSHOT');
+        }
+
+        // CRITICAL: Cancel any pending RAF and reset nodes synchronously.
+        // This ensures nodes are visually reset to "idle" (freshly added expected nodes)
+        // BEFORE any traversal data arrives, especially important for cached replays
+        // where RUN_FINISHED arrives very quickly.
+        if (benchmarkResetRafRef.current !== null) {
+          cancelAnimationFrame(benchmarkResetRafRef.current);
+          benchmarkResetRafRef.current = null;
+        }
+
+        // Synchronously reset combined nodes to idle status
+        if (benchmarkCombinedNodesRef.current.length > 0) {
+          const idleNodes = resetNodesToIdle(benchmarkCombinedNodesRef.current);
+          benchmarkCombinedNodesRef.current = idleNodes;
+          setBenchmarkCombinedNodes(idleNodes);
+        }
+
         setBenchmarkStatus('traversing');
-        setBenchmarkCurrentStep('Starting benchmark traversal');
+        setBenchmarkCurrentStep(isCached ? 'Loading cached results...' : 'Starting benchmark traversal');
         break;
 
       case 'STATE_SNAPSHOT':
+        // AG-UI Protocol: Complete state replacement for cached replays
+        // Server sends a single snapshot instead of 500+ individual events
         if (event.state) {
-          setBenchmarkTraversedNodes(event.state.nodes as GraphNode[]);
-          setBenchmarkTraversedEdges(event.state.edges as GraphEdge[]);
+          const nodes = event.state.nodes as GraphNode[];
+          const edges = event.state.edges as GraphEdge[];
+          // Update refs
+          benchmarkTraversedNodesRef.current = nodes;
+          benchmarkTraversedEdgesRef.current = edges;
+          // Update state immediately - this is the complete traversed graph
+          setBenchmarkTraversedNodes(nodes);
+          setBenchmarkTraversedEdges(edges);
+
+          // Track all node IDs for streaming progress (marks them as traversed)
+          const traversedIds = new Set(nodes.map(n => n.id));
+          benchmarkStreamedIdsRef.current = traversedIds;
+
+          console.log(`[STATE_SNAPSHOT] Benchmark complete graph: ${nodes.length} nodes, ${edges.length} edges`);
         }
         break;
 
       case 'STATE_DELTA':
+        // Live traversal: Apply JSON Patch for incremental updates
+        // Note: Cached replays use STATE_SNAPSHOT instead, so this only runs for live traversals
+        // PERFORMANCE: Update refs only during streaming - state is applied at RUN_FINISHED
+        // This prevents excessive re-renders during rapid event processing
         if (event.delta) {
-          setBenchmarkTraversedNodes(prev => {
-            const graphState = { nodes: [...prev], edges: [] };
-            try {
-              const result = applyPatch(graphState, event.delta as Operation[], true, false);
-              const updated = result.newDocument.nodes;
-              // Update ref so benchmark comparison has latest data
-              benchmarkTraversedNodesRef.current = updated;
-              return updated;
-            } catch {
-              return prev;
-            }
-          });
-          setBenchmarkTraversedEdges(prev => {
-            const graphState = { nodes: [], edges: [...prev] };
-            try {
-              const result = applyPatch(graphState, event.delta as Operation[], true, false);
-              const updated = result.newDocument.edges;
-              // Update ref so benchmark comparison has latest data
-              benchmarkTraversedEdgesRef.current = updated;
-              return updated;
-            } catch {
-              return prev;
-            }
-          });
+          const graphState = {
+            nodes: [...benchmarkTraversedNodesRef.current],
+            edges: [...benchmarkTraversedEdgesRef.current],
+          };
+          try {
+            const result = applyPatch(graphState, event.delta as Operation[], true, false);
+            benchmarkTraversedNodesRef.current = result.newDocument.nodes;
+            benchmarkTraversedEdgesRef.current = result.newDocument.edges;
+          } catch {
+            // Ignore patch errors - refs already have latest data
+          }
         }
         break;
 
       case 'STEP_STARTED':
-        setBenchmarkCurrentStep(event.step_id || '');
+        // Skip state update during streaming - tracked in RUN_FINISHED
         break;
 
       case 'STEP_FINISHED':
-        setBenchmarkBatchCount(prev => prev + 1);
+        // Live traversal: Process each batch and update state for real-time feedback
+        // Note: Cached replays use STATE_SNAPSHOT + decisions in RUN_FINISHED metadata
+        benchmarkBatchCountRef.current += 1;
 
         if (event.metadata) {
           const metadata = event.metadata;
@@ -840,14 +1022,12 @@ function TraversalUI() {
           }>;
 
           // Build new traversed nodes and edges
-          // Backend handles all sevenChrDef X-padding and validation - frontend just uses codes as-is
           const edgeSource = nodeId && nodeId !== 'ROOT' ? nodeId : 'ROOT';
           const isFromRoot = edgeSource === 'ROOT';
 
           const newNodes: GraphNode[] = [];
           const newEdges: GraphEdge[] = [];
 
-          // All batches handled uniformly - backend sends full validated codes
           for (const code of selectedIds) {
             newNodes.push({
               id: code,
@@ -887,33 +1067,26 @@ function TraversalUI() {
             selected_codes: selectedIds,
           };
 
-          // Update traversed state and refs (refs avoid stale closures in RUN_FINISHED)
-          setBenchmarkTraversedNodes(prev => {
-            const updated = mergeById(prev, newNodes);
-            benchmarkTraversedNodesRef.current = updated;
-            return updated;
-          });
-          setBenchmarkTraversedEdges(prev => {
-            const updated = mergeByKey(prev, newEdges);
-            benchmarkTraversedEdgesRef.current = updated;
-            return updated;
-          });
-          setBenchmarkDecisions(prev => [...prev, decision]);
-
-          // Phase 1a: Accumulate streamed IDs for Phase 2 marker computation
+          // Track streamed IDs for Phase 2 marker computation
           for (const id of selectedIds) {
             benchmarkStreamedIdsRef.current.add(id);
+            streamingTraversedIdsRef.current.add(id);
           }
 
-          // Phase 1b: Update traversed status in real-time (visual feedback)
-          // Updates expected nodes that were traversed (nodeId + selected_ids) to 'traversed' status
-          // nodeId is included because it represents the node being processed in the current batch
-          setBenchmarkCombinedNodes(prevCombined => {
-            if (!benchmarkExpectedGraph || prevCombined.length === 0) return prevCombined;
+          // Merge into refs for real-time feedback (no state updates = no re-renders)
+          benchmarkTraversedNodesRef.current = mergeById(benchmarkTraversedNodesRef.current, newNodes);
+          benchmarkTraversedEdgesRef.current = mergeByKey(benchmarkTraversedEdgesRef.current, newEdges);
+          benchmarkDecisionsRef.current = [...benchmarkDecisionsRef.current, decision];
 
-            const expectedNodeIds = new Set(benchmarkExpectedGraph.nodes.map(n => n.id));
-            return updateTraversedNodes(prevCombined, selectedIds, expectedNodeIds, nodeId);
-          });
+          // THROTTLED state updates for visual feedback
+          // This limits re-renders to max 10/sec instead of 100+ during rapid event processing
+          const now = Date.now();
+          if (now - lastVisualUpdateTimeRef.current >= VISUAL_UPDATE_THROTTLE_MS) {
+            lastVisualUpdateTimeRef.current = now;
+            setStreamingTraversedIds(new Set(streamingTraversedIdsRef.current));
+            setBenchmarkBatchCount(benchmarkBatchCountRef.current);
+          }
+          // Skip setBenchmarkCurrentStep during streaming - events arrive too fast to read
         }
         break;
 
@@ -927,173 +1100,251 @@ function TraversalUI() {
           const finalNodes = new Set(finalNodesRaw);
           const isZeroShot = !(llmConfig.scaffolded ?? true);
 
-          // NOTE: Cross-run caching is now handled by the backend (Burr + SQLite)
-          // The backend reports cache status in event.metadata.cached
-          const wasCached = event.metadata?.cached ?? false;
-          if (wasCached) {
-            console.log('[BACKEND CACHE HIT] Using cached zero-shot results:', finalNodesRaw.length, 'codes');
+          // Safety net: Cancel any pending RAF (primary reset happens in RUN_STARTED,
+          // but this catches edge cases where RAF might still be pending)
+          if (benchmarkResetRafRef.current !== null) {
+            cancelAnimationFrame(benchmarkResetRafRef.current);
+            benchmarkResetRafRef.current = null;
           }
 
-          // Phase 2: Compute final statuses and markers
-          // Use refs to get latest traversed data (avoid stale closure)
+          // AG-UI Protocol: For snapshot mode, decisions come in RUN_FINISHED metadata
+          // This eliminates the need for 500+ STEP_FINISHED events
+          const snapshotDecisions = event.metadata?.decisions as Array<{
+            batch_id: string;
+            node_id: string;
+            batch_type: string;
+            candidates: Record<string, string>;
+            selected_ids: string[];
+            reasoning: string;
+            selected_details?: Record<string, { depth: number; category: string; billable: boolean }>;
+          }> | undefined;
+
+          if (snapshotDecisions && snapshotDecisions.length > 0) {
+            // Convert server decisions to frontend DecisionPoint format
+            const decisions: DecisionPoint[] = snapshotDecisions.map(d => ({
+              current_node: d.node_id,
+              current_label: `${d.batch_type} batch`,
+              depth: (d.batch_id?.split('|').length || 1),
+              candidates: Object.entries(d.candidates).map(([code, label]) => ({
+                code,
+                label,
+                selected: d.selected_ids.includes(code),
+                confidence: d.selected_ids.includes(code) ? 1.0 : 0.0,
+                evidence: null,
+                reasoning: d.selected_ids.includes(code) ? d.reasoning : '',
+                billable: d.selected_details?.[code]?.billable ?? false,
+              })),
+              selected_codes: d.selected_ids,
+            }));
+            benchmarkDecisionsRef.current = decisions;
+            benchmarkBatchCountRef.current = decisions.length;
+            console.log(`[RUN_FINISHED] Snapshot mode: ${decisions.length} decisions from metadata`);
+          }
+
+          // Apply state from refs
+          setBenchmarkTraversedNodes(benchmarkTraversedNodesRef.current);
+          setBenchmarkTraversedEdges(benchmarkTraversedEdgesRef.current);
+          setBenchmarkDecisions(benchmarkDecisionsRef.current);
+          setBenchmarkBatchCount(benchmarkBatchCountRef.current);
+
+          // Log cache status (use ref which was set in RUN_STARTED for consistency)
+          if (benchmarkIsCachedReplayRef.current) {
+            console.log('[BACKEND CACHE HIT] Using cached traversal results:', finalNodesRaw.length, 'codes finalized');
+          }
+
+          // Phase 2: Compute final statuses and markers OUTSIDE of setState callbacks
+          // This prevents nested setState calls and React batching issues
           if (benchmarkExpectedGraph) {
             const latestTraversedEdges = benchmarkTraversedEdgesRef.current;
             const streamedIds = benchmarkStreamedIdsRef.current;
+            const currentCombinedNodes = benchmarkCombinedNodesRef.current;
 
             // For zero-shot finalized-only view: use empty set for streamedIds
-            // Zero-shot doesn't actually traverse - intermediate predictions shouldn't affect status
-            // Only the actual final codes matter for comparison
             const finalizedViewStreamedIds = isZeroShot ? new Set<string>() : streamedIds;
 
-            // Phase 2: Compute final comparison with markers
-            // Uses accumulated streamedIds from Phase 1 + finalizedCodes (scaffolded only)
-            setBenchmarkCombinedNodes(prevCombined => {
-              const {
-                nodes: finalCombinedNodes,
-                missedEdgeMarkers,
-                overshootMarkers,
-                traversedSet,
-              } = computeFinalizedComparison(
-                prevCombined,
-                benchmarkExpectedGraph.edges,
-                finalizedViewStreamedIds,
-                finalNodes,
-                benchmarkExpectedCodes,
-                latestTraversedEdges,
-                // Zero-shot finalized-only mode: no "traversed" status, only endpoint comparison
-                { finalizedOnlyMode: isZeroShot }
-              );
+            // Compute final comparison with markers
+            const {
+              nodes: finalCombinedNodes,
+              missedEdgeMarkers,
+              overshootMarkers,
+              traversedSet,
+            } = computeFinalizedComparison(
+              currentCombinedNodes,
+              benchmarkExpectedGraph.edges,
+              finalizedViewStreamedIds,
+              finalNodes,
+              benchmarkExpectedCodes,
+              latestTraversedEdges,
+              { finalizedOnlyMode: isZeroShot }
+            );
 
-              // Set markers (side effect, but needed here for traversedSet)
-              setBenchmarkMissedEdgeMarkers(missedEdgeMarkers);
-              setBenchmarkOvershootMarkers(overshootMarkers);
+            // DEBUG: Investigate red X marker bug for I13.0
+            console.log('[DEBUG] Expected codes:', [...benchmarkExpectedCodes]);
+            console.log('[DEBUG] Final nodes:', [...finalNodes]);
+            console.log('[DEBUG] Streamed IDs count:', streamedIds.size);
+            console.log('[DEBUG] Traversed set count:', traversedSet.size);
+            console.log('[DEBUG] Missed edge markers:', JSON.stringify(missedEdgeMarkers, null, 2));
+            console.log('[DEBUG] Overshoot markers:', JSON.stringify(overshootMarkers, null, 2));
+            // Check I13.0 specifically
+            console.log('[DEBUG] I13.0 in expected?', benchmarkExpectedCodes.has('I13.0'));
+            console.log('[DEBUG] I13.0 in finalNodes?', finalNodes.has('I13.0'));
+            console.log('[DEBUG] I13.0 in streamedIds?', streamedIds.has('I13.0'));
+            console.log('[DEBUG] I13.0 in traversedSet?', traversedSet.has('I13.0'));
+            // Check I13 (parent) specifically
+            console.log('[DEBUG] I13 in streamedIds?', streamedIds.has('I13'));
+            console.log('[DEBUG] I13 in traversedSet?', traversedSet.has('I13'));
+            // Check nodes with I13 prefix
+            const i13Nodes = [...traversedSet].filter(id => id.startsWith('I13'));
+            console.log('[DEBUG] All I13* nodes in traversedSet:', i13Nodes);
+            // Check expected edges involving I13
+            const i13Edges = benchmarkExpectedGraph.edges.filter(e =>
+              String(e.source).startsWith('I13') || String(e.target).startsWith('I13')
+            );
+            console.log('[DEBUG] Expected edges involving I13*:', JSON.stringify(i13Edges, null, 2));
+            // Check if any marker involves I13
+            const i13MissedMarkers = missedEdgeMarkers.filter(m =>
+              m.edgeSource?.startsWith('I13') || m.edgeTarget?.startsWith('I13') || m.missedCode?.startsWith('I13')
+            );
+            console.log('[DEBUG] Missed markers involving I13*:', JSON.stringify(i13MissedMarkers, null, 2));
 
-              // Compute metrics (separate concern - used for report)
-              const expectedAncestorMap = buildAncestorMap(benchmarkExpectedGraph.edges);
-              const traversedAncestorMap = buildAncestorMap(latestTraversedEdges);
+            // Compute metrics
+            const expectedAncestorMap = buildAncestorMap(benchmarkExpectedGraph.edges);
+            const traversedAncestorMap = buildAncestorMap(latestTraversedEdges);
 
-              const { outcomes, otherCodes } = compareFinalizedCodes(
-                benchmarkExpectedCodes,
-                expectedAncestorMap,
-                finalNodes,
-                traversedAncestorMap
-              );
+            const { outcomes, otherCodes } = compareFinalizedCodes(
+              benchmarkExpectedCodes,
+              expectedAncestorMap,
+              finalNodes,
+              traversedAncestorMap,
+              benchmarkExpectedGraph.edges
+            );
 
-              // Exclude ROOT from node counts - it's a virtual node, not a real ICD-10 code
-              const expectedNodeIds = new Set(
-                benchmarkExpectedGraph.nodes.map(n => n.id).filter(id => id !== 'ROOT')
-              );
-              const traversedNodeIdsExcludingRoot = new Set(
-                [...traversedSet].filter(id => id !== 'ROOT')
-              );
+            const expectedNodeIds = new Set(
+              benchmarkExpectedGraph.nodes.map(n => n.id).filter(id => id !== 'ROOT')
+            );
+            const traversedNodeIdsExcludingRoot = new Set(
+              [...traversedSet].filter(id => id !== 'ROOT')
+            );
 
-              const metrics = computeBenchmarkMetrics(
-                benchmarkExpectedCodes,
-                finalNodes,
-                expectedNodeIds,
-                traversedNodeIdsExcludingRoot,
-                outcomes,
-                otherCodes
-              );
+            const metrics = computeBenchmarkMetrics(
+              benchmarkExpectedCodes,
+              finalNodes,
+              expectedNodeIds,
+              traversedNodeIdsExcludingRoot,
+              outcomes,
+              otherCodes
+            );
 
-              setBenchmarkMetrics(metrics);
+            // Prepare finalized view cache
+            const finalizedView = {
+              nodes: finalCombinedNodes,
+              edges: benchmarkExpectedGraph.edges,
+              metrics: metrics,
+              overshootMarkers: overshootMarkers,
+            };
 
-              // Cache finalized view (no X markers - overshoot arrows only)
-              setBenchmarkFinalizedView({
-                nodes: finalCombinedNodes,
-                edges: benchmarkExpectedGraph.edges,
-                metrics: metrics,
-                overshootMarkers: overshootMarkers,
-              });
+            // Update ref before state
+            benchmarkCombinedNodesRef.current = finalCombinedNodes;
 
-              // For zero-shot mode: build inferred view with X markers
-              // The inferred graph represents the conceptual traversal path from final codes
-              // We compare this against the UNCHANGED expected graph, same as scaffolded mode
-              if (isZeroShot && finalNodesRaw.length > 0) {
-                (async () => {
-                  try {
-                    // Build inferred graph from final codes (represents what LLM "traversed")
-                    const inferredGraph = await buildGraph(finalNodesRaw);
+            // Apply ALL state updates in a single batch (no nested callbacks)
+            setBenchmarkCombinedNodes(finalCombinedNodes);
+            setBenchmarkMissedEdgeMarkers(missedEdgeMarkers);
+            setBenchmarkOvershootMarkers(overshootMarkers);
+            setBenchmarkMetrics(metrics);
+            setBenchmarkFinalizedView(finalizedView);
 
-                    // Use inferred node IDs as the "traversed" set (simulating scaffolded traversal)
-                    const inferredTraversedIds = new Set(inferredGraph.nodes.map(n => n.id));
+            // For zero-shot mode: build inferred view AFTER main state updates
+            if (isZeroShot && finalNodesRaw.length > 0) {
+              // Use setTimeout to ensure main render completes first
+              setTimeout(async () => {
+                try {
+                  const inferredGraph = await buildGraph(finalNodesRaw);
+                  const inferredTraversedIds = new Set(inferredGraph.nodes.map(n => n.id));
 
-                    // Initialize expected nodes with 'expected' status
-                    const initializedExpectedNodes: BenchmarkGraphNode[] = benchmarkExpectedGraph.nodes.map(node => ({
-                      ...node,
-                      benchmarkStatus: 'expected' as const,
-                    }));
+                  const initializedExpectedNodes: BenchmarkGraphNode[] = benchmarkExpectedGraph.nodes.map(node => ({
+                    ...node,
+                    benchmarkStatus: 'expected' as const,
+                  }));
 
-                    // Run the same comparison as scaffolded mode:
-                    // Compare inferred traversal against expected graph
-                    const {
-                      nodes: inferredViewNodes,
-                      missedEdgeMarkers: inferredMissedMarkers,
-                      overshootMarkers: inferredOvershootMarkers,
-                      traversedSet: inferredTraversedSet,
-                    } = computeFinalizedComparison(
-                      initializedExpectedNodes,
-                      benchmarkExpectedGraph.edges,  // Use expected edges (not merged)
-                      inferredTraversedIds,          // Inferred nodes as "streamed" traversal
-                      finalNodes,                    // Finalized codes
-                      benchmarkExpectedCodes,        // Expected leaf codes
-                      inferredGraph.edges            // Inferred edges for ancestor expansion
-                    );
+                  const {
+                    nodes: inferredViewNodes,
+                    missedEdgeMarkers: inferredMissedMarkers,
+                    overshootMarkers: inferredOvershootMarkers,
+                    traversedSet: inferredTraversedSet,
+                  } = computeFinalizedComparison(
+                    initializedExpectedNodes,
+                    benchmarkExpectedGraph.edges,
+                    inferredTraversedIds,
+                    finalNodes,
+                    benchmarkExpectedCodes,
+                    inferredGraph.edges
+                  );
 
-                    // Compute metrics using expected graph structure
-                    const expectedAncestorMap = buildAncestorMap(benchmarkExpectedGraph.edges);
-                    const inferredAncestorMap = buildAncestorMap(inferredGraph.edges);
+                  const inferredAncestorMap = buildAncestorMap(inferredGraph.edges);
+                  const { outcomes: inferredOutcomes, otherCodes: inferredOtherCodes } = compareFinalizedCodes(
+                    benchmarkExpectedCodes,
+                    expectedAncestorMap,
+                    finalNodes,
+                    inferredAncestorMap,
+                    benchmarkExpectedGraph.edges
+                  );
 
-                    const { outcomes: inferredOutcomes, otherCodes: inferredOtherCodes } = compareFinalizedCodes(
-                      benchmarkExpectedCodes,
-                      expectedAncestorMap,
-                      finalNodes,
-                      inferredAncestorMap
-                    );
+                  const expectedNodeIdsForMetrics = new Set(
+                    benchmarkExpectedGraph.nodes.map(n => n.id).filter(id => id !== 'ROOT')
+                  );
+                  const inferredTraversedNodeIds = new Set(
+                    [...inferredTraversedSet].filter(id => id !== 'ROOT')
+                  );
 
-                    // Exclude ROOT from node counts
-                    const expectedNodeIdsForMetrics = new Set(
-                      benchmarkExpectedGraph.nodes.map(n => n.id).filter(id => id !== 'ROOT')
-                    );
-                    const inferredTraversedNodeIds = new Set(
-                      [...inferredTraversedSet].filter(id => id !== 'ROOT')
-                    );
-
-                    const baseInferredMetrics = computeBenchmarkMetrics(
+                  const inferredMetrics = {
+                    ...computeBenchmarkMetrics(
                       benchmarkExpectedCodes,
                       finalNodes,
                       expectedNodeIdsForMetrics,
                       inferredTraversedNodeIds,
                       inferredOutcomes,
                       inferredOtherCodes
-                    );
+                    ),
+                    expectedCount: expectedNodeIdsForMetrics.size,
+                    traversedCount: inferredTraversedNodeIds.size,
+                  };
 
-                    // Override display counts to show graph node counts (not just leaf codes)
-                    // This makes "Expected" show 19 (all expected nodes) instead of 3 (leaf codes)
-                    // and "Traversed" show 65 (all inferred nodes) instead of 22 (finalized codes)
-                    const inferredMetrics = {
-                      ...baseInferredMetrics,
-                      expectedCount: expectedNodeIdsForMetrics.size,
-                      traversedCount: inferredTraversedNodeIds.size,
+                  // Create BenchmarkGraphNode[] from inferred graph with proper status
+                  // All nodes in inferred graph are "traversed" by definition
+                  // Nodes matching expected codes are "matched"
+                  const inferredGraphNodesWithStatus: BenchmarkGraphNode[] = inferredGraph.nodes.map(node => {
+                    const nodeCode = node.code || node.id;
+                    const isFinalized = finalNodes.has(nodeCode);
+                    const isExpected = benchmarkExpectedCodes.has(nodeCode);
+
+                    let benchmarkStatus: 'expected' | 'traversed' | 'matched';
+                    if (isFinalized && isExpected) {
+                      benchmarkStatus = 'matched';
+                    } else {
+                      // All nodes in inferred graph are part of the traversal path
+                      benchmarkStatus = 'traversed';
+                    }
+
+                    return {
+                      ...node,
+                      benchmarkStatus,
                     };
+                  });
 
-                    // Cache inferred view - uses expected graph structure, not merged
-                    setBenchmarkInferredView({
-                      nodes: inferredViewNodes,
-                      edges: benchmarkExpectedGraph.edges,  // Expected edges unchanged
-                      metrics: inferredMetrics,
-                      overshootMarkers: inferredOvershootMarkers,
-                      missedEdgeMarkers: inferredMissedMarkers,
-                      inferredNodes: inferredGraph.nodes,  // Raw inferred nodes for Report interim
-                    });
-                  } catch (err) {
-                    console.error('Failed to build inferred view:', err);
-                  }
-                })();
-              }
-
-              return finalCombinedNodes;
-            });
+                  setBenchmarkInferredView({
+                    nodes: inferredViewNodes,
+                    edges: inferredGraph.edges,  // Use inferred edges for Graph view
+                    graphNodes: inferredGraphNodesWithStatus,  // Inferred nodes with benchmark status
+                    metrics: inferredMetrics,
+                    overshootMarkers: inferredOvershootMarkers,
+                    missedEdgeMarkers: inferredMissedMarkers,
+                    inferredNodes: inferredGraph.nodes,
+                  });
+                } catch (err) {
+                  console.error('Failed to build inferred view:', err);
+                }
+              }, 0);
+            }
           }
 
           setBenchmarkStatus('complete');
@@ -1101,7 +1352,9 @@ function TraversalUI() {
         }
         break;
     }
-  }, [benchmarkExpectedGraph, benchmarkExpectedCodes, benchmarkTraversedNodes, benchmarkTraversedEdges, llmConfig]);
+  // Note: benchmarkTraversedNodes/Edges are accessed via refs (benchmarkTraversedNodesRef/EdgesRef)
+  // to avoid stale closures, so they're not needed in the dependency array
+  }, [benchmarkExpectedGraph, benchmarkExpectedCodes, llmConfig]);
 
   const handleBenchmarkError = useCallback((error: Error) => {
     setBenchmarkStatus('error');
@@ -1127,26 +1380,36 @@ function TraversalUI() {
     // Reset traversal state but keep expected graph
     setBenchmarkTraversedNodes([]);
     setBenchmarkTraversedEdges([]);
+    setBenchmarkDecisions([]);
+    setBenchmarkBatchCount(0);
+    // Reset all refs used during streaming
     benchmarkTraversedNodesRef.current = [];
     benchmarkTraversedEdgesRef.current = [];
-    benchmarkStreamedIdsRef.current = new Set(); // Reset Phase 1 streamed IDs
+    benchmarkDecisionsRef.current = [];
+    benchmarkBatchCountRef.current = 0;
+    benchmarkStreamedIdsRef.current = new Set();
+    streamingTraversedIdsRef.current = new Set();
+    lastVisualUpdateTimeRef.current = 0;
+    setStreamingTraversedIds(new Set());
     setBenchmarkOvershootMarkers([]);
     setBenchmarkMissedEdgeMarkers([]);
-    setBenchmarkDecisions([]);
     setBenchmarkMetrics(null);
-    setBenchmarkBatchCount(0);
     setBenchmarkStatus('traversing');
     setBenchmarkCurrentStep('Starting benchmark traversal');
     setBenchmarkError(null);
     // Reset cached views for new benchmark (toggle state persists - user preference)
     setBenchmarkFinalizedView(null);
     setBenchmarkInferredView(null);
+    // Reset cached replay flag
+    benchmarkIsCachedReplayRef.current = false;
 
-    // Reset graph to idle state first (plain black nodes)
-    // This ensures a clean visual slate before traversal colors nodes
-    if (benchmarkCombinedNodes.length > 0) {
-      const idleNodes = resetNodesToIdle(benchmarkCombinedNodes);
-      setBenchmarkCombinedNodes(idleNodes);
+    // NOTE: Node reset to idle is now handled synchronously in RUN_STARTED handler.
+    // This ensures nodes are visually reset BEFORE any traversal data arrives,
+    // especially important for cached replays where events arrive very quickly.
+    // Cancel any pending RAF from a previous aborted run
+    if (benchmarkResetRafRef.current !== null) {
+      cancelAnimationFrame(benchmarkResetRafRef.current);
+      benchmarkResetRafRef.current = null;
     }
 
     benchmarkControllerRef.current = streamTraversal(
@@ -1166,7 +1429,7 @@ function TraversalUI() {
       handleBenchmarkError
     );
     return true;
-  }, [benchmarkClinicalNote, llmConfig, benchmarkCombinedNodes, handleBenchmarkEvent, handleBenchmarkError]);
+  }, [benchmarkClinicalNote, llmConfig, handleBenchmarkEvent, handleBenchmarkError]);
 
   const handleBenchmarkCancel = useCallback(() => {
     if (benchmarkControllerRef.current) {
@@ -1188,11 +1451,18 @@ function TraversalUI() {
     setBenchmarkExpectedCodes(new Set());
     setBenchmarkCodeInput('');
     setBenchmarkExpectedGraph(null);
+    benchmarkExpectedNodeIdsRef.current = new Set(); // Reset cached expectedNodeIds
     setBenchmarkTraversedNodes([]);
     setBenchmarkTraversedEdges([]);
     benchmarkTraversedNodesRef.current = [];
     benchmarkTraversedEdgesRef.current = [];
-    benchmarkStreamedIdsRef.current = new Set(); // Reset Phase 1 streamed IDs
+    benchmarkDecisionsRef.current = [];
+    benchmarkBatchCountRef.current = 0;
+    benchmarkStreamedIdsRef.current = new Set();
+    streamingTraversedIdsRef.current = new Set();
+    lastVisualUpdateTimeRef.current = 0;
+    setStreamingTraversedIds(new Set());
+    benchmarkCombinedNodesRef.current = [];
     setBenchmarkCombinedNodes([]);
     setBenchmarkCombinedEdges([]);
     setBenchmarkOvershootMarkers([]);
@@ -1205,10 +1475,16 @@ function TraversalUI() {
     setBenchmarkClinicalNote('');
     setBenchmarkBatchCount(0);
     setBenchmarkInvalidCodes(new Set());
-    // Reset cached views and toggle
+    // Reset cached views, toggle, and tracking refs
     setBenchmarkFinalizedView(null);
     setBenchmarkInferredView(null);
     setBenchmarkInferPrecursors(false);
+    benchmarkIsCachedReplayRef.current = false;
+    // Cancel any pending RAF
+    if (benchmarkResetRafRef.current !== null) {
+      cancelAnimationFrame(benchmarkResetRafRef.current);
+      benchmarkResetRafRef.current = null;
+    }
   }, []);
 
   return (
@@ -1678,6 +1954,7 @@ function TraversalUI() {
                     elapsedTime={traverseElapsedTime}
                     onNodeRewindClick={handleNodeRewindClick}
                     allowRewind={state.status !== 'idle' && state.nodes.length > 1}
+                    rewindingNodeId={rewindingNodeId}
                   />
                 );
               })()
@@ -1707,9 +1984,18 @@ function TraversalUI() {
                     ? benchmarkFinalizedView
                     : null;
 
+                // Both views use expected graph structure - inferred view has different metrics/markers
+                // but same graph layout (expected nodes with benchmark status highlighting)
+                // IMPORTANT: Always use expected edges to maintain expected graph structure
+                // (benchmarkInferredView.edges contains inferred graph edges which is wrong for display)
                 const activeNodes = activeView?.nodes ?? benchmarkCombinedNodes;
-                const activeEdges = activeView?.edges ?? benchmarkCombinedEdges;
-                const activeMetrics = activeView?.metrics ?? benchmarkMetrics;
+                const activeEdges = useInferredView
+                  ? (benchmarkExpectedGraph?.edges ?? benchmarkCombinedEdges)
+                  : (activeView?.edges ?? benchmarkCombinedEdges);
+                // Ensure metrics are available: use inferred view metrics, then finalized view metrics, then state
+                const activeMetrics = useInferredView
+                  ? (benchmarkInferredView?.metrics ?? benchmarkFinalizedView?.metrics ?? benchmarkMetrics)
+                  : (activeView?.metrics ?? benchmarkMetrics);
                 const activeOvershootMarkers = activeView?.overshootMarkers ?? benchmarkOvershootMarkers;
                 const activeMissedEdgeMarkers = useInferredView && benchmarkInferredView
                   ? benchmarkInferredView.missedEdgeMarkers
@@ -1731,7 +2017,7 @@ function TraversalUI() {
                         ? activeMetrics.outcomes
                           .filter(o => o.status === 'exact')
                           .map(o => o.expectedCode)
-                        : [...benchmarkExpectedCodes]
+                        : benchmarkFinalizedCodesArray
                     }
                     isTraversing={benchmarkStatus === 'traversing'}
                     currentStep={benchmarkCurrentStep}
@@ -1750,6 +2036,7 @@ function TraversalUI() {
                     elapsedTime={benchmarkElapsedTime}
                     triggerFitToWindow={benchmarkFitTrigger}
                     showXMarkers={showXMarkers}
+                    streamingTraversedIds={benchmarkStatus === 'traversing' ? streamingTraversedIds : undefined}
                   />
                 );
               })()
@@ -1761,10 +2048,11 @@ function TraversalUI() {
                 const useInferredView = isZeroShot && isComplete && benchmarkInferPrecursors && benchmarkInferredView !== null;
                 const useFinalizedView = isZeroShot && isComplete && !benchmarkInferPrecursors && benchmarkFinalizedView !== null;
 
+                // Ensure metrics are available with fallback chain
                 const activeMetrics = useInferredView
-                  ? benchmarkInferredView?.metrics
+                  ? (benchmarkInferredView?.metrics ?? benchmarkFinalizedView?.metrics ?? benchmarkMetrics)
                   : useFinalizedView
-                    ? benchmarkFinalizedView?.metrics
+                    ? (benchmarkFinalizedView?.metrics ?? benchmarkMetrics)
                     : benchmarkMetrics;
 
                 // For zero-shot mode, use cached view nodes for correct interim computation

@@ -668,13 +668,15 @@ async def llm_selector(
             "Set candidate_selector.config.LLM_CONFIG before running traversal."
         )
 
-    # Create cache key
+    # Create cache key (includes settings_hash which incorporates extra config like Vertex AI location)
     node_id = batch_id.rsplit("|", 1)[0] if "|" in batch_id else batch_id
     candidate_keys = tuple(sorted(candidates.keys()))
     context_hash = hashlib.md5(context.encode()).hexdigest()[:8] if context else "nocontext"
     candidate_hash = hashlib.md5(str(candidate_keys).encode()).hexdigest()[:8]
     feedback_part = feedback[:50] if feedback else ""
-    cache_key = f"{node_id}|{context_hash}|{candidate_hash}|{feedback_part}|{config.settings_hash()}"
+    settings_hash = config.settings_hash()
+    cache_key = f"{node_id}|{context_hash}|{candidate_hash}|{feedback_part}|{settings_hash}"
+    print(f"[LLM SELECTOR] Cache key components: node={node_id}, settings_hash={settings_hash} (extra={config.extra})")
 
     # Check cache first
     if cache_key in SELECTOR_CACHE:
