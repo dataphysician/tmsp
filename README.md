@@ -31,16 +31,12 @@ Step 1: Which ICD-10 chapters are relevant?
    [ ] Chapter 9: Circulatory system
    ...
 
-Step 2a: Within Endocrine (E00-E89), which categories?
+Step 2: Within Endocrine (E00-E89), which categories?
    [x] E11: Type 2 diabetes mellitus       ← LLM selects
    [ ] E13: Other specified diabetes
    ...
 
-Step 2b: Within Eye disorders (H00-H59), which categories?
-   [x] H35: Other retinal disorders        ← LLM selects
-   ...
-
-Step 3a: Within E11, which manifestations?
+Step 3: Within E11, which manifestations?
    [x] E11.3: With ophthalmic complications  ← LLM selects
    ...
 
@@ -90,13 +86,6 @@ ICD-10-CM includes metadata relationships:
 - **codeAlso**: Additional codes that commonly co-occur
 - **useAdditionalCode**: Supplementary codes for complete picture
 
-TMSP evaluates whether LLMs correctly identify these relationships:
-
-```
-E11.3 has useAdditionalCode → H35.x (retinal disorders)
-Does the LLM select both the diabetes code AND the eye manifestation code?
-```
-
 ### 4. Specificity Progression
 
 Medical coding requires drilling down to the most specific applicable code. TMSP tracks whether models:
@@ -126,32 +115,44 @@ Zero-shot mode is useful for:
 - **Speed**: Single LLM call vs. multiple hierarchy traversals
 - **Traditional evaluation**: When you just need final codes without decision trace
 
+## Traversal Tools
+
+The web frontend includes three interactive tabs:
+
+**Visualize** lets you enter ICD-10-CM codes and see the minimal connected graph that links them to a common root. This is useful for understanding how codes relate through the hierarchy and lateral relationships (codeFirst, codeAlso, useAdditionalCode).
+
+**Traverse** runs the stepwise traversal on a clinical note and streams the decision tree in real-time. You can watch the LLM navigate through the hierarchy, see its reasoning at each step, and use Rewind to correct any mistakes.
+
+**Benchmark** compares LLM traversal results against expected codes. You provide a clinical note and the codes you expect, then run the traversal to see which codes were matched, missed, or overshot.
+
 ## Architecture
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Clinical Note  │────▶│  Agent/Burr      │────▶│  ICD-10-CM      │
+│  Clinical Note  │────▶│  Agent/Burr      │◀───▶│  ICD-10-CM      │
 │                 │     │  Orchestration   │     │  Index          │
-└─────────────────┘     └────────┬─────────┘     └─────────────────┘
-                                 │
-                    ┌────────────┼────────────┐
-                    ▼            ▼            ▼
-              ┌─────────┐  ┌─────────┐  ┌─────────┐
-              │codeFirst│  │ children│  │codeAlso │  ... parallel batches
-              └────┬────┘  └────┬────┘  └────┬────┘
-                   │            │            │
-                   ▼            ▼            ▼
-              ┌─────────────────────────────────┐
-              │   Candidate Selector (LLM)      │
-              │   - Structured output           │
-              │   - Multi-provider support      │
-              │   - Reasoning capture           │
-              └─────────────────────────────────┘
-                              │
-                              ▼
-              ┌─────────────────────────────────┐
-              │   Final Codes + Decision Tree   │
-              └─────────────────────────────────┘
+└─────────────────┘     └────────┬─────────┘     └────────┬────────┘
+                                 │                        ▲
+                    ┌────────────┼────────────┐           │
+                    ▼            ▼            ▼           │
+              ┌─────────┐  ┌─────────┐  ┌─────────┐       │
+              │codeFirst│  │ children│  │codeAlso │       │
+              └────┬────┘  └────┬────┘  └────┬────┘       │
+                   │            │            │            │
+                   ▼            ▼            ▼            │
+              ┌─────────────────────────────────┐         │
+              │   Candidate Selector (LLM)      │         │
+              │   - Structured output           │         │
+              │   - Multi-provider support      │         │
+              │   - Reasoning capture           │         │
+              └───────────────┬─────────────────┘         │
+                              │                           │
+                 ┌────────────┴────────────┐              │
+                 ▼                         ▼              │
+   ┌─────────────────────────┐   ┌─────────────────┐      │
+   │ Final Codes +           │   │  Spawn New      │──────┘
+   │ Decision Tree           │   │  Batches        │
+   └─────────────────────────┘   └─────────────────┘
 ```
 
 ### Components
@@ -241,20 +242,22 @@ print(reasoning)  # Full reasoning explanation
 |----------|-------------------|-------|
 | OpenAI | strict=true | Full JSON schema compliance |
 | Anthropic | json_schema | Via anthropic-beta header |
+| Vertex AI | responseSchema | Gemini models via API key or ADC |
 | Cerebras | strict=true | 5000 char schema limit |
 | SambaNova | best-effort | No strict mode |
 
-More to come...
-
 ## Evaluation Metrics
 
-TMSP enables measurement of:
+The Benchmark tab computes metrics comparing expected codes against traversal results:
 
-- **Path Accuracy**: Did traversal reach correct terminal codes?
-- **Step Accuracy**: Correct selections at each hierarchy level
-- **Completeness**: All applicable codes identified (including lateral)
-- **Reasoning Quality**: Clinical logic in selection explanations
-- **Consistency**: Same input → same output across runs
+- **Exact Match**: Expected code was finalized by the traversal
+- **Undershoot**: Ancestor of expected code was finalized (stopped too early)
+- **Overshoot**: Descendant of expected code was finalized (went too deep)
+- **Missed**: Expected code has no relationship to any finalized code
+- **Traversal Recall**: Fraction of expected trajectory nodes visited
+- **Final Codes Recall**: Fraction of expected codes exactly matched
+
+Lateral relationships (codeFirst, codeAlso, useAdditionalCode) are handled specially—if a lateral source is finalized, its target counts as matched.
 
 ## Rewind and Feedback
 
@@ -269,9 +272,8 @@ from agent import retry_node
 
 result = await retry_node(
     batch_id="E11|children",
-    feedback_map={
-        "E11|children": "Select E11.3 for ophthalmic complications, not E11.65"
-    }
+    feedback="Select E11.3 for ophthalmic complications, not E11.65",
+    selector="llm",
 )
 ```
 
