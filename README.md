@@ -195,6 +195,8 @@ During a single traversal, identical selection requests return cached results. T
 
 ## Installation
 
+### Backend
+
 ```bash
 # Core dependencies
 uv sync
@@ -203,15 +205,33 @@ uv sync
 uv sync --extra server
 ```
 
+### Frontend
+
+Requires Node.js (v18+).
+
+```bash
+cd frontend
+npm install
+```
+
 ## Usage
 
-### Run the Server
+### Run the Backend Server
 
 ```bash
 uv run tmsp-server
 # or
 uv run python -m server
 ```
+
+### Run the Frontend Dev Server
+
+```bash
+cd frontend
+npm run dev
+```
+
+The frontend runs at `http://localhost:5173` by default.
 
 ### Programmatic API
 
