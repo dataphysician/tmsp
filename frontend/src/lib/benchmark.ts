@@ -26,25 +26,43 @@ import type {
  * codeAlso, useAdditionalCode) which all represent parent-child relationships.
  */
 export function buildAncestorMap(edges: GraphEdge[]): Map<string, Set<string>> {
-  // Build parent map from hierarchy edges AND all lateral edges
-  // All lateral edges represent ancestry relationships for benchmark comparison
+  // Build parent map from hierarchy edges AND lateral edges
+  // IMPORTANT: Hierarchy edges take priority to prevent cycles
+  // Lateral edges (codeFirst, codeAlso, useAdditionalCode) can point from a child
+  // back to an ancestor, which would create cycles if allowed to overwrite hierarchy parents
   const parentMap = new Map<string, string>();
-  for (const edge of edges) {
-    const isHierarchy = edge.edge_type === 'hierarchy';
-    const isLateral = edge.edge_type === 'lateral';
 
-    if (isHierarchy || isLateral) {
-      // edge.source is parent, edge.target is child
-      parentMap.set(edge.target, edge.source);
+  // First pass: Add all hierarchy edges (these are the true parent-child relationships)
+  for (const edge of edges) {
+    if (edge.edge_type === 'hierarchy') {
+      parentMap.set(String(edge.target), String(edge.source));
     }
   }
 
-  // Build ancestor set for each node
+  // Second pass: Add lateral edges ONLY if target doesn't already have a hierarchy parent
+  // This prevents cycles where lateral edges point back to ancestors
+  for (const edge of edges) {
+    if (edge.edge_type === 'lateral') {
+      const target = String(edge.target);
+      if (!parentMap.has(target)) {
+        parentMap.set(target, String(edge.source));
+      }
+    }
+  }
+
+  // Build ancestor set for each node (with cycle detection to prevent infinite loops)
   const ancestorMap = new Map<string, Set<string>>();
   for (const [child] of parentMap) {
     const ancestors = new Set<string>();
     let current = child;
+    const visited = new Set<string>();
     while (parentMap.has(current)) {
+      if (visited.has(current)) {
+        // Cycle detected - break to prevent infinite loop
+        console.warn(`[buildAncestorMap] Cycle detected at node: ${current}`);
+        break;
+      }
+      visited.add(current);
       const parent = parentMap.get(current)!;
       ancestors.add(parent);
       current = parent;
@@ -262,12 +280,27 @@ export function computeBenchmarkMetrics(
  * codeFirst, codeAlso, useAdditionalCode) to properly track lateral pathways.
  */
 function buildParentMap(edges: GraphEdge[]): Map<string, string> {
+  // Build parent map with hierarchy edges taking priority over lateral edges
+  // This prevents cycles where lateral edges point back to ancestors
   const parentMap = new Map<string, string>();
+
+  // First pass: hierarchy edges (true parent-child relationships)
   for (const edge of edges) {
-    if (edge.edge_type === 'hierarchy' || edge.edge_type === 'lateral') {
+    if (edge.edge_type === 'hierarchy') {
       parentMap.set(String(edge.target), String(edge.source));
     }
   }
+
+  // Second pass: lateral edges only if no hierarchy parent exists
+  for (const edge of edges) {
+    if (edge.edge_type === 'lateral') {
+      const target = String(edge.target);
+      if (!parentMap.has(target)) {
+        parentMap.set(target, String(edge.source));
+      }
+    }
+  }
+
   return parentMap;
 }
 
@@ -285,12 +318,19 @@ function buildHierarchyAncestorMap(edges: GraphEdge[]): Map<string, Set<string>>
     }
   }
 
-  // Build ancestor set for each node
+  // Build ancestor set for each node (with cycle detection to prevent infinite loops)
   const ancestorMap = new Map<string, Set<string>>();
   for (const [child] of parentMap) {
     const ancestors = new Set<string>();
     let current = child;
+    const visited = new Set<string>();
     while (parentMap.has(current)) {
+      if (visited.has(current)) {
+        // Cycle detected - break to prevent infinite loop
+        console.warn(`[buildHierarchyAncestorMap] Cycle detected at node: ${current}`);
+        break;
+      }
+      visited.add(current);
       const parent = parentMap.get(current)!;
       ancestors.add(parent);
       current = parent;
@@ -382,14 +422,25 @@ export function computeBenchmarkVisualization(
   // This ensures intermediate nodes like T84.53, T84.53X are marked traversed
   // even if the backend didn't explicitly send them as nodes
   const nodesToExpand = new Set([...streamedNodeIds, ...finalizedCodes]);
+  // Safety: track visited nodes to prevent infinite loops from circular parent references
+  const visited = new Set<string>();
+  const MAX_DEPTH = 20; // ICD-10-CM max depth is ~7, use 20 as safety margin
   for (const code of nodesToExpand) {
+    visited.clear();
     let current = code;
+    let depth = 0;
     // Use combinedParentMap first (includes traversed edges), fallback to expected
-    while (combinedParentMap.has(current) || expectedParentMap.has(current)) {
+    while ((combinedParentMap.has(current) || expectedParentMap.has(current)) && depth < MAX_DEPTH) {
+      if (visited.has(current)) {
+        console.warn('[benchmark] Circular parent reference detected at:', current);
+        break;
+      }
+      visited.add(current);
       const parent = combinedParentMap.get(current) ?? expectedParentMap.get(current);
       if (!parent || parent === 'ROOT') break;
       traversedSet.add(parent);
       current = parent;
+      depth++;
     }
   }
 
@@ -623,13 +674,27 @@ export function computeFinalizedComparison(
   } else {
     traversedSet = new Set([...streamedNodeIds, ...finalizedCodes]);
     const nodesToExpand = new Set([...streamedNodeIds, ...finalizedCodes]);
+    // Safety: track visited nodes to prevent infinite loops from circular parent references
+    const visited = new Set<string>();
+    const MAX_DEPTH = 20; // ICD-10-CM max depth is ~7, use 20 as safety margin
     for (const code of nodesToExpand) {
+      visited.clear();
       let current = code;
-      while (combinedParentMap.has(current) || expectedParentMap.has(current)) {
+      let depth = 0;
+      while ((combinedParentMap.has(current) || expectedParentMap.has(current)) && depth < MAX_DEPTH) {
+        if (visited.has(current)) {
+          console.warn('[benchmark] Circular parent reference detected at:', current);
+          break;
+        }
+        visited.add(current);
         const parent = combinedParentMap.get(current) ?? expectedParentMap.get(current);
         if (!parent || parent === 'ROOT') break;
         traversedSet.add(parent);
         current = parent;
+        depth++;
+      }
+      if (depth >= MAX_DEPTH) {
+        console.warn('[benchmark] Max depth exceeded when expanding ancestors for:', code);
       }
     }
   }

@@ -26,8 +26,10 @@ export interface OverlayContext {
   nodesWithSevenChrDefChildren: Set<string>;
   /** Map from sevenChrDef target to parent */
   sevenChrDefParentMap: Map<string, string>;
-  /** Hierarchy edges for ancestor lookup */
-  hierarchyEdges: GraphEdge[];
+  /** Map from child node ID to parent node ID (hierarchy edges only) - O(1) lookup */
+  hierarchyParentMap: Map<string, string>;
+  /** Map from "source|target" to lateral edge - O(1) lookup */
+  lateralEdgeMap: Map<string, GraphEdge>;
   /** Expected leaves in benchmark mode */
   expectedLeaves: Set<string>;
   /** Whether in benchmark mode */
@@ -99,11 +101,11 @@ function getFullLabel(
   node: GraphNode,
   sevenChrDefParentMap: Map<string, string>,
   nodeMap: Map<string, GraphNode>,
-  hierarchyEdges: GraphEdge[]
+  hierarchyParentMap: Map<string, string>
 ): string {
   let fullLabel = node.label;
   if (node.category === 'activator' || node.depth === 7) {
-    const ancestorLabel = getActivatorAncestorLabel(node.id, sevenChrDefParentMap, nodeMap, hierarchyEdges);
+    const ancestorLabel = getActivatorAncestorLabel(node.id, sevenChrDefParentMap, nodeMap, hierarchyParentMap);
     const labelValue = node.label.includes(': ') ? node.label.split(': ').slice(1).join(': ') : node.label;
     if (ancestorLabel) {
       fullLabel = `${ancestorLabel}, ${labelValue}`;
@@ -114,12 +116,13 @@ function getFullLabel(
 
 /**
  * Get ancestor label for activator nodes.
+ * Uses O(1) Map lookup instead of O(n) .find() on edges array.
  */
 function getActivatorAncestorLabel(
   nodeId: string,
   sevenChrDefParentMap: Map<string, string>,
   nodeMap: Map<string, GraphNode>,
-  hierarchyEdges: GraphEdge[]
+  hierarchyParentMap: Map<string, string>
 ): string {
   const parentId = sevenChrDefParentMap.get(nodeId);
   if (!parentId) return '';
@@ -130,9 +133,10 @@ function getActivatorAncestorLabel(
     if (node && node.category !== 'placeholder') {
       return node.label;
     }
-    const parentEdge = hierarchyEdges.find(e => String(e.target) === currentId);
-    if (parentEdge) {
-      currentId = String(parentEdge.source);
+    // O(1) lookup instead of O(n) .find()
+    const nextParentId = hierarchyParentMap.get(currentId);
+    if (nextParentId) {
+      currentId = nextParentId;
     } else {
       break;
     }
@@ -480,7 +484,7 @@ export function renderBatchPanelsOverlay(
 
   if (!shouldShowBatchPanels) return false;
 
-  const fullLabel = getFullLabel(node, ctx.sevenChrDefParentMap, ctx.nodeMap, ctx.hierarchyEdges);
+  const fullLabel = getFullLabel(node, ctx.sevenChrDefParentMap, ctx.nodeMap, ctx.hierarchyParentMap);
   const displayCode = getDisplayCode(node, ctx.sevenChrDefParentMap, ctx.nodeMap);
 
   const panelData = calculatePanelData(
@@ -546,7 +550,7 @@ export function renderRegularOverlay(
   const pos = ctx.positions.get(node.id);
   if (!pos) return;
 
-  const fullLabel = getFullLabel(node, ctx.sevenChrDefParentMap, ctx.nodeMap, ctx.hierarchyEdges);
+  const fullLabel = getFullLabel(node, ctx.sevenChrDefParentMap, ctx.nodeMap, ctx.hierarchyParentMap);
   const displayCode = getDisplayCode(node, ctx.sevenChrDefParentMap, ctx.nodeMap);
   const billableText = node.billable ? '(Billable)' : '(Non-Billable)';
   const labelLines = wrapText(fullLabel, MAX_CHARS_PER_LINE);
@@ -922,9 +926,8 @@ function renderBasicOverlay(
   for (const childId of childIds) {
     const childNode = ctx.nodeMap.get(childId);
     if (childNode) {
-      const lateralEdge = [...ctx.sevenChrDefEdges, ...ctx.otherLateralEdges].find(
-        e => String(e.source) === node.id && String(e.target) === childId
-      );
+      // O(1) lookup instead of O(n) array spread + .find()
+      const lateralEdge = ctx.lateralEdgeMap.get(`${node.id}|${childId}`);
       nextCodes.push({ code: childNode.code, rule: lateralEdge?.rule ?? undefined });
     }
   }

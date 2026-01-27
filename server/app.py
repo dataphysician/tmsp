@@ -114,21 +114,31 @@ async def get_graph(request: GraphRequest) -> GraphResponse:
     if not codes:
         raise HTTPException(status_code=400, detail="No valid codes provided")
 
-    # Validate all codes exist in the ICD-10-CM index
+    # Filter out invalid codes instead of rejecting the entire request
+    # This is important for zero-shot mode where LLM may predict non-existent codes
+    valid_codes: list[str] = []
     invalid_codes: list[str] = []
     for code in codes:
         # Check if code exists directly or can be resolved (7th char codes)
-        if code not in data and resolve_code(code, data) is None:
+        if code in data or resolve_code(code, data) is not None:
+            valid_codes.append(code)
+        else:
             invalid_codes.append(code)
 
     if invalid_codes:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid ICD-10-CM codes: {', '.join(invalid_codes)}"
+        print(f"[/api/graph] Filtered out invalid codes: {', '.join(invalid_codes)}")
+
+    if not valid_codes:
+        # Return empty graph if no valid codes (instead of error)
+        return GraphResponse(
+            nodes=[],
+            edges=[],
+            stats=GraphStats(input_count=len(codes), node_count=0),
+            invalid_codes=invalid_codes,
         )
 
     # Build the graph using trace_tree
-    result = build_graph(codes, data)
+    result = build_graph(valid_codes, data)
 
     # Extract sets for categorization
     leaves = result["leaves"]
@@ -308,6 +318,7 @@ async def get_graph(request: GraphRequest) -> GraphResponse:
             input_count=len(codes),
             node_count=len(nodes),
         ),
+        invalid_codes=invalid_codes,
     )
 
 

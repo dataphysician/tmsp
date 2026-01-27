@@ -106,7 +106,7 @@ export function NodeRewindModal({
           <div className="rewind-modal-label">{node.label}</div>
         </div>
 
-        {/* Scrollable container for decision, feedback, and actions */}
+        {/* Scrollable container for decision and feedback */}
         <div className="rewind-modal-scrollable">
           {/* Previous Decision Section */}
           {decision && decision.candidates.length > 0 && (
@@ -140,7 +140,7 @@ export function NodeRewindModal({
               id="rewind-feedback"
               value={feedback}
               onChange={e => setFeedback(e.target.value)}
-              placeholder="e.g., 'The clinical note mentions that the injury has already been checked in the past, implying a subsequent encounter.'"
+              placeholder="e.g., 'The clinical note mentions that the condition has already been checked in the past, implying a subsequent encounter.'"
               disabled={isSubmitting}
               rows={3}
               autoFocus
@@ -152,24 +152,24 @@ export function NodeRewindModal({
 
           {/* Error Display */}
           {error && <div className="rewind-modal-error">{error}</div>}
+        </div>
 
-          {/* Actions */}
-          <div className="rewind-modal-actions">
-            <button
-              onClick={onClose}
-              disabled={isSubmitting}
-              className="rewind-modal-cancel-btn"
-            >
-              Cancel
-            </button>
-            <button
-              onClick={handleSubmit}
-              disabled={!feedback.trim() || isSubmitting}
-              className="rewind-modal-submit-btn"
-            >
-              {isSubmitting ? 'Updating...' : 'Update Node'}
-            </button>
-          </div>
+        {/* Actions (outside scrollable for fixed positioning) */}
+        <div className="rewind-modal-actions">
+          <button
+            onClick={onClose}
+            disabled={isSubmitting}
+            className="rewind-modal-cancel-btn"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleSubmit}
+            disabled={!feedback.trim() || isSubmitting}
+            className="rewind-modal-submit-btn"
+          >
+            {isSubmitting ? 'Updating...' : 'Update Node'}
+          </button>
         </div>
       </div>
     </div>

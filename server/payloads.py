@@ -33,6 +33,7 @@ class GraphResponse(BaseModel):
     nodes: list[GraphNode]
     edges: list[GraphEdge]
     stats: GraphStats
+    invalid_codes: list[str] = []  # Codes that were filtered out (not in flat index)
 
 
 class NodeDetailResponse(BaseModel):

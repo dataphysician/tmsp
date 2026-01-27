@@ -31,10 +31,14 @@ export function isPlaceholderNode(node: GraphNode): boolean {
   return node.category === 'placeholder';
 }
 
-/** Check if node is a sevenChrDef finalized node (submitted 7th character code) */
+/** Check if node is a sevenChrDef finalized node (depth 7 seventh character code) */
 export function isSevenChrDefFinalizedNode(node: GraphNode, finalizedCodes?: Set<string>): boolean {
   const code = node.code || node.id;
+  // Check if the code is directly in finalized codes
   if (finalizedCodes && code && finalizedCodes.has(code)) return true;
+  // For depth 7 nodes (sevenChrDef targets), also check category
+  // This handles zero-shot mode where depth 7 nodes are the finalized endpoints
+  if (node.depth === 7 && node.category === 'finalized') return true;
   return false;
 }
 

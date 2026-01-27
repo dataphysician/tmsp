@@ -2,7 +2,7 @@ import { useEffect, useRef, useMemo, useState, useCallback, memo } from 'react';
 import * as d3 from 'd3';
 import type { GraphNode, GraphEdge, TraversalStatus, BenchmarkGraphNode, BenchmarkMetrics, OvershootMarker, EdgeMissMarker, DecisionPoint } from '../lib/types';
 import { exportSvgToFile, generateSvgFilename } from '../lib/exportSvg';
-import { debounce, wrapNodeLabel, formatElapsedTime } from '../lib/textUtils';
+import { wrapNodeLabel, formatElapsedTime } from '../lib/textUtils';
 import { calculatePositions } from '../lib/graphPositioning';
 import { createEdgePath, createCurvedEdgePath } from '../lib/edgePaths';
 import {
@@ -47,6 +47,8 @@ interface GraphViewerProps {
   elapsedTime?: number | null;
   // Trigger fit-to-window (increment to trigger)
   triggerFitToWindow?: number;
+  // Callback when user interacts with graph (drag, click) - resets idle timer
+  onGraphInteraction?: () => void;
   // Rewind feature props (TRAVERSE tab only)
   onNodeRewindClick?: (nodeId: string, batchType?: string, feedback?: string) => void;
   allowRewind?: boolean;
@@ -86,6 +88,7 @@ function GraphViewerInner({
   codesBarLabel,
   elapsedTime = null,
   triggerFitToWindow,
+  onGraphInteraction,
   onNodeRewindClick,
   allowRewind = false,
   showXMarkers = true,
@@ -121,6 +124,8 @@ function GraphViewerInner({
 
   // Track rewindingNodeId in ref for D3 access
   const rewindingNodeIdRef = useRef(rewindingNodeId);
+  // Track previous fit trigger value to only run fit when trigger actually changes
+  const prevFitTriggerRef = useRef(0);
   useEffect(() => {
     rewindingNodeIdRef.current = rewindingNodeId;
   }, [rewindingNodeId]);
@@ -134,19 +139,17 @@ function GraphViewerInner({
     }
   }, [rewindingNodeId]);
 
-  const hasInitializedZoom = useRef(false);
-  const prevIsTraversing = useRef(isTraversing);
-  const prevRewindingNodeId = useRef<string | null>(rewindingNodeId);
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
   const lastInteractionTime = useRef<number>(0);
-  const prevNodeCount = useRef<number>(0);
-  const autoFitIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Track when rewind completes to add a grace period before allowing fit-to-window
-  const rewindCompletedTimeRef = useRef<number>(0);
-  // Track when traversal completes to add a grace period before allowing fit-to-window
-  const traversalCompletedTimeRef = useRef<number>(0);
-  // Track when nodes are added during a rewind (for delayed zoom after node appears)
-  const lastRewindNodeAddedTimeRef = useRef<number>(0);
+  // Ref for onGraphInteraction to avoid stale closures in D3 event handlers
+  const onGraphInteractionRef = useRef(onGraphInteraction);
+  // Ref for handleFitToWindow to avoid effect re-runs when nodes change during traversal
+  const handleFitToWindowRef = useRef<() => void>(() => {});
+
+  // Keep onGraphInteraction ref in sync
+  useEffect(() => {
+    onGraphInteractionRef.current = onGraphInteraction;
+  }, [onGraphInteraction]);
 
   const sortedFinalizedCodes = useMemo(() => {
     if (codeSortMode === 'default') return finalizedCodes;
@@ -184,11 +187,14 @@ function GraphViewerInner({
   }, []);
 
   const handleFitToWindow = useCallback(() => {
-    if (!svgRef.current || !zoomRef.current || !containerRef.current || nodes.length === 0) return;
+    if (!svgRef.current || !zoomRef.current || nodes.length === 0) return;
 
     const svg = d3.select(svgRef.current);
-    const container = containerRef.current;
-    const rect = container.getBoundingClientRect();
+    // Use graph-svg-area dimensions (SVG's parent) which excludes header bar,
+    // legend, and codes bar that are siblings in the flex container
+    const svgArea = svgRef.current.parentElement;
+    if (!svgArea) return;
+    const rect = svgArea.getBoundingClientRect();
     const width = rect.width;
     const height = rect.height;
 
@@ -201,23 +207,35 @@ function GraphViewerInner({
 
     if (bbox.width === 0 || bbox.height === 0) return;
 
-    // Calculate scale to fit with padding
+    // Calculate scale to fit both dimensions with padding
     const padding = 40;
-    const scaleX = (width - padding * 2) / bbox.width;
-    const scaleY = (height - padding * 2) / bbox.height;
+    const availableWidth = width - padding * 2;
+    const availableHeight = height - padding * 2;
+
+    const scaleX = availableWidth / bbox.width;
+    const scaleY = availableHeight / bbox.height;
+    // Use the smaller scale to ensure graph fits both horizontally and vertically
+    // Cap at 1.0 to avoid zooming in beyond 100%
     const scale = Math.min(scaleX, scaleY, 1.0);
 
-    // Center horizontally, position at top
+    // Calculate scaled dimensions
     const scaledWidth = bbox.width * scale;
+    const scaledHeight = bbox.height * scale;
+
+    // Center horizontally and vertically
     const translateX = (width - scaledWidth) / 2 - bbox.x * scale;
-    const topPadding = 20;
-    const translateY = topPadding - bbox.y * scale;
+    const translateY = (height - scaledHeight) / 2 - bbox.y * scale;
 
     svg.transition().duration(300).call(
       zoomRef.current.transform,
       d3.zoomIdentity.translate(translateX, translateY).scale(scale)
     );
   }, [nodes.length]);
+
+  // Keep handleFitToWindow ref in sync so the fit trigger effect always uses the latest version
+  useEffect(() => {
+    handleFitToWindowRef.current = handleFitToWindow;
+  }, [handleFitToWindow]);
 
   const handleExportSvg = useCallback(() => {
     if (!svgRef.current) return;
@@ -227,82 +245,44 @@ function GraphViewerInner({
   }, [benchmarkMode, isTraversing]);
 
   // Trigger fit-to-window when prop changes (with delay for layout to settle)
+  // Only run when triggerFitToWindow actually increments, not when handleFitToWindow changes
+  // Uses handleFitToWindowRef to avoid effect re-runs when nodes change during traversal
   useEffect(() => {
-    if (triggerFitToWindow && triggerFitToWindow > 0) {
+    if (triggerFitToWindow && triggerFitToWindow > prevFitTriggerRef.current) {
+      prevFitTriggerRef.current = triggerFitToWindow;
       const timer = setTimeout(() => {
-        handleFitToWindow();
-      }, 350); // Delay to allow sidebar collapse animation
+        handleFitToWindowRef.current();
+      }, 350); // Delay to allow layout to settle
       return () => clearTimeout(timer);
     }
-  }, [triggerFitToWindow, handleFitToWindow]);
+  }, [triggerFitToWindow]);
 
-  // ResizeObserver: fit-to-window when container resizes (debounced)
-  // This handles sidebar collapse, window resize, etc.
-  const debouncedFitToWindow = useMemo(
-    () => debounce(() => handleFitToWindow(), 150),
-    [handleFitToWindow]
-  );
+  // NOTE: Automatic fit-to-window (ResizeObserver, periodic interval) disabled.
+  // The initial render positions content correctly; auto-fit was causing issues.
+  // User can manually click the fit-to-window button (⤢) when needed.
 
   useEffect(() => {
-    if (!containerRef.current) return;
-
-    const resizeObserver = new ResizeObserver(() => {
-      debouncedFitToWindow();
-    });
-
-    resizeObserver.observe(containerRef.current);
-    return () => resizeObserver.disconnect();
-  }, [debouncedFitToWindow]);
-
-  // Periodic fit-to-window: frequent during traversal, sparse after completion
-  useEffect(() => {
-    // Clear existing interval when traversing state changes
-    if (autoFitIntervalRef.current) {
-      clearInterval(autoFitIntervalRef.current);
-      autoFitIntervalRef.current = null;
+    if (!svgRef.current || !containerRef.current) {
+      return;
     }
 
-    // During traversal: auto-fit every 10 seconds
-    // After traversal: auto-fit every 30 seconds (sparse, less intrusive)
-    const interval = isTraversing ? 10000 : 30000;
-    const idleThreshold = isTraversing ? 5000 : 10000;
-
-    autoFitIntervalRef.current = setInterval(() => {
-      const timeSinceInteraction = Date.now() - lastInteractionTime.current;
-      // Don't auto-fit if an overlay is open or during rewind
-      const overlayIsOpen = activeOverlayNodeRef.current !== null || pinnedNodeIdRef.current !== null;
-      const isRewinding = rewindingNodeIdRef.current !== null;
-      if (timeSinceInteraction >= idleThreshold && !overlayIsOpen && !isRewinding) {
-        handleFitToWindow();
-      }
-    }, interval);
-
-    return () => {
-      if (autoFitIntervalRef.current) {
-        clearInterval(autoFitIntervalRef.current);
-      }
-    };
-  }, [isTraversing, handleFitToWindow]);
-
-  useEffect(() => {
-    if (!svgRef.current || !containerRef.current) return;
-
     const svg = d3.select(svgRef.current);
-    const container = containerRef.current;
-    const rect = container.getBoundingClientRect();
+    // Use graph-svg-area (SVG's parent) for dimensions - this excludes
+    // header bar, legend, and codes bar that are siblings in the flex container
+    const svgArea = svgRef.current.parentElement;
+    if (!svgArea) return;
+    const rect = svgArea.getBoundingClientRect();
     const width = rect.width;
     const height = rect.height;
 
-    // Calculate scale factor based on container height (clamped to 0.7-1.5x)
+    // Calculate scale factor based on svg area height (clamped to 0.7-1.5x)
     const scaleFactor = Math.max(0.7, Math.min(1.5, height / REFERENCE_HEIGHT));
     const NODE_WIDTH = BASE_NODE_WIDTH * scaleFactor;
     const NODE_HEIGHT = BASE_NODE_HEIGHT * scaleFactor;
     const LEVEL_HEIGHT = BASE_LEVEL_HEIGHT * scaleFactor;
 
-    // Always size SVG to fill container
-    svg.attr('width', width).attr('height', height);
-
     // Clear everything and recreate from scratch each render
+    // NOTE: SVG uses width="100%" height="100%" from JSX - let CSS handle sizing
     svg.selectAll('*').remove();
     const g = svg.append('g').attr('class', 'main-group');
 
@@ -472,6 +452,20 @@ function GraphViewerInner({
       sevenChrDefParentMap.set(String(e.target), String(e.source));
     });
 
+    // Build hierarchy parent map for O(1) ancestor lookup in overlay renderer
+    // Maps child node ID -> parent node ID
+    const hierarchyParentMap = new Map<string, string>();
+    hierarchyEdges.forEach(e => {
+      hierarchyParentMap.set(String(e.target), String(e.source));
+    });
+
+    // Build lateral edge map for O(1) edge lookup in overlay renderer
+    // Maps "source|target" -> edge
+    const lateralEdgeMap = new Map<string, GraphEdge>();
+    [...sevenChrDefEdges, ...otherLateralEdges].forEach(e => {
+      lateralEdgeMap.set(`${String(e.source)}|${String(e.target)}`, e);
+    });
+
     // Helper to get the display code for a node
     // For sevenChrDef targets, combines parent code + 7th character (e.g., "T36.1X5" + "A" = "T36.1X5A")
     const getDisplayCode = (node: GraphNode): string => {
@@ -603,6 +597,9 @@ function GraphViewerInner({
           .attr('font-weight', 600)
           .attr('fill', '#1e293b')
           .text('ROOT');
+
+        // Make ROOT node look interactive (event handlers added later after helpers defined)
+        rootGroup.style('cursor', 'pointer');
       }
     }
 
@@ -640,7 +637,8 @@ function GraphViewerInner({
       finalizedCodesSet,
       nodesWithSevenChrDefChildren,
       sevenChrDefParentMap,
-      hierarchyEdges,
+      hierarchyParentMap,
+      lateralEdgeMap,
       expectedLeaves,
       benchmarkMode,
       allowRewind,
@@ -660,6 +658,43 @@ function GraphViewerInner({
     const showExpandedNode = (d: GraphNode, _nodeGroup: SVGGElement) => {
       showNodeOverlay(d, overlayContext, cancelShowTimeout);
     };
+
+    // Add ROOT node event handlers (now that helper functions are defined)
+    const rootNode = nodeMap.get('ROOT');
+    if (rootNode) {
+      nodesGroup.select<SVGGElement>('.node-root')
+        .on('click', function (event: MouseEvent) {
+          event.stopPropagation();
+          setPinnedNodeId('ROOT');
+          pinnedNodeIdRef.current = 'ROOT';
+          showExpandedNode(rootNode, this as SVGGElement);
+          onNodeClick('ROOT');
+        })
+        .on('mouseenter', function () {
+          if (activeOverlayNodeRef.current === 'ROOT') {
+            cancelHideTimeout();
+            return;
+          }
+          cancelShowTimeout();
+          cancelHideTimeout();
+          const nodeGroup = this as SVGGElement;
+          if (pinnedNodeIdRef.current === 'ROOT') {
+            showExpandedNode(rootNode, nodeGroup);
+            return;
+          }
+          showTimeoutRef.current = setTimeout(() => {
+            showExpandedNode(rootNode, nodeGroup);
+          }, 1000);
+        })
+        .on('mouseleave', () => {
+          cancelShowTimeout();
+          if (!pinnedNodeIdRef.current) {
+            hideTimeoutRef.current = setTimeout(() => {
+              hideExpandedNode();
+            }, 500);
+          }
+        });
+    }
 
     // Render non-ROOT nodes with simple join pattern
     const nonRootNodes = nodes.filter(n => n.id !== 'ROOT');
@@ -934,6 +969,7 @@ function GraphViewerInner({
         // event.sourceEvent is null for programmatic calls, defined for user interactions
         if (event.sourceEvent) {
           lastInteractionTime.current = Date.now();
+          onGraphInteractionRef.current?.();
         }
       })
       .on('zoom', (event) => {
@@ -941,6 +977,7 @@ function GraphViewerInner({
         // Only track ACTUAL user interactions
         if (event.sourceEvent) {
           lastInteractionTime.current = Date.now();
+          onGraphInteractionRef.current?.();
         }
       });
 
@@ -978,79 +1015,8 @@ function GraphViewerInner({
     const currentTransform = d3.zoomTransform(svg.node()!);
     g.attr('transform', currentTransform.toString());
 
-    // Determine if we should re-center the graph
-    // Only re-center on: initial render or new graph loaded (not during/after traversal)
-    const traversalJustCompleted = prevIsTraversing.current && !isTraversing;
-    const graphJustLoaded = prevNodeCount.current === 0 && nodes.length > 0;
-
-    // Detect if a rewind traversal just started
-    // (rewindingNodeId was null but now is set, AND traversal just started)
-    const rewindJustStarted = prevRewindingNodeId.current === null && rewindingNodeId !== null;
-
-    // Detect if a rewind traversal just completed
-    // (rewindingNodeId was set but now is null)
-    const rewindJustCompleted = prevRewindingNodeId.current !== null && rewindingNodeId === null;
-
-    // Track when rewind activity happens for grace period
-    if (rewindJustCompleted || rewindJustStarted) {
-      rewindCompletedTimeRef.current = Date.now();
-    }
-
-    // Track when nodes are added during or right after a rewind
-    // This triggers a 5-second delay before allowing fit-to-window after the node appears
-    const nodesWereAdded = nodes.length > prevNodeCount.current;
-    const duringOrJustAfterRewind = rewindingNodeId !== null || rewindJustCompleted;
-    if (nodesWereAdded && duringOrJustAfterRewind) {
-      lastRewindNodeAddedTimeRef.current = Date.now();
-    }
-
-    // Track when traversal completes for grace period
-    if (traversalJustCompleted) {
-      traversalCompletedTimeRef.current = Date.now();
-    }
-
-    // Reset zoom initialization only when a completely NEW graph loads (not traversal/rewind)
-    // Don't reset during traversal or rewind - user may be watching the graph grow
-    if (graphJustLoaded && !isTraversing && rewindingNodeId === null) {
-      hasInitializedZoom.current = false;
-    }
-
-    // Check if user has interacted within the last 3 seconds
-    const timeSinceLastInteraction = Date.now() - lastInteractionTime.current;
-    const userRecentlyInteracted = lastInteractionTime.current > 0 && timeSinceLastInteraction < 3000;
-
-    // Don't recenter if an overlay is currently open
-    const overlayIsOpen = activeOverlayNodeRef.current !== null || pinnedNodeIdRef.current !== null;
-
-    // Block fit-to-window during active rewind
-    const isActiveRewind = rewindingNodeId !== null;
-
-    // Extended grace period after rewind (10 seconds) to let user review results
-    const timeSinceRewindActivity = Date.now() - rewindCompletedTimeRef.current;
-    const rewindRecentlyActive = rewindCompletedTimeRef.current > 0 && timeSinceRewindActivity < 10000;
-
-    // Grace period after traversal completes (10 seconds) to let user review results
-    const timeSinceTraversalCompleted = Date.now() - traversalCompletedTimeRef.current;
-    const traversalRecentlyCompleted = traversalCompletedTimeRef.current > 0 && timeSinceTraversalCompleted < 10000;
-
-    // 5-second grace period after a node is added during rewind (so user can see the new node)
-    const timeSinceRewindNodeAdded = Date.now() - lastRewindNodeAddedTimeRef.current;
-    const rewindNodeRecentlyAdded = lastRewindNodeAddedTimeRef.current > 0 && timeSinceRewindNodeAdded < 5000;
-
-    // Skip automatic fit-to-window during active traversal/rewind or within grace period
-    // This prevents jarring zoom changes when user is watching nodes being added or reviewing results
-    const shouldRecenter = ((!hasInitializedZoom.current && nodes.length > 0) || graphJustLoaded) && !userRecentlyInteracted && !overlayIsOpen && !isActiveRewind && !rewindRecentlyActive && !isTraversing && !traversalRecentlyCompleted && !rewindNodeRecentlyAdded;
-
-    // Update prev tracking
-    prevIsTraversing.current = isTraversing;
-    prevNodeCount.current = nodes.length;
-    prevRewindingNodeId.current = rewindingNodeId;
-
-    if (shouldRecenter) {
-      // Use fit-to-window for proper centering
-      handleFitToWindow();
-      hasInitializedZoom.current = true;
-    }
+    // NOTE: Automatic fit-to-window removed - D3 render positions content correctly.
+    // User can manually click the fit-to-window button (⤢) when needed.
 
     // Cleanup: cancel any pending show timeout
     return () => {
@@ -1062,7 +1028,7 @@ function GraphViewerInner({
       }
     };
 
-  }, [nodes, edges, selectedNode, onNodeClick, finalizedCodes, isTraversing, benchmarkMode, overshootMarkers, missedEdgeMarkers, expectedLeaves, handleFitToWindow, showXMarkers, rewindingNodeId]);
+  }, [nodes, edges, selectedNode, onNodeClick, finalizedCodes, isTraversing, benchmarkMode, overshootMarkers, missedEdgeMarkers, expectedLeaves, showXMarkers, rewindingNodeId]);
 
   // Separate useEffect for streaming traversal style updates (avoids full re-render)
   // This only runs when streamingTraversedIds changes, updating node styles efficiently

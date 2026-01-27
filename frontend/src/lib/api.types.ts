@@ -67,6 +67,7 @@ export interface GraphResponse {
   nodes: GraphNode[];
   edges: GraphEdge[];
   stats: { input_count: number; node_count: number };
+  invalid_codes?: string[];  // Codes that were filtered out (not in flat index)
 }
 
 // Cache deletion configuration

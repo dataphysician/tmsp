@@ -85,7 +85,16 @@ export function VisualizeSidebar({
             </button>
           )}
         </div>
-        <div className="input-codes-table">
+        <div
+          className="input-codes-table"
+          onClick={(e) => {
+            // Focus textarea when clicking on table background (not on code rows)
+            if (e.target === e.currentTarget || (e.target as HTMLElement).classList.contains('empty-hint')) {
+              const textarea = document.querySelector<HTMLTextAreaElement>('textarea.code-input');
+              textarea?.focus();
+            }
+          }}
+        >
           {inputCodes.size === 0 ? (
             <span className="empty-hint">No codes added yet</span>
           ) : (

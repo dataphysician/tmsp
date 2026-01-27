@@ -6,7 +6,7 @@ A framework for evaluating LLM medical domain understanding through hierarchical
 
 TMSP tests the consistency and accuracy of medical knowledge in language models by guiding them through a **stepwise decision tree** rather than asking for direct answers. Instead of prompting "What ICD-10 codes apply to this patient?", the system presents a series of 0..n candidate selection questions at each level of the medical coding hierarchy.
 
-This approach reveals *how* an LLM reasons about medical concepts, not just *what* it outputs.
+This long-horizon approach reveals *how* an LLM reasons through sequential medical decisions, not just *what* codes it produces.
 
 ## The Problem with Direct Medical Coding
 
@@ -26,17 +26,27 @@ Clinical Note: "65yo male with type 2 diabetes, presenting with diabetic retinop
 
 Step 1: Which ICD-10 chapters are relevant?
    [ ] Chapter 1: Infectious diseases
+   [ ] Chapter 2: Neoplasms
+   [ ] Chapter 3: Blood disorders
    [x] Chapter 4: Endocrine disorders      ← LLM selects
-   [x] Chapter 7: Eye disorders            ← LLM selects
-   [ ] Chapter 9: Circulatory system
+   [ ] Chapter 5: Mental disorders
    ...
 
-Step 2: Within Endocrine (E00-E89), which categories?
-   [x] E11: Type 2 diabetes mellitus       ← LLM selects
+Step 2: Within Endocrine (E00-E89), which subgroups or code blocks are relevant?
+   [ ] E00-E07: Thyroid disorders
+   [x] E08-E13: Diabetes mellitus           ← LLM selects
+   [ ] E15-E16: Other glucose regulation
+   ...
+
+Step 3: Within Diabetes (E08-E13), what are the relevant category/categories?
+   [ ] E08: Diabetes due to underlying condition
+   [ ] E09: Drug-induced diabetes
+   [ ] E10: Type 1 diabetes mellitus
+   [x] E11: Type 2 diabetes mellitus        ← LLM selects
    [ ] E13: Other specified diabetes
    ...
 
-Step 3: Within E11, which manifestations?
+Step 4: Within E11, which manifestations?
    [x] E11.3: With ophthalmic complications  ← LLM selects
    ...
 
@@ -95,10 +105,10 @@ Medical coding requires drilling down to the most specific applicable code. TMSP
 
 ### 5. Consistency Testing
 
-The caching system ensures identical contexts produce identical selections. Running the same clinical note multiple times reveals:
-- Temperature-dependent variability
-- Context window sensitivity
-- Provider-specific biases
+Running the same clinical note multiple times with identical LLM settings reveals:
+- **Robustness**: The candidate selections that remain invariant
+- **Sensitivity**: The decision points causing variability across runs
+- **Grounding**: Whether selections reflect appropriate medical reasoning
 
 ## Zero Shot Mode
 
@@ -129,8 +139,8 @@ The web frontend includes three interactive tabs:
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Clinical Note  │────▶│  Agent/Burr      │◀───▶│  ICD-10-CM      │
-│                 │     │  Orchestration   │     │  Index          │
+│  Clinical Note  │────▶│  Burr/Agent      │◀───▶│  ICD-10-CM      │
+│                 │     │  Orchestrator    │     │  Index          │
 └─────────────────┘     └────────┬─────────┘     └────────┬────────┘
                                  │                        ▲
                     ┌────────────┼────────────┐           │
@@ -290,3 +300,26 @@ POST /api/traverse/rewind
 
 This tests whether LLMs can incorporate corrective feedback—a key capability for medical AI systems.
 
+## Planned Features
+
+### Arena
+
+An additional traversal tool, enabling head-to-head comparison of benchmark results across different LLMs. Run the same clinical notes through multiple providers and visualize:
+- Accuracy differences at each hierarchy level
+- Reasoning quality comparisons
+- Consistency and specificity patterns across models
+
+### Data Set Generation
+
+Export traversal data into training-ready formats:
+- **Fine-tuning datasets**: Candidate/selection pairs with reasoning traces
+- **RL-friendly format**: Reward signals derived from benchmark outcomes (match/undershoot/overshoot)
+
+Enables using TMSP traversals to improve medical coding models.
+
+### Diagnosis Querying
+
+Augment traversal with external clinical knowledge:
+- Cross-reference clinical guidelines and evidence-based sources
+- Hypothesize alternative or additional diagnoses
+- Surface other coding (e.g. risk-adjustment) and CDI opportunities the LLM may have missed

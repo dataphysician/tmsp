@@ -106,10 +106,13 @@ function TraversalUI() {
   const [graphData, setGraphData] = useState<{ nodes: GraphNode[]; edges: GraphEdge[] } | null>(null);
   const [isLoadingGraph, setIsLoadingGraph] = useState(false);
   const [graphError, setGraphError] = useState<string | null>(null);
+  const [visualizeFitTrigger, setVisualizeFitTrigger] = useState(0);
 
   // Zero-shot visualization graph (for Traverse tab when visualizePrediction is ON)
   const [zeroShotVisualization, setZeroShotVisualization] = useState<{ nodes: GraphNode[]; edges: GraphEdge[] } | null>(null);
   const [isLoadingZeroShotViz, setIsLoadingZeroShotViz] = useState(false);
+  const [traverseFitTrigger, setTraverseFitTrigger] = useState(0);
+  const traverseLastInteractionRef = useRef<number>(0);
 
   // BENCHMARK tab state
   const [benchmarkExpectedCodes, setBenchmarkExpectedCodes] = useState<Set<string>>(new Set());
@@ -121,6 +124,9 @@ function TraversalUI() {
   const benchmarkTraversedNodesRef = useRef<GraphNode[]>([]);
   const benchmarkTraversedEdgesRef = useRef<GraphEdge[]>([]);
   const benchmarkDecisionsRef = useRef<DecisionPoint[]>([]);
+  // Map refs for O(1) updates during streaming (avoid O(n) mergeById/mergeByKey on every event)
+  const benchmarkNodesMapRef = useRef<Map<string, GraphNode>>(new Map());
+  const benchmarkEdgesMapRef = useRef<Map<string, GraphEdge>>(new Map());
   const benchmarkCombinedNodesRef = useRef<BenchmarkGraphNode[]>([]);
   // Phase 1: Track all selected_ids during streaming for Phase 2 marker computation
   const benchmarkStreamedIdsRef = useRef<Set<string>>(new Set());
@@ -144,13 +150,14 @@ function TraversalUI() {
   const [benchmarkClinicalNote, setBenchmarkClinicalNote] = useState('');
   const [benchmarkBatchCount, setBenchmarkBatchCount] = useState(0);
   const [benchmarkFitTrigger, setBenchmarkFitTrigger] = useState(0);
+  const benchmarkLastInteractionRef = useRef<number>(0);
   // Streaming traversed IDs - updated during STEP_FINISHED for real-time visual feedback
   const [streamingTraversedIds, setStreamingTraversedIds] = useState<Set<string>>(new Set());
-  // Ref to track streaming IDs without triggering re-renders (updated every event, state throttled)
+  // Ref to track streaming IDs without triggering re-renders
   const streamingTraversedIdsRef = useRef<Set<string>>(new Set());
-  // Throttle visual updates to prevent UI freezing during rapid event processing
   const lastVisualUpdateTimeRef = useRef<number>(0);
-  const VISUAL_UPDATE_THROTTLE_MS = 100; // Max 10 visual updates per second
+  // Throttle visual updates to max 10/sec during streaming (prevents re-render storm)
+  const VISUAL_UPDATE_THROTTLE_MS = 100; // Max 10 visual updates per second during streaming
   const benchmarkControllerRef = useRef<AbortController | null>(null);
   const [benchmarkSidebarTab, setBenchmarkSidebarTab] = useState<SidebarTab>('clinical-note');
   const [benchmarkInvalidCodes, setBenchmarkInvalidCodes] = useState<Set<string>>(new Set());
@@ -247,6 +254,113 @@ function TraversalUI() {
       setBenchmarkElapsedTime(null);
     }
     prevBenchmarkStatusRef.current = benchmarkStatus;
+  }, [benchmarkStatus]);
+
+  // Callbacks to reset idle timer on graph interaction
+  const handleTraverseGraphInteraction = useCallback(() => {
+    traverseLastInteractionRef.current = Date.now();
+  }, []);
+
+  const handleBenchmarkGraphInteraction = useCallback(() => {
+    benchmarkLastInteractionRef.current = Date.now();
+  }, []);
+
+  // Fit-to-window when nodes first appear during Traverse tab traversal
+  const traverseHadNodesRef = useRef(false);
+  useEffect(() => {
+    if (state.status === 'traversing' && !isRewinding) {
+      if (state.nodes.length > 0 && !traverseHadNodesRef.current) {
+        // Nodes just appeared - trigger fit after short delay
+        traverseHadNodesRef.current = true;
+        const timer = setTimeout(() => {
+          setTraverseFitTrigger(prev => prev + 1);
+        }, 350);
+        return () => clearTimeout(timer);
+      }
+    } else if (state.status === 'idle') {
+      // Reset when going back to idle
+      traverseHadNodesRef.current = false;
+    }
+  }, [state.status, state.nodes.length, isRewinding]);
+
+  // Periodic fit-to-window during Traverse tab traversal (after 5 seconds idle, not during rewind)
+  useEffect(() => {
+    if (state.status === 'traversing' && !isRewinding) {
+      // Reset interaction time when traversal starts
+      traverseLastInteractionRef.current = Date.now();
+      const interval = setInterval(() => {
+        const idleTime = Date.now() - traverseLastInteractionRef.current;
+        if (idleTime >= 5000) {
+          setTraverseFitTrigger(prev => prev + 1);
+          traverseLastInteractionRef.current = Date.now(); // Reset after fit
+        }
+      }, 1000); // Check every second
+      return () => clearInterval(interval);
+    }
+  }, [state.status, isRewinding]);
+
+  // Final fit-to-window 5 seconds after Traverse tab traversal completes (resets on interaction)
+  useEffect(() => {
+    if (state.status === 'complete' && !isRewinding) {
+      traverseLastInteractionRef.current = Date.now();
+      const interval = setInterval(() => {
+        const idleTime = Date.now() - traverseLastInteractionRef.current;
+        if (idleTime >= 5000) {
+          setTraverseFitTrigger(prev => prev + 1);
+          clearInterval(interval); // Only trigger once after completion
+        }
+      }, 1000);
+      return () => clearInterval(interval);
+    }
+  }, [state.status, isRewinding]);
+
+  // Fit-to-window when nodes first appear during Benchmark tab traversal
+  const benchmarkHadNodesRef = useRef(false);
+  useEffect(() => {
+    if (benchmarkStatus === 'traversing') {
+      if (benchmarkCombinedNodes.length > 0 && !benchmarkHadNodesRef.current) {
+        // Nodes just appeared - trigger fit after short delay
+        benchmarkHadNodesRef.current = true;
+        const timer = setTimeout(() => {
+          setBenchmarkFitTrigger(prev => prev + 1);
+        }, 350);
+        return () => clearTimeout(timer);
+      }
+    } else if (benchmarkStatus === 'idle') {
+      // Reset when going back to idle
+      benchmarkHadNodesRef.current = false;
+    }
+  }, [benchmarkStatus, benchmarkCombinedNodes.length]);
+
+  // Periodic fit-to-window during Benchmark tab traversal (after 5 seconds idle)
+  useEffect(() => {
+    if (benchmarkStatus === 'traversing') {
+      // Reset interaction time when traversal starts
+      benchmarkLastInteractionRef.current = Date.now();
+      const interval = setInterval(() => {
+        const idleTime = Date.now() - benchmarkLastInteractionRef.current;
+        if (idleTime >= 5000) {
+          setBenchmarkFitTrigger(prev => prev + 1);
+          benchmarkLastInteractionRef.current = Date.now(); // Reset after fit
+        }
+      }, 1000); // Check every second
+      return () => clearInterval(interval);
+    }
+  }, [benchmarkStatus]);
+
+  // Final fit-to-window 5 seconds after Benchmark tab traversal completes (resets on interaction)
+  useEffect(() => {
+    if (benchmarkStatus === 'complete') {
+      benchmarkLastInteractionRef.current = Date.now();
+      const interval = setInterval(() => {
+        const idleTime = Date.now() - benchmarkLastInteractionRef.current;
+        if (idleTime >= 5000) {
+          setBenchmarkFitTrigger(prev => prev + 1);
+          clearInterval(interval); // Only trigger once after completion
+        }
+      }, 1000);
+      return () => clearInterval(interval);
+    }
   }, [benchmarkStatus]);
 
   // Handle AG-UI events
@@ -463,6 +577,8 @@ function TraversalUI() {
             finalized_codes: finalNodes,
             current_step: `Complete - ${finalNodes.length} codes found`,
           }));
+          // Trigger fit-to-window after traversal completes
+          setTraverseFitTrigger(prev => prev + 1);
         }
         setIsLoading(false);
         break;
@@ -486,9 +602,17 @@ function TraversalUI() {
       return false;
     }
 
-    // Cancel any existing stream
+    // Cancel any existing traverse stream
     if (controllerRef.current) {
       controllerRef.current.abort();
+      controllerRef.current = null;
+    }
+
+    // Also cancel any pending benchmark stream to prevent cross-tab interference
+    if (benchmarkControllerRef.current) {
+      benchmarkControllerRef.current.abort();
+      benchmarkControllerRef.current = null;
+      setBenchmarkStatus('idle');
     }
 
     setIsLoading(true);
@@ -702,21 +826,32 @@ function TraversalUI() {
 
   // Effect to visualize zero-shot predictions when enabled
   useEffect(() => {
-    const shouldVisualize =
-      state.status === 'complete' &&
-      !(llmConfig.scaffolded ?? true) &&
-      (llmConfig.visualizePrediction ?? false) &&
-      state.finalized_codes.length > 0;
+    const isComplete = state.status === 'complete';
+    const isZeroShot = !(llmConfig.scaffolded ?? true);
+    const vizEnabled = llmConfig.visualizePrediction ?? false;
+    const hasCodes = state.finalized_codes.length > 0;
+    const shouldVisualize = isComplete && isZeroShot && vizEnabled && hasCodes;
+
+    console.log('[ZeroShotViz] Effect triggered:', {
+      isComplete,
+      isZeroShot,
+      vizEnabled,
+      hasCodes,
+      shouldVisualize,
+      finalized_codes: state.finalized_codes,
+    });
 
     if (shouldVisualize) {
       // Build graph from finalized codes for Traverse tab visualization
       (async () => {
         setIsLoadingZeroShotViz(true);
         try {
+          console.log('[ZeroShotViz] Building graph from codes:', state.finalized_codes);
           const result = await buildGraph(state.finalized_codes);
+          console.log('[ZeroShotViz] Graph built successfully:', result.nodes.length, 'nodes');
           setZeroShotVisualization({ nodes: result.nodes, edges: result.edges });
         } catch (err) {
-          console.error('Failed to build zero-shot visualization:', err);
+          console.error('[ZeroShotViz] Failed to build visualization:', err);
           setZeroShotVisualization(null);
         } finally {
           setIsLoadingZeroShotViz(false);
@@ -724,6 +859,7 @@ function TraversalUI() {
       })();
     } else if (state.status === 'idle' || (llmConfig.scaffolded ?? true)) {
       // Clear visualization when returning to idle or switching to scaffolded mode
+      console.log('[ZeroShotViz] Clearing visualization');
       setZeroShotVisualization(null);
     }
   }, [state.status, state.finalized_codes, llmConfig.scaffolded, llmConfig.visualizePrediction]);
@@ -765,6 +901,8 @@ function TraversalUI() {
       try {
         const result = await buildGraph([...newSet]);
         setGraphData({ nodes: result.nodes, edges: result.edges });
+        // Trigger fit-to-window after graph is built
+        setVisualizeFitTrigger(prev => prev + 1);
       } catch (err) {
         setGraphError(err instanceof Error ? err.message : 'Failed to build graph');
       } finally {
@@ -824,6 +962,8 @@ function TraversalUI() {
       setBenchmarkInvalidCodes(new Set());
       setBenchmarkStatus('idle');
       setBenchmarkCurrentStep('');
+      // Trigger fit-to-window after graph is built
+      setBenchmarkFitTrigger(prev => prev + 1);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : 'Failed to build expected graph';
 
@@ -846,6 +986,8 @@ function TraversalUI() {
             setBenchmarkCombinedEdges(result.edges);
             setBenchmarkStatus('idle');
             setBenchmarkCurrentStep('');
+            // Trigger fit-to-window after graph is built
+            setBenchmarkFitTrigger(prev => prev + 1);
             return;
           } catch {
             // Fall through to error state if valid codes also fail
@@ -930,24 +1072,18 @@ function TraversalUI() {
   const handleBenchmarkEvent = useCallback((event: AGUIEvent) => {
     switch (event.type) {
       case 'RUN_STARTED':
-        // Track cached status (single source of truth from server)
-        const isCached = event.metadata?.cached === true;
-        benchmarkIsCachedReplayRef.current = isCached;
+        // Track cached status - single source of truth from server
+        benchmarkIsCachedReplayRef.current = event.metadata?.cached === true;
 
-        if (isCached) {
-          console.log('[Benchmark] Cached replay - expecting STATE_SNAPSHOT');
-        }
-
-        // CRITICAL: Cancel any pending RAF and reset nodes synchronously.
-        // This ensures nodes are visually reset to "idle" (freshly added expected nodes)
-        // BEFORE any traversal data arrives, especially important for cached replays
-        // where RUN_FINISHED arrives very quickly.
+        // Cancel any pending RAF from previous run
         if (benchmarkResetRafRef.current !== null) {
           cancelAnimationFrame(benchmarkResetRafRef.current);
           benchmarkResetRafRef.current = null;
         }
 
-        // Synchronously reset combined nodes to idle status
+        // Synchronously reset combined nodes to idle status BEFORE any data arrives
+        // This ensures users see the "freshly added" state before results stream in
+        // Critical for cached replays where STATE_SNAPSHOT arrives immediately
         if (benchmarkCombinedNodesRef.current.length > 0) {
           const idleNodes = resetNodesToIdle(benchmarkCombinedNodesRef.current);
           benchmarkCombinedNodesRef.current = idleNodes;
@@ -955,7 +1091,11 @@ function TraversalUI() {
         }
 
         setBenchmarkStatus('traversing');
-        setBenchmarkCurrentStep(isCached ? 'Loading cached results...' : 'Starting benchmark traversal');
+        setBenchmarkCurrentStep(
+          benchmarkIsCachedReplayRef.current
+            ? 'Loading cached results...'
+            : 'Starting benchmark traversal'
+        );
         break;
 
       case 'STATE_SNAPSHOT':
@@ -964,12 +1104,10 @@ function TraversalUI() {
         if (event.state) {
           const nodes = event.state.nodes as GraphNode[];
           const edges = event.state.edges as GraphEdge[];
-          // Update refs
+          // Update refs only - state will be applied in RUN_FINISHED
+          // This prevents double state updates which can cause hangs
           benchmarkTraversedNodesRef.current = nodes;
           benchmarkTraversedEdgesRef.current = edges;
-          // Update state immediately - this is the complete traversed graph
-          setBenchmarkTraversedNodes(nodes);
-          setBenchmarkTraversedEdges(edges);
 
           // Track all node IDs for streaming progress (marks them as traversed)
           const traversedIds = new Set(nodes.map(n => n.id));
@@ -980,23 +1118,9 @@ function TraversalUI() {
         break;
 
       case 'STATE_DELTA':
-        // Live traversal: Apply JSON Patch for incremental updates
-        // Note: Cached replays use STATE_SNAPSHOT instead, so this only runs for live traversals
-        // PERFORMANCE: Update refs only during streaming - state is applied at RUN_FINISHED
-        // This prevents excessive re-renders during rapid event processing
-        if (event.delta) {
-          const graphState = {
-            nodes: [...benchmarkTraversedNodesRef.current],
-            edges: [...benchmarkTraversedEdgesRef.current],
-          };
-          try {
-            const result = applyPatch(graphState, event.delta as Operation[], true, false);
-            benchmarkTraversedNodesRef.current = result.newDocument.nodes;
-            benchmarkTraversedEdgesRef.current = result.newDocument.edges;
-          } catch {
-            // Ignore patch errors - refs already have latest data
-          }
-        }
+        // SKIP for benchmark mode - we accumulate via STEP_FINISHED using O(1) Maps
+        // STATE_DELTA with array spreading is O(n) per event = O(n²) total
+        // Only used for non-benchmark traverse mode
         break;
 
       case 'STEP_STARTED':
@@ -1004,8 +1128,6 @@ function TraversalUI() {
         break;
 
       case 'STEP_FINISHED':
-        // Live traversal: Process each batch and update state for real-time feedback
-        // Note: Cached replays use STATE_SNAPSHOT + decisions in RUN_FINISHED metadata
         benchmarkBatchCountRef.current += 1;
 
         if (event.metadata) {
@@ -1046,15 +1168,16 @@ function TraversalUI() {
             });
           }
 
-          // Build decision point
+          // Build decision point - use Set for O(1) lookups instead of Array.includes O(n)
+          const selectedSet = new Set(selectedIds);
           const candidateDecisions: CandidateDecision[] = Object.entries(candidates).map(
             ([code, label]) => ({
               code,
               label,
-              selected: selectedIds.includes(code),
-              confidence: selectedIds.includes(code) ? 1.0 : 0.0,
+              selected: selectedSet.has(code),
+              confidence: selectedSet.has(code) ? 1.0 : 0.0,
               evidence: null,
-              reasoning: selectedIds.includes(code) ? reasoning : '',
+              reasoning: selectedSet.has(code) ? reasoning : '',
               billable: selectedDetails[code]?.billable ?? false,
             })
           );
@@ -1067,26 +1190,30 @@ function TraversalUI() {
             selected_codes: selectedIds,
           };
 
-          // Track streamed IDs for Phase 2 marker computation
+          // Accumulate in Map refs for O(1) updates (NO state updates during streaming)
+          // Maps are converted to arrays at RUN_FINISHED
+          for (const node of newNodes) {
+            benchmarkNodesMapRef.current.set(node.id, node);
+          }
+          for (const edge of newEdges) {
+            const edgeKey = `${edge.source}|${edge.target}`;
+            benchmarkEdgesMapRef.current.set(edgeKey, edge);
+          }
+          benchmarkDecisionsRef.current.push(decision);
+
+          // Track streamed IDs for Phase 2 marker computation AND visual feedback
           for (const id of selectedIds) {
             benchmarkStreamedIdsRef.current.add(id);
             streamingTraversedIdsRef.current.add(id);
           }
 
-          // Merge into refs for real-time feedback (no state updates = no re-renders)
-          benchmarkTraversedNodesRef.current = mergeById(benchmarkTraversedNodesRef.current, newNodes);
-          benchmarkTraversedEdgesRef.current = mergeByKey(benchmarkTraversedEdgesRef.current, newEdges);
-          benchmarkDecisionsRef.current = [...benchmarkDecisionsRef.current, decision];
-
-          // THROTTLED state updates for visual feedback
-          // This limits re-renders to max 10/sec instead of 100+ during rapid event processing
+          // Throttled visual updates during streaming (max 10/sec to avoid UI overload)
+          // This triggers GraphViewer's lightweight style-update useEffect
           const now = Date.now();
           if (now - lastVisualUpdateTimeRef.current >= VISUAL_UPDATE_THROTTLE_MS) {
             lastVisualUpdateTimeRef.current = now;
             setStreamingTraversedIds(new Set(streamingTraversedIdsRef.current));
-            setBenchmarkBatchCount(benchmarkBatchCountRef.current);
           }
-          // Skip setBenchmarkCurrentStep during streaming - events arrive too fast to read
         }
         break;
 
@@ -1121,24 +1248,35 @@ function TraversalUI() {
 
           if (snapshotDecisions && snapshotDecisions.length > 0) {
             // Convert server decisions to frontend DecisionPoint format
-            const decisions: DecisionPoint[] = snapshotDecisions.map(d => ({
-              current_node: d.node_id,
-              current_label: `${d.batch_type} batch`,
-              depth: (d.batch_id?.split('|').length || 1),
-              candidates: Object.entries(d.candidates).map(([code, label]) => ({
-                code,
-                label,
-                selected: d.selected_ids.includes(code),
-                confidence: d.selected_ids.includes(code) ? 1.0 : 0.0,
-                evidence: null,
-                reasoning: d.selected_ids.includes(code) ? d.reasoning : '',
-                billable: d.selected_details?.[code]?.billable ?? false,
-              })),
-              selected_codes: d.selected_ids,
-            }));
+            // Use Set for O(1) lookups instead of Array.includes O(n)
+            const decisions: DecisionPoint[] = snapshotDecisions.map(d => {
+              const selectedSet = new Set(d.selected_ids);
+              return {
+                current_node: d.node_id,
+                current_label: `${d.batch_type} batch`,
+                depth: (d.batch_id?.split('|').length || 1),
+                candidates: Object.entries(d.candidates).map(([code, label]) => ({
+                  code,
+                  label,
+                  selected: selectedSet.has(code),
+                  confidence: selectedSet.has(code) ? 1.0 : 0.0,
+                  evidence: null,
+                  reasoning: selectedSet.has(code) ? d.reasoning : '',
+                  billable: d.selected_details?.[code]?.billable ?? false,
+                })),
+                selected_codes: d.selected_ids,
+              };
+            });
             benchmarkDecisionsRef.current = decisions;
             benchmarkBatchCountRef.current = decisions.length;
             console.log(`[RUN_FINISHED] Snapshot mode: ${decisions.length} decisions from metadata`);
+          }
+
+          // Convert Maps to arrays (only done once at RUN_FINISHED)
+          // During streaming, we used Map refs for O(1) updates
+          if (benchmarkNodesMapRef.current.size > 0) {
+            benchmarkTraversedNodesRef.current = [...benchmarkNodesMapRef.current.values()];
+            benchmarkTraversedEdgesRef.current = [...benchmarkEdgesMapRef.current.values()];
           }
 
           // Apply state from refs
@@ -1147,9 +1285,10 @@ function TraversalUI() {
           setBenchmarkDecisions(benchmarkDecisionsRef.current);
           setBenchmarkBatchCount(benchmarkBatchCountRef.current);
 
-          // Log cache status (use ref which was set in RUN_STARTED for consistency)
-          if (benchmarkIsCachedReplayRef.current) {
-            console.log('[BACKEND CACHE HIT] Using cached traversal results:', finalNodesRaw.length, 'codes finalized');
+          // Log cache status
+          const wasCached = event.metadata?.cached ?? false;
+          if (wasCached) {
+            console.log('[BACKEND CACHE HIT] Using cached results:', finalNodesRaw.length, 'codes');
           }
 
           // Phase 2: Compute final statuses and markers OUTSIDE of setState callbacks
@@ -1177,35 +1316,6 @@ function TraversalUI() {
               latestTraversedEdges,
               { finalizedOnlyMode: isZeroShot }
             );
-
-            // DEBUG: Investigate red X marker bug for I13.0
-            console.log('[DEBUG] Expected codes:', [...benchmarkExpectedCodes]);
-            console.log('[DEBUG] Final nodes:', [...finalNodes]);
-            console.log('[DEBUG] Streamed IDs count:', streamedIds.size);
-            console.log('[DEBUG] Traversed set count:', traversedSet.size);
-            console.log('[DEBUG] Missed edge markers:', JSON.stringify(missedEdgeMarkers, null, 2));
-            console.log('[DEBUG] Overshoot markers:', JSON.stringify(overshootMarkers, null, 2));
-            // Check I13.0 specifically
-            console.log('[DEBUG] I13.0 in expected?', benchmarkExpectedCodes.has('I13.0'));
-            console.log('[DEBUG] I13.0 in finalNodes?', finalNodes.has('I13.0'));
-            console.log('[DEBUG] I13.0 in streamedIds?', streamedIds.has('I13.0'));
-            console.log('[DEBUG] I13.0 in traversedSet?', traversedSet.has('I13.0'));
-            // Check I13 (parent) specifically
-            console.log('[DEBUG] I13 in streamedIds?', streamedIds.has('I13'));
-            console.log('[DEBUG] I13 in traversedSet?', traversedSet.has('I13'));
-            // Check nodes with I13 prefix
-            const i13Nodes = [...traversedSet].filter(id => id.startsWith('I13'));
-            console.log('[DEBUG] All I13* nodes in traversedSet:', i13Nodes);
-            // Check expected edges involving I13
-            const i13Edges = benchmarkExpectedGraph.edges.filter(e =>
-              String(e.source).startsWith('I13') || String(e.target).startsWith('I13')
-            );
-            console.log('[DEBUG] Expected edges involving I13*:', JSON.stringify(i13Edges, null, 2));
-            // Check if any marker involves I13
-            const i13MissedMarkers = missedEdgeMarkers.filter(m =>
-              m.edgeSource?.startsWith('I13') || m.edgeTarget?.startsWith('I13') || m.missedCode?.startsWith('I13')
-            );
-            console.log('[DEBUG] Missed markers involving I13*:', JSON.stringify(i13MissedMarkers, null, 2));
 
             // Compute metrics
             const expectedAncestorMap = buildAncestorMap(benchmarkExpectedGraph.edges);
@@ -1254,11 +1364,25 @@ function TraversalUI() {
             setBenchmarkFinalizedView(finalizedView);
 
             // For zero-shot mode: build inferred view AFTER main state updates
+            console.log('[BenchmarkInferredView] Checking conditions:', { isZeroShot, finalNodesCount: finalNodesRaw.length });
             if (isZeroShot && finalNodesRaw.length > 0) {
               // Use setTimeout to ensure main render completes first
+              console.log('[BenchmarkInferredView] Building inferred view for codes:', finalNodesRaw);
               setTimeout(async () => {
                 try {
                   const inferredGraph = await buildGraph(finalNodesRaw);
+
+                  // Log any invalid codes that were filtered out by the server
+                  if (inferredGraph.invalid_codes && inferredGraph.invalid_codes.length > 0) {
+                    console.log('[BenchmarkInferredView] Filtered out invalid codes:', inferredGraph.invalid_codes);
+                  }
+
+                  // If no valid nodes were returned, skip building the inferred view
+                  if (inferredGraph.nodes.length === 0) {
+                    console.log('[BenchmarkInferredView] No valid codes - skipping inferred view');
+                    return;
+                  }
+
                   const inferredTraversedIds = new Set(inferredGraph.nodes.map(n => n.id));
 
                   const initializedExpectedNodes: BenchmarkGraphNode[] = benchmarkExpectedGraph.nodes.map(node => ({
@@ -1331,6 +1455,10 @@ function TraversalUI() {
                     };
                   });
 
+                  console.log('[BenchmarkInferredView] Built successfully:', {
+                    inferredViewNodesCount: inferredViewNodes.length,
+                    inferredGraphNodesCount: inferredGraph.nodes.length,
+                  });
                   setBenchmarkInferredView({
                     nodes: inferredViewNodes,
                     edges: inferredGraph.edges,  // Use inferred edges for Graph view
@@ -1341,14 +1469,19 @@ function TraversalUI() {
                     inferredNodes: inferredGraph.nodes,
                   });
                 } catch (err) {
-                  console.error('Failed to build inferred view:', err);
+                  console.error('[BenchmarkInferredView] Failed to build:', err);
                 }
               }, 0);
             }
           }
 
+          // Final visual sync - ensure all streaming IDs are reflected
+          setStreamingTraversedIds(new Set(benchmarkStreamedIdsRef.current));
+
           setBenchmarkStatus('complete');
           setBenchmarkCurrentStep(`Complete - ${finalNodes.size} codes finalized`);
+          // Trigger fit-to-window after traversal completes
+          setBenchmarkFitTrigger(prev => prev + 1);
         }
         break;
     }
@@ -1369,9 +1502,18 @@ function TraversalUI() {
       return false;
     }
 
-    // Cancel any existing stream
+    // Cancel any existing benchmark stream
     if (benchmarkControllerRef.current) {
       benchmarkControllerRef.current.abort();
+      benchmarkControllerRef.current = null;
+    }
+
+    // Also cancel any pending traverse stream to prevent cross-tab interference
+    // This handles the case where user switched from Traverse tab with pending request
+    if (controllerRef.current) {
+      controllerRef.current.abort();
+      controllerRef.current = null;
+      setIsLoading(false);
     }
 
     // NOTE: Cross-run caching is now handled by the backend (Burr + SQLite)
@@ -1390,6 +1532,9 @@ function TraversalUI() {
     benchmarkStreamedIdsRef.current = new Set();
     streamingTraversedIdsRef.current = new Set();
     lastVisualUpdateTimeRef.current = 0;
+    // Reset Map refs used for O(1) streaming updates
+    benchmarkNodesMapRef.current = new Map();
+    benchmarkEdgesMapRef.current = new Map();
     setStreamingTraversedIds(new Set());
     setBenchmarkOvershootMarkers([]);
     setBenchmarkMissedEdgeMarkers([]);
@@ -1403,13 +1548,12 @@ function TraversalUI() {
     // Reset cached replay flag
     benchmarkIsCachedReplayRef.current = false;
 
-    // NOTE: Node reset to idle is now handled synchronously in RUN_STARTED handler.
-    // This ensures nodes are visually reset BEFORE any traversal data arrives,
-    // especially important for cached replays where events arrive very quickly.
-    // Cancel any pending RAF from a previous aborted run
-    if (benchmarkResetRafRef.current !== null) {
-      cancelAnimationFrame(benchmarkResetRafRef.current);
-      benchmarkResetRafRef.current = null;
+    // Reset graph to idle state first (plain black nodes)
+    // This ensures a clean visual slate before traversal colors nodes
+    if (benchmarkCombinedNodes.length > 0) {
+      const idleNodes = resetNodesToIdle(benchmarkCombinedNodes);
+      benchmarkCombinedNodesRef.current = idleNodes;
+      setBenchmarkCombinedNodes(idleNodes);
     }
 
     benchmarkControllerRef.current = streamTraversal(
@@ -1429,7 +1573,7 @@ function TraversalUI() {
       handleBenchmarkError
     );
     return true;
-  }, [benchmarkClinicalNote, llmConfig, handleBenchmarkEvent, handleBenchmarkError]);
+  }, [benchmarkClinicalNote, llmConfig, benchmarkCombinedNodes, handleBenchmarkEvent, handleBenchmarkError]);
 
   const handleBenchmarkCancel = useCallback(() => {
     if (benchmarkControllerRef.current) {
@@ -1461,6 +1605,9 @@ function TraversalUI() {
     benchmarkStreamedIdsRef.current = new Set();
     streamingTraversedIdsRef.current = new Set();
     lastVisualUpdateTimeRef.current = 0;
+    // Reset Map refs used for O(1) streaming updates
+    benchmarkNodesMapRef.current = new Map();
+    benchmarkEdgesMapRef.current = new Map();
     setStreamingTraversedIds(new Set());
     benchmarkCombinedNodesRef.current = [];
     setBenchmarkCombinedNodes([]);
@@ -1552,7 +1699,16 @@ function TraversalUI() {
                     </button>
                   )}
                 </div>
-                <div className="input-codes-table">
+                <div
+                  className="input-codes-table"
+                  onClick={(e) => {
+                    // Focus textarea when clicking on table background (not on code rows)
+                    if (e.target === e.currentTarget || (e.target as HTMLElement).classList.contains('empty-hint')) {
+                      const textarea = document.querySelector<HTMLTextAreaElement>('textarea.code-input');
+                      textarea?.focus();
+                    }
+                  }}
+                >
                   {inputCodes.size === 0 ? (
                     <span className="empty-hint">No codes added yet</span>
                   ) : (
@@ -1686,6 +1842,7 @@ function TraversalUI() {
                 onClick={() => {
                   if (handleTraverse()) {
                     setSidebarCollapsed(true);
+                    setTraverseFitTrigger(prev => prev + 1);
                   }
                 }}
                 disabled={isLoading || !clinicalNote.trim()}
@@ -1919,6 +2076,7 @@ function TraversalUI() {
                 status={isLoadingGraph ? 'traversing' : graphData ? 'complete' : 'idle'}
                 errorMessage={graphError}
                 codesBarLabel="Submitted Codes"
+                triggerFitToWindow={visualizeFitTrigger}
               />
             ) : (
               <VisualizeReportViewer
@@ -1932,10 +2090,19 @@ function TraversalUI() {
             traverseViewTab === 'graph' ? (
               // Use visualization graph when zero-shot + visualizePrediction is ON
               (() => {
-                const useVisualization =
-                  !(llmConfig.scaffolded ?? true) &&
-                  (llmConfig.visualizePrediction ?? false) &&
-                  zeroShotVisualization !== null;
+                const isZeroShot = !(llmConfig.scaffolded ?? true);
+                const vizEnabled = llmConfig.visualizePrediction ?? false;
+                const hasVizData = zeroShotVisualization !== null;
+                const useVisualization = isZeroShot && vizEnabled && hasVizData;
+
+                console.log('[TraverseGraphViewer] Render:', {
+                  isZeroShot,
+                  vizEnabled,
+                  hasVizData,
+                  useVisualization,
+                  vizNodes: zeroShotVisualization?.nodes.length ?? 0,
+                  stateNodes: state.nodes.length,
+                });
 
                 return (
                   <GraphViewer
@@ -1955,6 +2122,8 @@ function TraversalUI() {
                     onNodeRewindClick={handleNodeRewindClick}
                     allowRewind={state.status !== 'idle' && state.nodes.length > 1}
                     rewindingNodeId={rewindingNodeId}
+                    triggerFitToWindow={traverseFitTrigger}
+                    onGraphInteraction={handleTraverseGraphInteraction}
                   />
                 );
               })()
@@ -1977,6 +2146,16 @@ function TraversalUI() {
                 const useInferredView = isZeroShot && isComplete && benchmarkInferPrecursors && benchmarkInferredView !== null;
                 const useFinalizedView = isZeroShot && isComplete && !benchmarkInferPrecursors && benchmarkFinalizedView !== null;
 
+                console.log('[BenchmarkGraphViewer] Render:', {
+                  isZeroShot,
+                  isComplete,
+                  benchmarkInferPrecursors,
+                  hasInferredView: benchmarkInferredView !== null,
+                  hasFinalizedView: benchmarkFinalizedView !== null,
+                  useInferredView,
+                  useFinalizedView,
+                });
+
                 // Get active view data
                 const activeView = useInferredView
                   ? benchmarkInferredView
@@ -1984,11 +2163,13 @@ function TraversalUI() {
                     ? benchmarkFinalizedView
                     : null;
 
-                // Both views use expected graph structure - inferred view has different metrics/markers
-                // but same graph layout (expected nodes with benchmark status highlighting)
-                // IMPORTANT: Always use expected edges to maintain expected graph structure
-                // (benchmarkInferredView.edges contains inferred graph edges which is wrong for display)
-                const activeNodes = activeView?.nodes ?? benchmarkCombinedNodes;
+                // When inferred view is active, use the comparison-based nodes (expected graph with
+                // benchmark status based on inferred traversal coverage) and expected graph edges.
+                // This shows which expected nodes were/weren't covered by the inferred traversal.
+                // For finalized view, use expected graph structure with benchmark status highlighting.
+                const activeNodes = useInferredView
+                  ? (benchmarkInferredView?.nodes ?? benchmarkCombinedNodes)
+                  : (activeView?.nodes ?? benchmarkCombinedNodes);
                 const activeEdges = useInferredView
                   ? (benchmarkExpectedGraph?.edges ?? benchmarkCombinedEdges)
                   : (activeView?.edges ?? benchmarkCombinedEdges);
@@ -2035,6 +2216,7 @@ function TraversalUI() {
                     codesBarLabel={isComplete ? 'Matched Final Codes' : 'Target Final Codes'}
                     elapsedTime={benchmarkElapsedTime}
                     triggerFitToWindow={benchmarkFitTrigger}
+                    onGraphInteraction={handleBenchmarkGraphInteraction}
                     showXMarkers={showXMarkers}
                     streamingTraversedIds={benchmarkStatus === 'traversing' ? streamingTraversedIds : undefined}
                   />

@@ -54,14 +54,15 @@ export async function processSSEStream(
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? ''; // Keep incomplete line in buffer
 
+      // Process events one at a time, yielding between each to prevent blocking
+      // This prevents "Page Unresponsive" during streaming
       for (const line of lines) {
         if (line.startsWith('data: ')) {
           try {
             const event = JSON.parse(line.slice(6)) as AGUIEvent;
-            // AG-UI Protocol: Process all events immediately
-            // For cached replays, server sends STATE_SNAPSHOT + RUN_FINISHED (3 events)
-            // instead of 500+ individual events
             onEvent(event);
+            // Yield after EVERY event to keep UI responsive
+            await new Promise(resolve => setTimeout(resolve, 0));
           } catch (parseError) {
             console.error(`[${logPrefix}] Failed to parse SSE event:`, parseError);
           }
