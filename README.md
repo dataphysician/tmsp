@@ -231,7 +231,7 @@ cd frontend
 npm run dev
 ```
 
-The frontend runs at `http://localhost:5173` by default.
+The frontend runs at `http://localhost:3000`. Make sure the backend server is running first.
 
 ### Programmatic API
 
