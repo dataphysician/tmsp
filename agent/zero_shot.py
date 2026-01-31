@@ -41,6 +41,7 @@ from burr.core import ApplicationBuilder, State, action
 from burr.integrations.persisters.b_aiosqlite import AsyncSQLitePersister
 
 from candidate_selector.selector import zero_shot_selector
+from agent.traversal import delete_persisted_state
 
 
 # ============================================================================
@@ -106,8 +107,10 @@ def generate_zero_shot_cache_key(
     temperature: float,
     max_completion_tokens: int | None = None,
     system_prompt: str | None = None,
+    use_cache: bool = True,
+    cache_version: int = 0,
 ) -> str:
-    """Generate a deterministic cache key for zero-shot requests.
+    """Generate a cache key for zero-shot requests.
 
     The key is based on all inputs that affect the LLM response.
 
@@ -118,10 +121,16 @@ def generate_zero_shot_cache_key(
         temperature: Temperature setting
         max_completion_tokens: Max completion tokens setting
         system_prompt: Custom system prompt (if any)
+        use_cache: If True, generate deterministic key (may hit cache).
+                   If False, add datetime to make key unique (never hits cache).
+        cache_version: Version number for soft invalidation. Incrementing this
+                       creates a new cache slot, orphaning old entries without deletion.
 
     Returns:
         A hash string to use as partition_key
     """
+    from datetime import datetime
+
     # Normalize inputs
     normalized = {
         "clinical_note": clinical_note.strip(),
@@ -132,12 +141,17 @@ def generate_zero_shot_cache_key(
         "system_prompt": (system_prompt or "").strip(),
     }
 
-    # Create deterministic string representation
+    # Create deterministic string representation with version
     key_str = (
         f"{normalized['provider']}|{normalized['model']}|"
         f"{normalized['temperature']}|{normalized['max_completion_tokens']}|"
-        f"{normalized['system_prompt']}|{normalized['clinical_note']}"
+        f"{normalized['system_prompt']}|{normalized['clinical_note']}|"
+        f"v{cache_version}"
     )
+
+    # Add datetime for unique key when caching is disabled
+    if not use_cache:
+        key_str += f"|{datetime.now().isoformat()}"
 
     # Hash for shorter key
     key_hash = hashlib.sha256(key_str.encode()).hexdigest()[:16]
@@ -222,7 +236,18 @@ async def build_zero_shot_app(
     if cached_state is not None:
         # Cache hit! Check if the run completed (has selected_codes)
         state_dict = cached_state.get("state", {})
-        if "selected_codes" in state_dict and state_dict["selected_codes"] is not None:
+        if "selected_codes" not in state_dict or state_dict["selected_codes"] is None:
+            # Incomplete cache (e.g., from a cancelled run) - delete it to prevent
+            # Burr from auto-resuming. Without this, Burr's persister would override
+            # the fresh .with_state() initialization with the partial cached state.
+            print(f"[ZERO-SHOT BURR] Deleting incomplete cache for partition_key={partition_key}")
+            await delete_persisted_state(
+                partition_key=partition_key,
+                app_id=app_id,
+                db_path="./cache.db",
+                table_name="zero_shot_state",
+            )
+        else:
             print(f"[ZERO-SHOT BURR] Cache HIT for partition_key={partition_key}")
             print(f"[ZERO-SHOT BURR] Cached codes: {len(state_dict.get('selected_codes', []))} codes")
 

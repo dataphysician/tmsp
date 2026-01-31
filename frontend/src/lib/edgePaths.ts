@@ -78,3 +78,52 @@ export function createPath(
   }
   return createEdgePath(edge, positions, nodeHeight);
 }
+
+/**
+ * Get a point along a straight edge path at parameter t (0-1).
+ * Returns coordinates near the arrowhead when t is close to 1.
+ */
+export function getPointOnStraightEdge(
+  srcPos: { x: number; y: number },
+  tgtPos: { x: number; y: number },
+  nodeHeight: number,
+  t: number
+): { x: number; y: number } {
+  const x1 = srcPos.x;
+  const y1 = srcPos.y + nodeHeight / 2;
+  const x2 = tgtPos.x;
+  const y2 = tgtPos.y - nodeHeight / 2 - ARROW_PADDING_STRAIGHT;
+
+  return {
+    x: x1 + t * (x2 - x1),
+    y: y1 + t * (y2 - y1)
+  };
+}
+
+/**
+ * Get a point along a curved (Bezier) edge path at parameter t (0-1).
+ * Uses quadratic Bezier formula: B(t) = (1-t)²P0 + 2(1-t)t*P1 + t²P2
+ */
+export function getPointOnCurvedEdge(
+  srcPos: { x: number; y: number },
+  tgtPos: { x: number; y: number },
+  nodeHeight: number,
+  t: number
+): { x: number; y: number } {
+  const x1 = srcPos.x;
+  const y1 = srcPos.y + nodeHeight / 2;
+  const x2 = tgtPos.x;
+  const y2 = tgtPos.y - nodeHeight / 2 - ARROW_PADDING_CURVED;
+
+  // Control point for quadratic Bezier
+  const dx = x2 - x1;
+  const cx = x1 + dx / 2;
+  const cy = Math.min(y1, y2) - Math.abs(dx) * 0.2 - 20;
+
+  // Quadratic Bezier formula
+  const oneMinusT = 1 - t;
+  return {
+    x: oneMinusT * oneMinusT * x1 + 2 * oneMinusT * t * cx + t * t * x2,
+    y: oneMinusT * oneMinusT * y1 + 2 * oneMinusT * t * cy + t * t * y2
+  };
+}

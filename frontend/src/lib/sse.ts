@@ -91,6 +91,7 @@ export function buildTraversalRequestBody(config: {
   extra?: Record<string, string> | null;
   system_prompt?: string | null;
   scaffolded?: boolean;
+  persist_cache?: boolean;
   // Additional fields for rewind
   batch_id?: string;
   feedback?: string;
@@ -107,6 +108,7 @@ export function buildTraversalRequestBody(config: {
     extra: config.extra ?? null,
     system_prompt: config.system_prompt ?? null,
     scaffolded: config.scaffolded ?? true,
+    persist_cache: config.persist_cache ?? true,
   };
 
   // Add rewind-specific fields if present

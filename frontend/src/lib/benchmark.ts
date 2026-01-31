@@ -262,6 +262,7 @@ export function computeBenchmarkMetrics(
     traversedCount: traversedCodes.size,
     expectedNodesCount: expectedNodeIds.size,
     traversedNodesCount: traversedNodeIds.size,
+    expectedNodesTraversed,
     exactCount,
     undershootCount,
     overshootCount,
@@ -631,14 +632,14 @@ export function computeFinalizedComparison(
   finalizedCodes: Set<string>,
   expectedLeaves: Set<string>,
   traversedEdges: GraphEdge[] = [],
-  options: { finalizedOnlyMode?: boolean } = {}
+  options: { finalizedOnlyMode?: boolean; exactMatchedCodes?: Set<string> } = {}
 ): {
   nodes: BenchmarkGraphNode[];
   overshootMarkers: OvershootMarker[];
   missedEdgeMarkers: EdgeMissMarker[];
   traversedSet: Set<string>;
 } {
-  const { finalizedOnlyMode = false } = options;
+  const { finalizedOnlyMode = false, exactMatchedCodes } = options;
 
   // Build nodeMap for O(1) lookups (avoid O(n) nodes.find() calls)
   const nodeMap = new Map<string, BenchmarkGraphNode>();
@@ -747,8 +748,10 @@ export function computeFinalizedComparison(
     const isExpectedLeaf = expectedLeaves.has(nodeId);
     const isBenchmarkFinalized = finalizedCodes.has(nodeId);
 
-    // Matched: expected leaf that was finalized
-    if (isExpectedLeaf && isBenchmarkFinalized) {
+    // Matched: expected leaf with exact outcome (includes lateral matches)
+    // Use exactMatchedCodes if provided (includes lateral parent matches), else fall back to direct finalization
+    const isExactMatch = exactMatchedCodes ? exactMatchedCodes.has(nodeId) : isBenchmarkFinalized;
+    if (isExpectedLeaf && isExactMatch) {
       return { ...node, benchmarkStatus: 'matched' as const };
     }
 

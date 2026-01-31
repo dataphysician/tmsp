@@ -199,6 +199,8 @@ class SpawnParallelBatches(MapStates):
                 spawn_seven_chr=SpawnSevenChr(),
             )
             .with_transitions(
+                # Cancel check - highest priority
+                ("load_node", "finish_batch", expr("cancelled == True")),
                 ("load_node", "select_candidates"),
                 # Empty selection WITH sevenChrDef authority -> spawn sevenChrDef batch
                 (
@@ -276,6 +278,8 @@ class SpawnParallelBatches(MapStates):
         batch_data = state.get("batch_data", {})
         halted_by_exception = state.get("halted_by_exception", [])
         final_nodes = state.get("final_nodes", [])
+        # Track seen final nodes to avoid duplicates from parallel paths reaching same nodes
+        final_nodes_set = set(final_nodes)
 
         count = 0
         async for result_state in results:
@@ -286,7 +290,11 @@ class SpawnParallelBatches(MapStates):
             result_halted = result_state.get("halted_by_exception", [])
             result_finals = result_state.get("final_nodes", [])
             halted_by_exception.extend(result_halted)
-            final_nodes.extend(result_finals)
+            # Deduplicate final_nodes - multiple parallel paths may reach the same terminal node
+            for fn in result_finals:
+                if fn not in final_nodes_set:
+                    final_nodes_set.add(fn)
+                    final_nodes.append(fn)
 
         print(f"\n{'=' * 60}")
         print("PARALLEL BATCH LEVEL COMPLETED")
@@ -532,6 +540,8 @@ class SpawnSevenChr(MapStates):
                 spawn_seven_chr=SpawnSevenChr(),  # Recursive for placeholder spawning
             )
             .with_transitions(
+                # Cancel check - highest priority
+                ("load_node", "finish_batch", expr("cancelled == True")),
                 ("load_node", "select_candidates"),
                 # Empty + authority + |children → spawn_seven_chr (handles placeholder or sevenChrDef)
                 (
@@ -605,13 +615,19 @@ class SpawnSevenChr(MapStates):
         """Merge sevenChrDef batch result."""
         batch_data = state.get("batch_data", {})
         final_nodes = state.get("final_nodes", [])
+        # Track seen final nodes to avoid duplicates from parallel paths
+        final_nodes_set = set(final_nodes)
 
         async for result_state in results:
             result_batch_data = result_state.get("batch_data", {})
             batch_data.update(result_batch_data)
 
             result_finals = result_state.get("final_nodes", [])
-            final_nodes.extend(result_finals)
+            # Deduplicate final_nodes
+            for fn in result_finals:
+                if fn not in final_nodes_set:
+                    final_nodes_set.add(fn)
+                    final_nodes.append(fn)
 
         print(f"\n{'=' * 60}")
         print("SEVENCHRONDEF BATCH COMPLETED")

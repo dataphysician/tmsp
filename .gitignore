@@ -12,6 +12,9 @@ wheels/
 # Databases
 *.db
 
+# Cache version tracking (runtime state)
+cache_versions.json
+
 # UV lock file
 uv.lock
 

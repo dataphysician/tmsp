@@ -74,12 +74,14 @@ class RewindRequest(BaseModel):
 
     Used by /api/traverse/rewind endpoint to fork from a checkpoint
     and re-traverse with corrective feedback.
+
+    Backend is the authoritative source for pre-rewind state - it loads the
+    cached state, prunes it to the rewind point, and emits a STATE_SNAPSHOT.
     """
 
     batch_id: str  # e.g., "E08.3|children" - identifies the checkpoint to fork from
     feedback: str  # User's corrective feedback text for the LLM
     clinical_note: str  # Original clinical note (needed to generate partition key for checkpoint lookup)
-    existing_nodes: list[str] = []  # Node IDs already in graph (for lateral target parent lookup)
     provider: str = "openai"  # "openai" | "cerebras" | "sambanova" | "anthropic" | "vertexai" | "other"
     api_key: str = ""
     model: str | None = None  # Optional model override

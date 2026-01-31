@@ -1,6 +1,11 @@
 import { useState, useMemo } from 'react';
 import type { BenchmarkMetrics, DecisionPoint, TraversalStatus, ExpectedCodeOutcome, GraphNode, GraphEdge, BenchmarkGraphNode } from '../lib/types';
 
+// Highlight modes for the count grid buttons
+// Column-level (Row 1): 'missed' | 'shared' | 'other' - expand interim, highlight column
+// Code-level (Row 2): 'matched' | 'undershoot' | 'overshoot' - collapse interim, highlight codes
+type HighlightMode = 'missed' | 'shared' | 'other' | 'matched' | 'undershoot' | 'overshoot';
+
 interface BenchmarkReportViewerProps {
   metrics: BenchmarkMetrics | null;
   decisions: DecisionPoint[];
@@ -165,10 +170,7 @@ export function BenchmarkReportViewer({
   );
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set(['ROOT']));
   // highlightMode controls box muting, interim expansion, and code highlighting
-  // 'expected' | 'missed' -> focus Target box, expand interim
-  // 'traversed' -> focus Shared box, expand interim
-  // 'matched' -> focus Shared box, collapse interim
-  const [highlightMode, setHighlightMode] = useState<string | null>(null);
+  const [highlightMode, setHighlightMode] = useState<HighlightMode | null>(null);
 
   // Format elapsed time as seconds with 1 decimal
   const formatElapsedTime = (ms: number): string => {
@@ -194,7 +196,7 @@ export function BenchmarkReportViewer({
   };
 
   // Handle clicks on Expected, Traversed, Matched, Missed count items
-  const handleHighlightClick = (mode: string, e: React.MouseEvent) => {
+  const handleHighlightClick = (mode: HighlightMode, e: React.MouseEvent) => {
     e.stopPropagation();
     // Toggle off if clicking the same mode
     setHighlightMode(prev => prev === mode ? null : mode);
@@ -203,37 +205,43 @@ export function BenchmarkReportViewer({
   // Derive muted state for each venn box based on highlightMode
   const isBoxMuted = (box: 'target' | 'shared' | 'benchmark'): boolean => {
     if (!highlightMode) return false;
-    if (highlightMode === 'expected' || highlightMode === 'missed') {
-      return box !== 'target';
-    }
-    if (highlightMode === 'traversed' || highlightMode === 'matched' || highlightMode === 'undershoot') {
-      return box !== 'shared';
-    }
-    if (highlightMode === 'overshoot') {
-      return box !== 'benchmark';
-    }
+
+    // Column-level highlights (Row 1)
+    if (highlightMode === 'missed') return box !== 'target';
+    if (highlightMode === 'shared') return box !== 'shared';
+    if (highlightMode === 'other') return box !== 'benchmark';
+
+    // Code-level highlights (Row 2) - mute based on where codes live
+    if (highlightMode === 'matched' || highlightMode === 'undershoot') return box !== 'shared';
+    if (highlightMode === 'overshoot') return box !== 'benchmark';
+
     return false;
   };
 
   // Derive expanded state for interim sections based on highlightMode
-  // Only expand interim for the region being highlighted, collapse others
-  // 'matched' and 'missed' keep all interim collapsed (only highlights final codes)
+  // Column-level (Row 1): expand interim for the associated column
+  // Code-level (Row 2): collapse all interim (only highlights specific codes)
   const isInterimExpanded = (box: 'target' | 'shared' | 'benchmark'): boolean => {
-    if (!highlightMode) return false;
-    if (highlightMode === 'expected') {
-      return box === 'target';
+    if (!highlightMode) return true; // Default: all expanded
+
+    // Column-level highlights (Row 1): expand the associated column's interim
+    if (highlightMode === 'missed') return box === 'target';
+    if (highlightMode === 'shared') return box === 'shared';
+    if (highlightMode === 'other') return box === 'benchmark';
+
+    // Code-level highlights (Row 2): collapse all interim
+    if (highlightMode === 'matched' || highlightMode === 'undershoot' || highlightMode === 'overshoot') {
+      return false;
     }
-    if (highlightMode === 'traversed' || highlightMode === 'undershoot') {
-      return box === 'shared';
-    }
-    if (highlightMode === 'overshoot') {
-      return box === 'benchmark';
-    }
-    return false;
+
+    return true;
   };
 
   // Manual toggle for interim expansion (when clicking box directly)
-  const [manualExpandedColumns, setManualExpandedColumns] = useState<Set<string>>(new Set());
+  // Default: all columns expanded
+  const [manualExpandedColumns, setManualExpandedColumns] = useState<Set<string>>(
+    new Set(['target', 'shared', 'benchmark'])
+  );
 
   const toggleColumn = (column: string) => {
     // Clear highlight mode when manually toggling
@@ -354,6 +362,27 @@ export function BenchmarkReportViewer({
     return count - 1;
   }, [tree]);
 
+  // Compute set of all nodes that have children (expandable nodes)
+  const allExpandableNodes = useMemo(() => {
+    if (!tree) return new Set<string>();
+    const expandable = new Set<string>();
+    const collect = (node: TreeNode) => {
+      if (node.children.length > 0) {
+        expandable.add(node.code);
+      }
+      node.children.forEach(collect);
+    };
+    collect(tree);
+    return expandable;
+  }, [tree]);
+
+  // Expand All disabled when all expandable nodes are already expanded
+  const isAllExpanded = allExpandableNodes.size > 0 &&
+    [...allExpandableNodes].every(code => expandedNodes.has(code));
+
+  // Collapse All disabled when only ROOT is expanded (default state)
+  const isFullyCollapsed = expandedNodes.size === 1 && expandedNodes.has('ROOT');
+
   // Group outcomes by status
   // When hideOvershootUndershoot is true, treat overshoot/undershoot as missed
   const groupedOutcomes = metrics?.outcomes.reduce(
@@ -378,9 +407,9 @@ export function BenchmarkReportViewer({
   // - Shared interim: from combinedNodes (traversed nodes in expected graph)
   // - Benchmark interim: from traversedNodes (traversed nodes NOT in expected graph)
   const { matches: interimTarget, shared: interimShared, benchmark: interimBenchmark } = useMemo(() => {
-    const target: any[] = [];
-    const shared: any[] = [];
-    const benchmark: any[] = [];
+    const target: GraphNode[] = [];
+    const shared: GraphNode[] = [];
+    const benchmark: GraphNode[] = [];
 
     // Allow lookup of whether node is in expected graph
     const expectedNodeIds = new Set(expectedGraph?.nodes.map(n => n.id) || []);
@@ -393,25 +422,28 @@ export function BenchmarkReportViewer({
     });
     metrics?.otherCodes.forEach(code => finalizedCodes.add(code));
 
+    // Build set of traversed node IDs for quick lookup (authoritative source for what was visited)
+    const traversedIds = new Set(traversedNodes?.map(n => n.id) || []);
+
     // 1. Target + Shared interim: from combinedNodes (expected graph with status overlays)
-    const nodes = (combinedNodes as any[]) || [];
+    const nodes = combinedNodes || [];
     nodes.forEach(n => {
       // Exclude ROOT and finalized nodes
       if (n.id === 'ROOT' || finalizedCodes.has(n.id)) return;
 
-      const status = n.benchmarkStatus; // 'expected', 'traversed', 'matched', 'undershoot'
+      const status = 'benchmarkStatus' in n ? n.benchmarkStatus : undefined;
 
-      if (status === 'expected') {
-        // Target interim: expected nodes not yet traversed (missed path ancestors)
+      if (status === 'expected' && !traversedIds.has(n.id)) {
+        // Target interim: expected nodes that were never traversed (missed path ancestors)
         target.push(n);
-      } else if (status === 'traversed' && expectedNodeIds.has(n.id)) {
+      } else if (traversedIds.has(n.id) && expectedNodeIds.has(n.id)) {
         // Shared interim: traversed nodes that are in expected graph
         shared.push(n);
       }
     });
 
     // 2. Benchmark interim: from traversedNodes (raw streamed nodes NOT in expected graph)
-    const traversed = (traversedNodes as any[]) || [];
+    const traversed = traversedNodes || [];
     traversed.forEach(n => {
       // Exclude ROOT and finalized nodes
       if (n.id === 'ROOT' || finalizedCodes.has(n.id)) return;
@@ -422,7 +454,8 @@ export function BenchmarkReportViewer({
     });
 
     // Sorting by depth/code to ensure logical order
-    const sorter = (a: any, b: any) => (a.depth - b.depth) || a.id.localeCompare(b.id);
+    const sorter = (a: { depth: number; id: string }, b: { depth: number; id: string }) =>
+      (a.depth - b.depth) || a.id.localeCompare(b.id);
     target.sort(sorter);
     shared.sort(sorter);
     benchmark.sort(sorter);
@@ -490,12 +523,12 @@ export function BenchmarkReportViewer({
       {showTree && !metrics && (
         <>
           <div className="trajectory-actions">
-            <button onClick={expandAll} className="action-btn">Expand All</button>
-            <button onClick={collapseAll} className="action-btn">Collapse All</button>
+            <button onClick={expandAll} className="action-btn" disabled={isAllExpanded}>Expand All</button>
+            <button onClick={collapseAll} className="action-btn" disabled={isFullyCollapsed}>Collapse All</button>
           </div>
           <div className="trajectory-tree">
             <TreeNodeComponent
-              node={tree!}
+              node={tree}
               depth={0}
               expandedNodes={expandedNodes}
               toggleNode={toggleNode}
@@ -525,60 +558,66 @@ export function BenchmarkReportViewer({
 
                 {/* Count Summary (Right Side) */}
                 <div className="metrics-counts compact">
-                  <div className="count-grid">
-                    <div
-                      className={`count-item interactive ${highlightMode === 'expected' ? 'selected' : ''}`}
-                      onClick={(e) => handleHighlightClick('expected', e)}
-                      role="button"
-                      tabIndex={0}
-                    >
-                      <span className="count-value">{metrics.expectedCount}</span>
-                      <span className="count-label">Expected</span>
+                  <div className="count-grid two-row">
+                    {/* Row 1: Column-level highlights (expand interim, highlight column) */}
+                    <div className="count-row column-level">
+                      <div
+                        className={`count-item missed interactive ${highlightMode === 'missed' ? 'selected' : ''}`}
+                        onClick={(e) => handleHighlightClick('missed', e)}
+                        role="button"
+                        tabIndex={0}
+                      >
+                        <span className="count-value">{hideOvershootUndershoot ? metrics.missedCount + metrics.overshootCount + metrics.undershootCount : metrics.missedCount}</span>
+                        <span className="count-label">Missed</span>
+                      </div>
+                      <div
+                        className={`count-item interactive ${highlightMode === 'shared' ? 'selected' : ''}`}
+                        onClick={(e) => handleHighlightClick('shared', e)}
+                        role="button"
+                        tabIndex={0}
+                      >
+                        <span className="count-value">{metrics.exactCount + (hideOvershootUndershoot ? 0 : metrics.undershootCount)}</span>
+                        <span className="count-label">Correct</span>
+                      </div>
+                      <div
+                        className={`count-item interactive ${highlightMode === 'other' ? 'selected' : ''}`}
+                        onClick={(e) => handleHighlightClick('other', e)}
+                        role="button"
+                        tabIndex={0}
+                      >
+                        <span className="count-value">{metrics.otherCount + (hideOvershootUndershoot ? 0 : metrics.overshootCount)}</span>
+                        <span className="count-label">Extra</span>
+                      </div>
                     </div>
-                    <div
-                      className={`count-item interactive ${highlightMode === 'traversed' ? 'selected' : ''}`}
-                      onClick={(e) => handleHighlightClick('traversed', e)}
-                      role="button"
-                      tabIndex={0}
-                    >
-                      <span className="count-value">{metrics.traversedCount}</span>
-                      <span className="count-label">Traversed</span>
-                    </div>
-                    <div
-                      className={`count-item exact interactive ${highlightMode === 'matched' ? 'selected' : ''}`}
-                      onClick={(e) => handleHighlightClick('matched', e)}
-                      role="button"
-                      tabIndex={0}
-                    >
-                      <span className="count-value">{metrics.exactCount}</span>
-                      <span className="count-label">Matched</span>
-                    </div>
-                    <div
-                      className={`count-item overshoot interactive ${highlightMode === 'overshoot' ? 'selected' : ''} ${hideOvershootUndershoot ? 'disabled' : ''}`}
-                      onClick={(e) => !hideOvershootUndershoot && handleHighlightClick('overshoot', e)}
-                      role="button"
-                      tabIndex={hideOvershootUndershoot ? -1 : 0}
-                    >
-                      <span className="count-value">{hideOvershootUndershoot ? 0 : metrics.overshootCount}</span>
-                      <span className="count-label">Overshoot</span>
-                    </div>
-                    <div
-                      className={`count-item undershoot interactive ${highlightMode === 'undershoot' ? 'selected' : ''} ${hideOvershootUndershoot ? 'disabled' : ''}`}
-                      onClick={(e) => !hideOvershootUndershoot && handleHighlightClick('undershoot', e)}
-                      role="button"
-                      tabIndex={hideOvershootUndershoot ? -1 : 0}
-                    >
-                      <span className="count-value">{hideOvershootUndershoot ? 0 : metrics.undershootCount}</span>
-                      <span className="count-label">Undershoot</span>
-                    </div>
-                    <div
-                      className={`count-item missed interactive ${highlightMode === 'missed' ? 'selected' : ''}`}
-                      onClick={(e) => handleHighlightClick('missed', e)}
-                      role="button"
-                      tabIndex={0}
-                    >
-                      <span className="count-value">{hideOvershootUndershoot ? metrics.missedCount + metrics.overshootCount + metrics.undershootCount : metrics.missedCount}</span>
-                      <span className="count-label">Missed Decisions</span>
+                    {/* Row 2: Code-level highlights (collapse interim, highlight codes) */}
+                    <div className="count-row code-level">
+                      <div
+                        className={`count-item exact interactive ${highlightMode === 'matched' ? 'selected' : ''}`}
+                        onClick={(e) => handleHighlightClick('matched', e)}
+                        role="button"
+                        tabIndex={0}
+                      >
+                        <span className="count-value">{metrics.exactCount}</span>
+                        <span className="count-label">Matched</span>
+                      </div>
+                      <div
+                        className={`count-item undershoot interactive ${highlightMode === 'undershoot' ? 'selected' : ''} ${hideOvershootUndershoot ? 'disabled' : ''}`}
+                        onClick={(e) => !hideOvershootUndershoot && handleHighlightClick('undershoot', e)}
+                        role="button"
+                        tabIndex={hideOvershootUndershoot ? -1 : 0}
+                      >
+                        <span className="count-value">{hideOvershootUndershoot ? 0 : metrics.undershootCount}</span>
+                        <span className="count-label">Undershot</span>
+                      </div>
+                      <div
+                        className={`count-item overshoot interactive ${highlightMode === 'overshoot' ? 'selected' : ''} ${hideOvershootUndershoot ? 'disabled' : ''}`}
+                        onClick={(e) => !hideOvershootUndershoot && handleHighlightClick('overshoot', e)}
+                        role="button"
+                        tabIndex={hideOvershootUndershoot ? -1 : 0}
+                      >
+                        <span className="count-value">{hideOvershootUndershoot ? 0 : metrics.overshootCount}</span>
+                        <span className="count-label">Overshot</span>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -597,14 +636,14 @@ export function BenchmarkReportViewer({
                   style={{ cursor: 'pointer' }}
                 >
                   <div className="venn-region-label interactive">
-                    Target Codes
+                    Missed
                   </div>
                   <div className="venn-codes">
                     {groupedOutcomes.missed.map(outcome => (
                       <span
                         key={outcome.expectedCode}
-                        className={`venn-code-tag expected-region ${highlightMode === 'expected' ? 'highlighted' : ''} ${highlightMode === 'undershoot' || highlightMode === 'overshoot' ? 'muted' : ''}`}
-                        title={`${getNodeLabel(outcome.expectedCode)}\nStatus: Missed Decision`}
+                        className={`venn-code-tag expected-region ${highlightMode === 'missed' ? 'highlighted' : ''} ${highlightMode === 'matched' || highlightMode === 'undershoot' || highlightMode === 'overshoot' || highlightMode === 'shared' || highlightMode === 'other' ? 'muted' : ''}`}
+                        title={`${getNodeLabel(outcome.expectedCode)}\nStatus: Missed`}
                         onClick={(e) => { e.stopPropagation(); onCodeClick?.(outcome.expectedCode); }}
                       >
                         {outcome.expectedCode}
@@ -629,7 +668,7 @@ export function BenchmarkReportViewer({
                         {interimTarget.map(n => (
                           <span
                             key={n.id}
-                            className={`venn-code-tag expected-region dimmed-interim ${highlightMode === 'expected' ? 'highlighted' : ''}`}
+                            className={`venn-code-tag expected-region dimmed-interim ${highlightMode === 'missed' ? 'highlighted' : ''}`}
                             title={`${n.label}\nStatus: Expected Path`}
                             onClick={(e) => { e.stopPropagation(); onCodeClick?.(n.id); }}
                           >
@@ -649,13 +688,13 @@ export function BenchmarkReportViewer({
                   style={{ cursor: 'pointer' }}
                 >
                   <div className="venn-region-label interactive">
-                    Shared Codes
+                    Correct
                   </div>
                   <div className="venn-codes">
                     {groupedOutcomes.exact.map(outcome => (
                       <span
                         key={outcome.expectedCode}
-                        className={`venn-code-tag intersection-region exact ${highlightMode === 'matched' || highlightMode === 'traversed' ? 'highlighted' : ''} ${highlightMode === 'undershoot' || highlightMode === 'overshoot' ? 'muted' : ''}`}
+                        className={`venn-code-tag intersection-region exact ${highlightMode === 'matched' || highlightMode === 'shared' ? 'highlighted' : ''} ${highlightMode === 'undershoot' || highlightMode === 'overshoot' || highlightMode === 'missed' || highlightMode === 'other' ? 'muted' : ''}`}
                         title={`${getNodeLabel(outcome.expectedCode)}\nStatus: Matched`}
                         onClick={(e) => { e.stopPropagation(); onCodeClick?.(outcome.expectedCode); }}
                       >
@@ -665,8 +704,8 @@ export function BenchmarkReportViewer({
                     {groupedOutcomes.undershoot.map(outcome => (
                       <span
                         key={outcome.expectedCode}
-                        className={`venn-code-tag intersection-region undershoot ${highlightMode === 'traversed' || highlightMode === 'undershoot' ? 'highlighted' : ''} ${highlightMode === 'overshoot' ? 'muted' : ''}`}
-                        title={`${getNodeLabel(outcome.relatedCode || outcome.expectedCode)}\nStatus: Undershoot (expected ${outcome.expectedCode})`}
+                        className={`venn-code-tag intersection-region undershoot ${highlightMode === 'undershoot' || highlightMode === 'shared' ? 'highlighted' : ''} ${highlightMode === 'matched' || highlightMode === 'overshoot' || highlightMode === 'missed' || highlightMode === 'other' ? 'muted' : ''}`}
+                        title={`${getNodeLabel(outcome.relatedCode || outcome.expectedCode)}\nStatus: Undershot (expected ${outcome.expectedCode})`}
                         onClick={(e) => { e.stopPropagation(); onCodeClick?.(outcome.relatedCode ?? outcome.expectedCode); }}
                       >
                         {outcome.relatedCode || outcome.expectedCode}
@@ -691,7 +730,7 @@ export function BenchmarkReportViewer({
                         {interimShared.map(n => (
                           <span
                             key={n.id}
-                            className={`venn-code-tag intersection-region dimmed-interim ${highlightMode === 'traversed' || highlightMode === 'undershoot' ? 'highlighted' : ''}`}
+                            className={`venn-code-tag intersection-region dimmed-interim ${highlightMode === 'shared' ? 'highlighted' : ''}`}
                             title={`${n.label}\nStatus: Traversed Path`}
                             onClick={(e) => { e.stopPropagation(); onCodeClick?.(n.id); }}
                           >
@@ -711,14 +750,14 @@ export function BenchmarkReportViewer({
                   style={{ cursor: 'pointer' }}
                 >
                   <div className="venn-region-label interactive">
-                    Benchmark Codes
+                    Extra
                   </div>
                   <div className="venn-codes">
                     {groupedOutcomes.overshoot.map(outcome => (
                       <span
                         key={outcome.expectedCode}
-                        className={`venn-code-tag benchmark-region overshoot ${highlightMode === 'overshoot' ? 'highlighted' : ''} ${highlightMode === 'undershoot' ? 'muted' : ''}`}
-                        title={`${getNodeLabel(outcome.relatedCode || outcome.expectedCode)}\nStatus: Overshoot (expected ${outcome.expectedCode})`}
+                        className={`venn-code-tag benchmark-region overshoot ${highlightMode === 'overshoot' || highlightMode === 'other' ? 'highlighted' : ''} ${highlightMode === 'matched' || highlightMode === 'undershoot' || highlightMode === 'missed' || highlightMode === 'shared' ? 'muted' : ''}`}
+                        title={`${getNodeLabel(outcome.relatedCode || outcome.expectedCode)}\nStatus: Overshot (expected ${outcome.expectedCode})`}
                         onClick={(e) => { e.stopPropagation(); onCodeClick?.(outcome.relatedCode ?? outcome.expectedCode); }}
                       >
                         {outcome.relatedCode || outcome.expectedCode}
@@ -727,8 +766,8 @@ export function BenchmarkReportViewer({
                     {metrics && metrics.otherCodes.map(code => (
                       <span
                         key={code}
-                        className={`venn-code-tag benchmark-region other ${highlightMode === 'undershoot' || highlightMode === 'overshoot' ? 'muted' : ''}`}
-                        title={`${getNodeLabel(code)}\nStatus: Alternative Pathway`}
+                        className={`venn-code-tag benchmark-region other ${highlightMode === 'other' ? 'highlighted' : ''} ${highlightMode === 'matched' || highlightMode === 'undershoot' || highlightMode === 'overshoot' || highlightMode === 'missed' || highlightMode === 'shared' ? 'muted' : ''}`}
+                        title={`${getNodeLabel(code)}\nStatus: Extra`}
                         onClick={(e) => { e.stopPropagation(); onCodeClick?.(code); }}
                       >
                         {code}
@@ -753,7 +792,7 @@ export function BenchmarkReportViewer({
                         {interimBenchmark.map(n => (
                           <span
                             key={n.id}
-                            className={`venn-code-tag benchmark-region dimmed-interim ${highlightMode === 'overshoot' ? 'highlighted' : ''}`}
+                            className={`venn-code-tag benchmark-region dimmed-interim ${highlightMode === 'other' ? 'highlighted' : ''}`}
                             title={`${n.label}\nStatus: Traversed Path`}
                             onClick={(e) => { e.stopPropagation(); onCodeClick?.(n.id); }}
                           >
@@ -776,16 +815,15 @@ export function BenchmarkReportViewer({
 
       {/* Empty State - only show when no expected codes and no metrics */}
       {!hasExpectedCodes && !metrics && status === 'idle' && (
-        <div className="empty-state">
-          <span className="empty-icon">📊</span>
-          <span className="empty-text">No benchmark data yet</span>
-          <span className="empty-hint">Add expected codes and run a benchmark to see results</span>
+        <div className="trajectory-empty">
+          <div className="empty-text">No benchmark data yet</div>
+          <div className="empty-hint">Add expected codes and run a benchmark to see results</div>
         </div>
       )}
 
       {/* Loading State */}
       {status === 'traversing' && !metrics && (
-        <div className="loading-state">
+        <div className="trajectory-empty loading-state">
           <div className="spinner" />
           <span>Running benchmark...</span>
         </div>

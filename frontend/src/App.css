@@ -4,14 +4,20 @@
 
 :root {
   --primary: #6366f1;
+  --accent-color: #6366f1;
   --success: #22c55e;
   --warning: #f59e0b;
   --error: #ef4444;
   --text: #1e293b;
+  --text-primary: #1e293b;
+  --text-secondary: #64748b;
   --text-muted: #64748b;
   --bg: #f8fafc;
+  --bg-primary: #f8fafc;
+  --bg-secondary: #f1f5f9;
   --card-bg: #ffffff;
   --border: #e2e8f0;
+  --border-color: #e2e8f0;
   --header-height: 3rem;
   --sidebar-width: 320px;
   --sidebar-collapsed-width: 24px;
@@ -29,6 +35,41 @@ button:focus,
 button:focus-visible {
   outline: none;
   box-shadow: none;
+}
+
+/* Global: Checkbox styling - unchecked background matches sidebar */
+input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 1rem;
+  height: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  background: var(--card-bg);
+  cursor: pointer;
+  position: relative;
+}
+
+input[type="checkbox"]:checked {
+  background: var(--primary);
+  border-color: var(--primary);
+}
+
+input[type="checkbox"]:checked::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid white;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+input[type="checkbox"]:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* Main Layout: sidebar overlays main content */
@@ -184,12 +225,20 @@ button:focus-visible {
 
 /* Sidebar Tab Content */
 .sidebar-tab-content {
-  padding: 1rem 0 0.5rem 0;
+  padding: 0.25rem 0 0.5rem 0;
   flex: 1;
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* Scrollable container for LLM settings */
+.llm-settings-scroll-container {
+  flex: 1;
   overflow-y: auto;
+  min-height: 0;
 }
 
 /* Remove focus outline for interactive elements in sidebar */
@@ -274,7 +323,8 @@ button:focus-visible {
 }
 
 .add-btn:disabled {
-  background: var(--text-muted);
+  background: #e2e8f0;
+  color: #94a3b8;
   cursor: not-allowed;
 }
 
@@ -283,7 +333,7 @@ button:focus-visible {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  padding: 0 1rem;
+  padding: 0 1rem 0.5rem;
 }
 
 .input-label {
@@ -458,7 +508,7 @@ button:focus-visible {
 
 /* Sidebar Actions */
 .sidebar-actions {
-  padding: 1rem;
+  padding: 0.5rem 1rem;
   display: flex;
   gap: 0.5rem;
 }
@@ -480,7 +530,8 @@ button:focus-visible {
 }
 
 .primary-btn:disabled {
-  background: var(--text-muted);
+  background: #e2e8f0;
+  color: #94a3b8;
   cursor: not-allowed;
 }
 
@@ -497,6 +548,70 @@ button:focus-visible {
 
 .cancel-btn:hover {
   background: #dc2626;
+}
+
+.secondary-btn {
+  padding: 0.625rem 1rem;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.secondary-btn:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.secondary-btn:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.cache-header-label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+
+.setting-row.cache-row {
+  display: flex;
+  flex-direction: row !important;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 0.75rem;
+}
+
+.clear-cache-btn {
+  font-size: 0.7rem;
+  padding: 0.25rem 0.5rem;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  font-weight: 500;
+}
+
+.clear-cache-btn:focus,
+.clear-cache-btn:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.clear-cache-btn:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.clear-cache-btn:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 /* Setting Rows */
@@ -601,40 +716,6 @@ button:focus-visible {
   color: var(--text);
 }
 
-.scaffolded-toggle input[type="checkbox"] {
-  width: 1rem;
-  height: 1rem;
-  accent-color: var(--primary);
-  cursor: pointer;
-  -webkit-appearance: none;
-  appearance: none;
-  background: var(--card-bg);
-  border: 1px solid var(--border);
-  border-radius: 0.25rem;
-  position: relative;
-}
-
-.scaffolded-toggle input[type="checkbox"]:checked {
-  background: var(--primary);
-  border-color: var(--primary);
-}
-
-.scaffolded-toggle input[type="checkbox"]:checked::after {
-  content: '';
-  position: absolute;
-  left: 4px;
-  top: 1px;
-  width: 4px;
-  height: 8px;
-  border: solid white;
-  border-width: 0 2px 2px 0;
-  transform: rotate(45deg);
-}
-
-.scaffolded-toggle input[type="checkbox"]:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
 
 .scaffolded-toggle span {
   font-weight: 500;
@@ -718,7 +799,37 @@ button:focus-visible {
   cursor: not-allowed;
 }
 
-/* Infer Precursor Nodes Toggle (checkbox style, right-aligned) */
+/* Trajectory section with integrated Infer Precursor Nodes */
+.trajectory-section {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.5rem;
+}
+
+.trajectory-section > label:first-child {
+  margin-bottom: 0;
+}
+
+.infer-precursor-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-size: 0.875rem;
+  color: var(--text);
+  margin: 0.25rem 0;
+}
+
+.infer-precursor-toggle span {
+  font-weight: 500;
+}
+
+.infer-precursor-toggle input[type="checkbox"] {
+  cursor: pointer;
+}
+
+/* Legacy visualize toggle styles (may still be used elsewhere) */
 .visualize-row {
   margin-top: 0.25rem !important;
   margin-bottom: 0 !important;
@@ -733,41 +844,6 @@ button:focus-visible {
   cursor: pointer;
   font-size: 0.875rem;
   color: var(--text);
-}
-
-.visualize-toggle input[type="checkbox"] {
-  width: 1rem;
-  height: 1rem;
-  accent-color: var(--primary);
-  cursor: pointer;
-  -webkit-appearance: none;
-  appearance: none;
-  background: var(--card-bg);
-  border: 1px solid var(--border);
-  border-radius: 0.25rem;
-  position: relative;
-}
-
-.visualize-toggle input[type="checkbox"]:checked {
-  background: var(--primary);
-  border-color: var(--primary);
-}
-
-.visualize-toggle input[type="checkbox"]:checked::after {
-  content: '';
-  position: absolute;
-  left: 4px;
-  top: 1px;
-  width: 4px;
-  height: 8px;
-  border: solid white;
-  border-width: 0 2px 2px 0;
-  transform: rotate(45deg);
-}
-
-.visualize-toggle input[type="checkbox"]:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
 }
 
 .visualize-toggle span {
@@ -1203,12 +1279,18 @@ button:focus-visible {
 /* Shared View Header Bar (used by Graph and Trajectory views) */
 .view-header-bar {
   display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  padding: 0.75rem 1rem;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.5rem 1rem 0.75rem 1rem;
   border-bottom: 1px solid var(--border);
   background: var(--bg);
   flex-shrink: 0;
+}
+
+.view-header-top-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
 }
 
 .view-status-section {
@@ -1218,7 +1300,9 @@ button:focus-visible {
 }
 
 .view-status-section .status-line,
-.view-status-section .report-line {
+.view-status-section .report-line,
+.view-header-bar .status-line,
+.view-header-bar .report-line {
   display: flex;
   gap: 0.5rem;
   align-items: center;
@@ -1508,9 +1592,14 @@ button:focus-visible {
   transition: all 0.15s ease;
 }
 
-.action-btn:hover {
+.action-btn:hover:not(:disabled) {
   background: var(--border);
   color: var(--text);
+}
+
+.action-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .trajectory-list {
@@ -2286,6 +2375,26 @@ button:focus-visible {
   gap: 0.375rem;
 }
 
+.count-grid.two-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+}
+
+.count-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.375rem;
+}
+
+.count-row.column-level .count-item {
+  background: var(--surface);
+}
+
+.count-row.code-level .count-item {
+  background: var(--card-bg);
+}
+
 .count-item {
   display: flex;
   flex-direction: column;
@@ -2768,36 +2877,50 @@ button:focus-visible {
   font-style: italic;
 }
 
-/* Benchmark Metrics Line in Header */
-.benchmark-metrics-line {
-  display: flex;
-  flex-wrap: wrap;
+/* Benchmark outcome counts in status line */
+.benchmark-outcome-counts {
+  display: inline-flex;
+  align-items: center;
   gap: 0.5rem;
+  margin-left: 0.75rem;
 }
 
-.benchmark-stat {
+.benchmark-outcome-counts .benchmark-stat {
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
+  color: var(--text-primary); /* numbers in black */
 }
 
-.benchmark-stat.exact {
-  color: #16a34a;
+.benchmark-outcome-counts .outcome-label {
+  font-weight: 500;
 }
 
-/* green */
-.benchmark-stat.overshoot {
-  color: #dc2626;
+.benchmark-outcome-counts .benchmark-stat.exact .outcome-label {
+  color: #16a34a; /* green */
 }
 
-/* red */
-.benchmark-stat.undershoot {
-  color: #f59e0b;
+.benchmark-outcome-counts .benchmark-stat.overshoot .outcome-label {
+  color: #6366f1; /* periwinkle/indigo */
 }
 
-/* amber */
-.benchmark-stat.missed {
-  color: #6366f1;
+.benchmark-outcome-counts .benchmark-stat.undershoot .outcome-label {
+  color: #f59e0b; /* amber */
+}
+
+/* Benchmark scores in report line */
+.benchmark-scores {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.benchmark-score {
+  color: var(--text-secondary);
+}
+
+.benchmark-score strong {
+  color: var(--text-primary);
 }
 
 /* periwinkle */
@@ -3374,6 +3497,119 @@ button:focus-visible {
   cursor: not-allowed;
 }
 
+/* =========================================
+   Confirm Modal Styles
+   ========================================= */
+
+.confirm-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.confirm-modal-content {
+  background: var(--card-bg);
+  border-radius: 8px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.2);
+  max-width: 400px;
+  width: 90%;
+  display: flex;
+  flex-direction: column;
+}
+
+.confirm-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.confirm-modal-header h2 {
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.confirm-modal-close-btn {
+  background: none;
+  border: none;
+  font-size: 1.5rem;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 0;
+}
+
+.confirm-modal-close-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+.confirm-modal-body {
+  padding: 1.25rem;
+}
+
+.confirm-modal-body p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.9375rem;
+  line-height: 1.5;
+}
+
+.confirm-modal-actions {
+  display: flex;
+  justify-content: center;
+  gap: 1rem;
+  padding: 1rem 1.25rem;
+  border-top: 1px solid var(--border);
+}
+
+.confirm-modal-cancel-btn,
+.confirm-modal-confirm-btn {
+  flex: 1;
+  max-width: 120px;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.confirm-modal-cancel-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+}
+
+.confirm-modal-cancel-btn:hover:not(:disabled) {
+  background: var(--bg-secondary);
+}
+
+.confirm-modal-confirm-btn {
+  background: var(--primary);
+  border: 1px solid var(--primary);
+  color: white;
+}
+
+.confirm-modal-confirm-btn:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.confirm-modal-confirm-btn:disabled,
+.confirm-modal-cancel-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* =================================================================
    SYSTEM PROMPT ACCORDION STYLES
    ================================================================= */
@@ -3503,18 +3739,6 @@ button:focus-visible {
   align-items: center;
   gap: 0.5rem;
   cursor: pointer;
-}
-
-.scaffolded-checkbox-group input[type="checkbox"] {
-  width: 1rem;
-  height: 1rem;
-  accent-color: var(--primary);
-  cursor: pointer;
-}
-
-.scaffolded-checkbox-group input[type="checkbox"]:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
 }
 
 .scaffolded-checkbox-group .checkbox-label {

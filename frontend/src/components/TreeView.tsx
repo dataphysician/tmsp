@@ -202,6 +202,27 @@ export function TreeView({
     return codeSortMode === 'desc' ? sorted.reverse() : sorted;
   }, [highlightedCodes, codeSortMode]);
 
+  // Compute set of all nodes that have children (expandable nodes)
+  const allExpandableNodes = useMemo(() => {
+    if (!tree) return new Set<string>();
+    const expandable = new Set<string>();
+    const collect = (node: TreeNode) => {
+      if (node.children.length > 0) {
+        expandable.add(node.code);
+      }
+      node.children.forEach(collect);
+    };
+    collect(tree);
+    return expandable;
+  }, [tree]);
+
+  // Expand All disabled when all expandable nodes are already expanded
+  const isAllExpanded = allExpandableNodes.size > 0 &&
+    [...allExpandableNodes].every(code => expandedNodes.has(code));
+
+  // Collapse All disabled when only ROOT is expanded (default state)
+  const isFullyCollapsed = expandedNodes.size === 1 && expandedNodes.has('ROOT');
+
   const toggleNode = (code: string) => {
     setExpandedNodes(prev => {
       const next = new Set(prev);
@@ -258,8 +279,8 @@ export function TreeView({
       {showTree && (
         <>
           <div className="trajectory-actions">
-            <button onClick={expandAll} className="action-btn">Expand All</button>
-            <button onClick={collapseAll} className="action-btn">Collapse All</button>
+            <button onClick={expandAll} className="action-btn" disabled={isAllExpanded}>Expand All</button>
+            <button onClick={collapseAll} className="action-btn" disabled={isFullyCollapsed}>Collapse All</button>
           </div>
 
           <div className="trajectory-tree">

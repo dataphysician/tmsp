@@ -212,26 +212,24 @@ Requires Node.js (v18+).
 ```bash
 cd frontend
 npm install
+npm run build
 ```
 
 ## Usage
 
-### Run the Backend Server
+### Run the Server
 
 ```bash
 uv run tmsp-server
-# or
-uv run python -m server
 ```
 
-### Run the Frontend Dev Server
+The application runs at `http://localhost:8000`.
+
+To use a different port:
 
 ```bash
-cd frontend
-npm run dev
+uv run tmsp-server --port 8080
 ```
-
-The frontend runs at `http://localhost:3000`. Make sure the backend server is running first.
 
 ### Programmatic API
 

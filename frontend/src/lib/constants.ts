@@ -13,6 +13,7 @@ export type FeatureTab = (typeof FEATURE_TABS)[keyof typeof FEATURE_TABS];
 export const VIEW_TABS = {
   GRAPH: 'graph',
   TRAJECTORY: 'trajectory',
+  REPORT: 'report',
 } as const;
 
 export type ViewTab = (typeof VIEW_TABS)[keyof typeof VIEW_TABS];
@@ -21,6 +22,7 @@ export type ViewTab = (typeof VIEW_TABS)[keyof typeof VIEW_TABS];
 export const SIDEBAR_TABS = {
   CLINICAL_NOTE: 'clinical-note',
   LLM_SETTINGS: 'llm-settings',
+  BENCHMARK_SETUP: 'benchmark-setup',
 } as const;
 
 export type SidebarTab = (typeof SIDEBAR_TABS)[keyof typeof SIDEBAR_TABS];
@@ -128,6 +130,7 @@ export const INITIAL_TRAVERSAL_STATE: TraversalState = {
   status: 'idle',
   current_step: '',
   error: null,
+  wasZeroShot: false,
 };
 
 // Default LLM system prompt (must match backend candidate_selector/selector.py LLM_SYSTEM_PROMPT)

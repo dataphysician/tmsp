@@ -167,10 +167,10 @@ export function useAGUIStream(
         break;
 
       case 'STATE_SNAPSHOT':
-        if (event.state) {
+        if (event.snapshot) {
           callbacks.onSnapshot?.(
-            event.state.nodes as GraphNode[],
-            event.state.edges as GraphEdge[]
+            event.snapshot.nodes as GraphNode[],
+            event.snapshot.edges as GraphEdge[]
           );
         }
         break;
@@ -184,28 +184,29 @@ export function useAGUIStream(
         break;
 
       case 'STEP_STARTED':
-        callbacks.onStepStart?.(event.step_id || '');
+        callbacks.onStepStart?.(event.stepName || '');
         break;
 
       case 'STEP_FINISHED':
         if (event.metadata) {
           const result = processStepFinished(
             event.metadata as unknown as StepMetadata,
-            event.step_id
+            event.stepName
           );
           callbacks.onStepFinish?.(result);
         }
         break;
 
-      case 'RUN_FINISHED':
-        if (event.metadata?.error) {
-          callbacks.onError?.(event.metadata.error as string);
-        } else {
-          const finalNodesRaw = (event.metadata?.final_nodes || []) as string[];
-          const finalNodes = [...new Set(finalNodesRaw)];
-          callbacks.onComplete?.(finalNodes);
-        }
+      case 'RUN_ERROR':
+        callbacks.onError?.(event.error);
         break;
+
+      case 'RUN_FINISHED': {
+        const finalNodesRaw = (event.metadata?.final_nodes ?? []) as string[];
+        const finalNodes = [...new Set(finalNodesRaw)];
+        callbacks.onComplete?.(finalNodes);
+        break;
+      }
     }
   }, [callbacks, getCurrentState]);
 

@@ -60,8 +60,10 @@ def generate_traversal_cache_key(
     model: str | None,
     temperature: float,
     system_prompt: str | None = None,
+    use_cache: bool = True,
+    cache_version: int = 0,
 ) -> str:
-    """Generate a deterministic cache key for scaffolded traversal.
+    """Generate a cache key for scaffolded traversal.
 
     The key is based on all inputs that affect the LLM responses during traversal.
     Different clinical notes or model configurations produce different keys,
@@ -73,10 +75,16 @@ def generate_traversal_cache_key(
         model: Model name (None uses provider default)
         temperature: Temperature setting
         system_prompt: Custom system prompt (if any)
+        use_cache: If True, generate deterministic key (may hit cache).
+                   If False, add datetime to make key unique (never hits cache).
+        cache_version: Version number for soft invalidation. Incrementing this
+                       creates a new cache slot, orphaning old entries without deletion.
 
     Returns:
         A hash string to use as partition_key (e.g., "scaffolded_a1b2c3d4e5f6g7h8")
     """
+    from datetime import datetime
+
     # Normalize inputs
     normalized = {
         "clinical_note": clinical_note.strip(),
@@ -86,12 +94,17 @@ def generate_traversal_cache_key(
         "system_prompt": (system_prompt or "").strip(),
     }
 
-    # Create deterministic string representation
+    # Create deterministic string representation with version
     key_str = (
         f"{normalized['provider']}|{normalized['model']}|"
         f"{normalized['temperature']}|"
-        f"{normalized['system_prompt']}|{normalized['clinical_note']}"
+        f"{normalized['system_prompt']}|{normalized['clinical_note']}|"
+        f"v{cache_version}"
     )
+
+    # Add datetime for unique key when caching is disabled
+    if not use_cache:
+        key_str += f"|{datetime.now().isoformat()}"
 
     # Hash for shorter key
     key_hash = hashlib.sha256(key_str.encode()).hexdigest()[:16]
@@ -143,36 +156,48 @@ async def cleanup_persister() -> None:
 
 async def delete_persisted_state(
     partition_key: str,
-    app_id: str = "ROOT",
+    app_id: str | None = "ROOT",
     db_path: str = "./cache.db",
     table_name: str = "burr_state",
 ) -> bool:
-    """Delete a specific persisted state entry.
+    """Delete persisted state entries.
 
     Use this when a traversal is cancelled or reset to ensure a fresh run.
 
     Args:
-        partition_key: The partition key of the entry to delete
-        app_id: Application identifier (default: "ROOT")
+        partition_key: The partition key of the entries to delete
+        app_id: Application identifier. If None, deletes ALL entries for partition_key
+                (ROOT + all subgraphs). Default: "ROOT"
         db_path: Path to SQLite database file
         table_name: Table name for state storage
 
     Returns:
-        True if entry was deleted, False if not found or error
+        True if any entries were deleted, False if not found or error
     """
     import aiosqlite
 
     try:
         async with aiosqlite.connect(db_path) as db:
-            cursor = await db.execute(
-                f"DELETE FROM {table_name} WHERE partition_key = ? AND app_id = ?",
-                (partition_key, app_id),
-            )
+            if app_id is None:
+                # Delete ALL entries for this partition_key (ROOT + subgraphs)
+                cursor = await db.execute(
+                    f"DELETE FROM {table_name} WHERE partition_key = ?",
+                    (partition_key,),
+                )
+            else:
+                # Delete specific app_id entry
+                cursor = await db.execute(
+                    f"DELETE FROM {table_name} WHERE partition_key = ? AND app_id = ?",
+                    (partition_key, app_id),
+                )
             await db.commit()
-            deleted = cursor.rowcount > 0
-            if deleted:
-                print(f"[PERSISTER] Deleted entry: partition_key={partition_key}, app_id={app_id}")
-            return deleted
+            deleted_count = cursor.rowcount
+            if deleted_count > 0:
+                if app_id is None:
+                    print(f"[PERSISTER] Deleted {deleted_count} entries for partition_key={partition_key}")
+                else:
+                    print(f"[PERSISTER] Deleted entry: partition_key={partition_key}, app_id={app_id}")
+            return deleted_count > 0
     except Exception as e:
         print(f"[PERSISTER] Error deleting entry: {e}")
         return False
@@ -382,7 +407,17 @@ async def build_app(
             state_dict = cached_state.get("state", {})
             final_nodes = state_dict.get("final_nodes", [])
 
-            if final_nodes:  # Non-empty final_nodes indicates completed run
+            if not final_nodes:
+                # Incomplete cache (e.g., from a cancelled run) - delete it to prevent
+                # Burr from auto-resuming. Without this, Burr's persister would override
+                # the fresh .with_state() initialization with the partial cached state.
+                print(f"[BUILD_APP] Deleting incomplete cache (empty final_nodes) for partition_key={partition_key}")
+                await delete_persisted_state(
+                    partition_key=partition_key,
+                    app_id=app_id,
+                )
+            else:
+                # Non-empty final_nodes indicates completed run - use cache
                 print(f"\n{'=' * 60}")
                 print("[BUILD_APP] CACHE HIT!")
                 print(f"  partition_key: {partition_key}")
@@ -432,6 +467,8 @@ async def build_app(
             finish=finish,
         )
         .with_transitions(
+            # Cancel check - FIRST/highest priority
+            ("load_node", "finish", expr("cancelled == True")),
             # Cache hit -> exit early
             (
                 "load_node",
@@ -477,6 +514,7 @@ async def build_app(
             default_selector=default_selector,
             final_nodes=[],
             pending_feedback=None,  # Set by inject_feedback during rewind
+            cancelled=False,  # Cancel flag for state transitions
         )
     )
 

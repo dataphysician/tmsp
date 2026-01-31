@@ -1010,6 +1010,80 @@ export function calculatePositions(
     }
   }
 
+  // ===== PHASE 10: Same-row collision resolution =====
+  // After all positioning, check for any nodes at the same Y that overlap horizontally
+  // This handles edge cases where lateral links or rewind operations cause collisions
+  const resolveRowCollisions = () => {
+    // Group nodes by Y position (with small tolerance for floating point)
+    const nodesByRow = new Map<number, Array<{ id: string; x: number }>>();
+
+    for (const [nodeId, pos] of positions.entries()) {
+      if (nodeId === 'ROOT') continue;
+
+      // Round Y to handle floating point precision
+      const rowY = Math.round(pos.y);
+      if (!nodesByRow.has(rowY)) {
+        nodesByRow.set(rowY, []);
+      }
+      nodesByRow.get(rowY)!.push({ id: nodeId, x: pos.x });
+    }
+
+    let anyShifted = false;
+
+    // For each row, sort by X and resolve overlaps
+    for (const [_rowY, nodesInRow] of nodesByRow.entries()) {
+      if (nodesInRow.length < 2) continue;
+
+      // Sort by X position
+      nodesInRow.sort((a, b) => a.x - b.x);
+
+      // Check each pair for collision
+      for (let i = 0; i < nodesInRow.length - 1; i++) {
+        const leftNode = nodesInRow[i];
+        const rightNode = nodesInRow[i + 1];
+
+        // Calculate minimum required gap (node width + padding)
+        const minGapRequired = layoutWidth + nodePadding;
+        const actualGap = rightNode.x - leftNode.x;
+
+        if (actualGap < minGapRequired) {
+          // Collision detected - shift ALL remaining nodes on this row (not just rightNode)
+          // This prevents cascading collisions within the same row
+          const shiftNeeded = minGapRequired - actualGap;
+          anyShifted = true;
+
+          // Shift ALL remaining nodes on this row plus their descendants
+          for (let j = i + 1; j < nodesInRow.length; j++) {
+            const nodeToShift = nodesInRow[j];
+            const currentPos = positions.get(nodeToShift.id)!;
+            positions.set(nodeToShift.id, { x: currentPos.x + shiftNeeded, y: currentPos.y });
+            nodeToShift.x = currentPos.x + shiftNeeded;
+
+            // Also shift all descendants
+            const descendants = getAllDescendants(nodeToShift.id);
+            for (const descId of descendants) {
+              const descPos = positions.get(descId);
+              if (descPos) {
+                positions.set(descId, { x: descPos.x + shiftNeeded, y: descPos.y });
+              }
+            }
+          }
+
+          // After shifting all remaining nodes on this row, no need to check
+          // more pairs in this row - they all moved together maintaining gaps
+          break;
+        }
+      }
+    }
+
+    return anyShifted;
+  };
+
+  // Run collision resolution up to 5 passes (shifts may cascade)
+  for (let pass = 0; pass < 5; pass++) {
+    if (!resolveRowCollisions()) break;
+  }
+
   // Log unpositioned nodes
   for (const node of _nodes) {
     if (!positions.has(node.id)) {

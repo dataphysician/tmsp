@@ -47,6 +47,7 @@ export interface TraversalState {
   status: TraversalStatus;
   current_step: string;
   error: string | null;
+  wasZeroShot?: boolean;  // Track if current graph came from zero-shot mode
 }
 
 // Benchmark types
@@ -125,6 +126,7 @@ export interface BenchmarkMetrics {
   traversedCount: number;          // Finalized codes from traversal
   expectedNodesCount: number;      // Total nodes in expected trajectory
   traversedNodesCount: number;     // Total nodes visited during traversal
+  expectedNodesTraversed: number;  // Count of expected nodes that were traversed (intersection)
 
   // Outcome breakdown for expected codes
   exactCount: number;         // Expected codes matched exactly (MATCHED)
@@ -159,4 +161,5 @@ export interface LLMConfig {
   systemPrompt?: string;    // Custom system prompt (uses default if empty)
   scaffolded?: boolean;     // true = tree traversal (default), false = single-shot
   visualizePrediction?: boolean;  // When scaffolded=false, visualize predicted codes as graph
+  persistCache?: boolean;   // true = cache traversals in SQLite (default), false = no caching
 }

@@ -6,7 +6,7 @@ import {
   getDefaultMaxTokens,
 } from '../lib/constants';
 
-const DEFAULT_LLM_CONFIG: LLMConfig = {
+export const DEFAULT_LLM_CONFIG: LLMConfig = {
   provider: 'vertexai',
   apiKey: '',
   model: 'gemini-2.5-flash',

@@ -4,7 +4,7 @@ import type { GraphNode, GraphEdge, TraversalStatus, BenchmarkGraphNode, Benchma
 import { exportSvgToFile, generateSvgFilename } from '../lib/exportSvg';
 import { wrapNodeLabel, formatElapsedTime } from '../lib/textUtils';
 import { calculatePositions } from '../lib/graphPositioning';
-import { createEdgePath, createCurvedEdgePath } from '../lib/edgePaths';
+import { createEdgePath, createCurvedEdgePath, getPointOnStraightEdge, getPointOnCurvedEdge } from '../lib/edgePaths';
 import {
   isFinalizedNode,
   isSevenChrDefFinalizedNode,
@@ -909,43 +909,26 @@ function GraphViewerInner({
         const tgtPos = positions.get(marker.edgeTarget);
         if (!srcPos || !tgtPos) return;
 
-        // Position X a few pixels before the arrowhead on the edge path
-        // For curved edges (when source and target have different x), follow the curve
-        const ARROW_PADDING = 8;
-        const X_OFFSET_BEFORE_ARROW = 35; // Distance along edge before arrowhead
+        // Find the actual edge to determine if it uses curved path
+        // Lateral edges (except sevenChrDef) use curved paths
+        const edge = edges.find(e =>
+          String(e.source) === marker.edgeSource &&
+          String(e.target) === marker.edgeTarget
+        );
+        const isCurvedEdge = edge?.edge_type === 'lateral' && edge?.rule !== 'sevenChrDef';
 
-        // Calculate point on edge path near the arrowhead
-        // The arrowhead is at (tgtPos.x, tgtPos.y - NODE_HEIGHT/2 - ARROW_PADDING)
-        const arrowX = tgtPos.x;
-        const arrowY = tgtPos.y - NODE_HEIGHT / 2 - ARROW_PADDING;
+        // Get point along the actual edge path (near arrowhead)
+        // Use different t values: curved edges can be closer, straight edges need more clearance
+        const markerPos = isCurvedEdge
+          ? getPointOnCurvedEdge(srcPos, tgtPos, NODE_HEIGHT, 0.92)
+          : getPointOnStraightEdge(srcPos, tgtPos, NODE_HEIGHT, 0.85);
 
-        // For lateral (curved) edges, position X along the approach direction
-        // Calculate approach angle from control point to target
-        const dx = tgtPos.x - srcPos.x;
-        if (Math.abs(dx) > NODE_WIDTH) {
-          // This is a curved lateral edge - position X before arrowhead along the curve's approach
-          // The curve approaches from above-left, so offset diagonally
-          const xPos = arrowX - X_OFFSET_BEFORE_ARROW * 0.7;
-          const yPos = arrowY - X_OFFSET_BEFORE_ARROW * 0.5;
-
-          missedGroup.append('path')
-            .attr('d', `M${xPos - 8},${yPos - 8} L${xPos + 8},${yPos + 8} M${xPos + 8},${yPos - 8} L${xPos - 8},${yPos + 8}`)
-            .attr('stroke', '#dc2626')
-            .attr('stroke-width', 3)
-            .attr('fill', 'none')
-            .attr('stroke-linecap', 'round');
-        } else {
-          // Vertical/near-vertical edge - position X directly above arrowhead (closer than lateral)
-          const xPos = arrowX;
-          const yPos = arrowY - 18; // Reduced offset for vertical edges (was X_OFFSET_BEFORE_ARROW = 35)
-
-          missedGroup.append('path')
-            .attr('d', `M${xPos - 8},${yPos - 8} L${xPos + 8},${yPos + 8} M${xPos + 8},${yPos - 8} L${xPos - 8},${yPos + 8}`)
-            .attr('stroke', '#dc2626')
-            .attr('stroke-width', 3)
-            .attr('fill', 'none')
-            .attr('stroke-linecap', 'round');
-        }
+        missedGroup.append('path')
+          .attr('d', `M${markerPos.x - 6},${markerPos.y - 6} L${markerPos.x + 6},${markerPos.y + 6} M${markerPos.x + 6},${markerPos.y - 6} L${markerPos.x - 6},${markerPos.y + 6}`)
+          .attr('stroke', '#dc2626')
+          .attr('stroke-width', 2.5)
+          .attr('fill', 'none')
+          .attr('stroke-linecap', 'round');
       });
     }
 
@@ -1079,7 +1062,7 @@ function GraphViewerInner({
   return (
     <div className="graph-container" ref={containerRef}>
       <div className="view-header-bar">
-        <div className="view-status-section">
+        <div className="view-header-top-row">
           <div className="status-line">
             <span className="status-label">Status:</span>
             {status === 'idle' ? (
@@ -1094,6 +1077,21 @@ function GraphViewerInner({
             {(status === 'complete' || status === 'error') && elapsedTime !== null && (
               <span className="status-elapsed">({formatElapsedTime(elapsedTime)})</span>
             )}
+            {benchmarkMode && benchmarkMetrics && status === 'complete' && (
+              <span className="benchmark-outcome-counts">
+                <span className="benchmark-stat exact">
+                  {benchmarkMetrics.exactCount} <span className="outcome-label">matched</span>
+                </span>
+                <span className="stat-separator">·</span>
+                <span className="benchmark-stat undershoot">
+                  {benchmarkMetrics.undershootCount} <span className="outcome-label">undershot</span>
+                </span>
+                <span className="stat-separator">·</span>
+                <span className="benchmark-stat overshoot">
+                  {benchmarkMetrics.overshootCount} <span className="outcome-label">overshot</span>
+                </span>
+              </span>
+            )}
             {status === 'error' && errorMessage && (
               <span className="status-message">{errorMessage}</span>
             )}
@@ -1101,107 +1099,85 @@ function GraphViewerInner({
               <span className="status-message">{currentStep}</span>
             )}
           </div>
-          {benchmarkMode && benchmarkMetrics ? (
-            <div className="report-line benchmark-metrics-line">
-              <span className="report-label">Benchmark:</span>
-              <span className="report-stats">
-                <span className="benchmark-stat exact">
-                  <strong>{benchmarkMetrics.exactCount}</strong> matched final code
-                </span>
-                <span className="stat-separator">·</span>
-                <span className="benchmark-stat undershoot">
-                  <strong>{benchmarkMetrics.undershootCount}</strong> undershot final code
-                </span>
-                <span className="stat-separator">·</span>
-                <span className="benchmark-stat overshoot">
-                  <strong>{benchmarkMetrics.overshootCount}</strong> overshot final code
-                </span>
-                <span className="stat-separator">·</span>
-                <span className="benchmark-stat missed">
-                  <strong>{benchmarkMetrics.missedCount}</strong> missed decisions
-                </span>
-                {benchmarkMetrics.otherCount > 0 && (
-                  <>
-                    <span className="stat-separator">·</span>
-                    <span className="benchmark-stat other">
-                      <strong>{benchmarkMetrics.otherCount}</strong> other trajectories
-                    </span>
-                  </>
-                )}
-                <span className="stat-separator">|</span>
-                <span className="benchmark-score">
-                  Traversal Recall: <strong>{(benchmarkMetrics.traversalRecall * 100).toFixed(1)}%</strong>
-                </span>
-                <span className="stat-separator">·</span>
-                <span className="benchmark-score">
-                  Final Codes Recall: <strong>{(benchmarkMetrics.finalCodesRecall * 100).toFixed(1)}%</strong>
-                </span>
-              </span>
-            </div>
-          ) : benchmarkMode && !benchmarkMetrics && nodeCount > 0 ? (
-            // Benchmark mode: before or during traversal
-            <div className="report-line">
-              <span className="report-label">Report:</span>
-              <span className="report-stats">
-                {status === 'idle' ? (
-                  // Before traversal: show target nodes count
-                  <>
-                    <strong>{nodeCount}</strong> target nodes
-                  </>
-                ) : (
-                  // During traversal: show intersecting traversed nodes count
-                  <>
-                    <strong>
-                      {(nodes as BenchmarkGraphNode[]).filter(
-                        n => n.benchmarkStatus === 'traversed' || n.benchmarkStatus === 'matched'
-                      ).length}
-                    </strong> nodes traversed
-                    <span className="stat-separator">·</span>
-                    <strong>{nodeCount}</strong> target nodes
-                  </>
-                )}
-              </span>
-            </div>
-          ) : (nodeCount > 0 || finalizedCodes.length > 0 || decisionCount > 0) && (
-            <div className="report-line">
-              <span className="report-label">Report:</span>
-              <span className="report-stats">
-                {finalizedCodes.length > 0 && status === 'complete' && (
-                  <>
-                    <strong>{finalizedCodes.length}</strong> codes finalized
-                  </>
-                )}
-                {finalizedCodes.length > 0 && status === 'complete' && nodeCount > 0 && (
-                  <span className="stat-separator">·</span>
-                )}
-                {nodeCount > 0 && (
-                  <>
-                    <strong>{nodeCount}</strong> nodes explored
-                  </>
-                )}
-                {(nodeCount > 0 || (finalizedCodes.length > 0 && status === 'complete')) && decisionCount > 0 && (
-                  <span className="stat-separator">·</span>
-                )}
-                {decisionCount > 0 && (
-                  <>
-                    <strong>{decisionCount}</strong> decisions made
-                  </>
-                )}
-              </span>
-            </div>
-          )}
+          <button
+            className="export-btn"
+            onClick={handleExportSvg}
+            title="Export as SVG"
+            disabled={
+              nodes.length === 0 ||
+              (benchmarkMode && status !== 'complete' && status !== 'error')
+            }
+          >
+            Export SVG
+          </button>
         </div>
-        <button
-          className="export-btn"
-          onClick={handleExportSvg}
-          title="Export as SVG"
-          disabled={
-            nodes.length === 0 ||
-            (benchmarkMode && status !== 'complete' && status !== 'error')
-          }
-        >
-          Export SVG
-        </button>
+        {benchmarkMode && benchmarkMetrics ? (
+          <div className="report-line">
+            <span className="report-label">Benchmark:</span>
+            <span className="benchmark-scores">
+              <span className="benchmark-score">
+                Traversal Recall: <strong>{(benchmarkMetrics.traversalRecall * 100).toFixed(1)}%</strong>
+                {' '}({benchmarkMetrics.expectedNodesTraversed}/{benchmarkMetrics.expectedNodesCount})
+              </span>
+              <span className="stat-separator">·</span>
+              <span className="benchmark-score">
+                Final Codes Recall: <strong>{(benchmarkMetrics.finalCodesRecall * 100).toFixed(1)}%</strong>
+                {' '}({benchmarkMetrics.exactCount}/{benchmarkMetrics.expectedCount})
+              </span>
+            </span>
+          </div>
+        ) : benchmarkMode && !benchmarkMetrics && nodeCount > 0 ? (
+          // Benchmark mode: before or during traversal
+          <div className="report-line">
+            <span className="report-label">Report:</span>
+            <span className="report-stats">
+              {status === 'idle' ? (
+                // Before traversal: show target nodes count
+                <>
+                  <strong>{nodeCount}</strong> target nodes
+                </>
+              ) : (
+                // During traversal: show intersecting traversed nodes count
+                <>
+                  <strong>
+                    {(nodes as BenchmarkGraphNode[]).filter(
+                      n => n.benchmarkStatus === 'traversed' || n.benchmarkStatus === 'matched'
+                    ).length}
+                  </strong> nodes traversed
+                  <span className="stat-separator">·</span>
+                  <strong>{nodeCount}</strong> target nodes
+                </>
+              )}
+            </span>
+          </div>
+        ) : (nodeCount > 0 || finalizedCodes.length > 0 || decisionCount > 0) && (
+          <div className="report-line">
+            <span className="report-label">Report:</span>
+            <span className="report-stats">
+              {finalizedCodes.length > 0 && status === 'complete' && (
+                <>
+                  <strong>{finalizedCodes.length}</strong> codes finalized
+                </>
+              )}
+              {finalizedCodes.length > 0 && status === 'complete' && nodeCount > 0 && (
+                <span className="stat-separator">·</span>
+              )}
+              {nodeCount > 0 && (
+                <>
+                  <strong>{nodeCount}</strong> nodes explored
+                </>
+              )}
+              {(nodeCount > 0 || (finalizedCodes.length > 0 && status === 'complete')) && decisionCount > 0 && (
+                <span className="stat-separator">·</span>
+              )}
+              {decisionCount > 0 && (
+                <>
+                  <strong>{decisionCount}</strong> decisions made
+                </>
+              )}
+            </span>
+          </div>
+        )}
       </div>
       <div className="graph-svg-area">
         <svg ref={svgRef} width="100%" height="100%" />
@@ -1213,8 +1189,8 @@ function GraphViewerInner({
         {status === 'idle' && nodes.filter(n => n.id !== 'ROOT').length === 0 && (
           <div className="empty-state absolute">
             <span className="empty-icon">📊</span>
-            <span className="empty-text">No traversal data yet</span>
-            <span className="empty-hint">Enter a clinical note and start traversal</span>
+            <span className="empty-text">{benchmarkMode ? 'No benchmark data yet' : 'No traversal data yet'}</span>
+            <span className="empty-hint">{benchmarkMode ? 'Add expected codes and run a benchmark' : 'Enter a clinical note and start traversal'}</span>
           </div>
         )}
         {isTraversing && nodes.filter(n => n.id !== 'ROOT').length === 0 && (
@@ -1244,7 +1220,7 @@ function GraphViewerInner({
               <span>Undershot Code</span>
             </div>
             <div className="legend-item">
-              <span className="legend-x" style={{ color: '#dc2626', fontWeight: 'bold', fontSize: '16px' }}>✕</span>
+              <span className="legend-box" style={{ background: '#fecaca', border: '2px solid #dc2626' }} />
               <span>Overshot Code</span>
             </div>
             <div className="legend-item">

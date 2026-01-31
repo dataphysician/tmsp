@@ -8,10 +8,11 @@ Includes:
 
 import asyncio
 import json
+import uuid
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Literal, TypedDict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -55,6 +56,103 @@ from agent.zero_shot import (
 # Scaffolded traversal cache key generator and state management
 from agent.traversal import generate_traversal_cache_key, delete_persisted_state, PERSISTER, initialize_persister
 
+# Track partition keys created during this server session (for selective cache clearing)
+SESSION_PARTITION_KEYS: set[str] = set()
+
+# Reference to current/last Burr app (for cancel endpoint and clear cache)
+CURRENT_APP = None  # Type: Application | None (from burr.core)
+
+# Reference to currently running async task (for cancel endpoint)
+RUNNING_TASK = None  # Type: asyncio.Task | None
+
+# ============================================================================
+# Cache Version Tracking (Soft Invalidation)
+# ============================================================================
+# Maps config_hash -> version. When user invalidates, version increments.
+# Key generation includes version, so old entries are orphaned (not deleted).
+# Persisted to disk to survive server restarts (including hot reload).
+CACHE_VERSIONS_FILE = Path(__file__).parent / "cache_versions.json"
+
+
+def _load_cache_versions() -> dict[str, int]:
+    """Load cache versions from disk."""
+    if CACHE_VERSIONS_FILE.exists():
+        try:
+            return json.loads(CACHE_VERSIONS_FILE.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[CACHE] Warning: Failed to load cache_versions.json: {e}")
+            return {}
+    return {}
+
+
+def _save_cache_versions() -> None:
+    """Save cache versions to disk."""
+    try:
+        CACHE_VERSIONS_FILE.write_text(json.dumps(CACHE_VERSIONS))
+    except OSError as e:
+        print(f"[CACHE] Warning: Failed to save cache_versions.json: {e}")
+
+
+CACHE_VERSIONS: dict[str, int] = _load_cache_versions()
+
+
+def _compute_config_hash(
+    clinical_note: str,
+    provider: str,
+    model: str,
+    temperature: float,
+    system_prompt: str | None,
+    scaffolded: bool,
+) -> str:
+    """Compute a hash for cache version tracking.
+
+    This identifies a unique configuration for version tracking purposes.
+    """
+    import hashlib
+    key_str = (
+        f"{provider}|{model}|{round(temperature, 2)}|"
+        f"{(system_prompt or '').strip()}|{clinical_note.strip()}|"
+        f"{'scaffolded' if scaffolded else 'zeroshot'}"
+    )
+    return hashlib.sha256(key_str.encode()).hexdigest()[:16]
+
+
+def get_cache_version(
+    clinical_note: str,
+    provider: str,
+    model: str,
+    temperature: float,
+    system_prompt: str | None = None,
+    scaffolded: bool = True,
+) -> int:
+    """Get current cache version for a configuration."""
+    config_hash = _compute_config_hash(
+        clinical_note, provider, model, temperature, system_prompt, scaffolded
+    )
+    version = CACHE_VERSIONS.get(config_hash, 0)
+    print(f"[CACHE] get_cache_version hash={config_hash}, version={version}, model={model!r}, scaffolded={scaffolded}")
+    return version
+
+
+def increment_cache_version(
+    clinical_note: str,
+    provider: str,
+    model: str,
+    temperature: float,
+    system_prompt: str | None = None,
+    scaffolded: bool = True,
+) -> int:
+    """Increment and return new cache version for a configuration."""
+    config_hash = _compute_config_hash(
+        clinical_note, provider, model, temperature, system_prompt, scaffolded
+    )
+    current = CACHE_VERSIONS.get(config_hash, 0)
+    new_version = current + 1
+    CACHE_VERSIONS[config_hash] = new_version
+    _save_cache_versions()  # Persist to disk
+    print(f"[CACHE] increment_cache_version hash={config_hash}: {current} -> {new_version}, model={model!r}, scaffolded={scaffolded}")
+    return new_version
+
 # Helper to check if a node DIRECTLY has sevenChrDef metadata
 # Note: This is for visual "activator" category only - NOT for sevenChrDef processing
 # Nodes that inherit sevenChrDef from ancestors (self-activation) are NOT activators visually
@@ -69,6 +167,266 @@ def node_has_seven_chr_def(code: str) -> bool:
     entry = data[code]
     metadata = entry.get("metadata", {})
     return bool(metadata.get("sevenChrDef"))
+
+
+def format_with_seventh_char(base_code: str, seventh_char: str) -> str:
+    """Format ICD-10-CM code with 7th character and placeholder padding."""
+    if "." in base_code:
+        category, subcategory = base_code.split(".", 1)
+    else:
+        category = base_code[:3] if len(base_code) >= 3 else base_code
+        subcategory = base_code[3:] if len(base_code) > 3 else ""
+    padded_subcategory = subcategory.ljust(3, "X") + seventh_char
+    return f"{category}.{padded_subcategory}"
+
+
+# TypedDicts for type-safe graph building (matches GraphNode/GraphEdge pydantic models)
+class NodeDict(TypedDict):
+    id: str
+    code: str
+    label: str
+    depth: int
+    category: Literal["root", "finalized", "ancestor", "placeholder", "activator"]
+    billable: bool
+
+class EdgeDict(TypedDict):
+    source: str
+    target: str
+    edge_type: Literal["hierarchy", "lateral"]
+    rule: str | None
+
+
+def build_graph_from_batch_data(
+    batch_data: dict[str, dict],
+    final_nodes: list[str],
+) -> tuple[list[NodeDict], list[EdgeDict], set[str], set[tuple[str, str]]]:
+    """Build graph nodes and edges from batch_data.
+
+    Used for both cached replay snapshots and pre-rewind state snapshots.
+
+    Args:
+        batch_data: Dict mapping batch_id -> batch info with node_id, selected_ids, etc.
+        final_nodes: List of finalized code IDs.
+
+    Returns:
+        Tuple of (nodes_list, edges_list, seen_nodes_set, seen_edges_set)
+    """
+    nodes: list[NodeDict] = [{"id": "ROOT", "code": "ROOT", "label": "ROOT", "depth": 0, "category": "root", "billable": False}]
+    edges: list[EdgeDict] = []
+    seen_nodes: set[str] = {"ROOT"}
+    seen_edges: set[tuple[str, str]] = set()
+    final_nodes_set = set(final_nodes)
+
+    # Sort batches by depth to ensure parents are processed before children
+    sorted_batches = sorted(
+        [(bid, binfo) for bid, binfo in batch_data.items()],
+        key=lambda x: (x[1].get("depth", 0), x[0])
+    )
+
+    for batch_id, batch_info in sorted_batches:
+        node_id = batch_info.get("node_id")
+        parent_id = batch_info.get("parent_id")
+        depth = batch_info.get("depth", 0)
+        candidates = batch_info.get("candidates", {})
+        selected_ids = batch_info.get("selected_ids", [])
+        seven_chr_authority = batch_info.get("seven_chr_authority")
+        batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
+
+        # Transform selected_ids for sevenChrDef batches
+        if batch_type == "sevenChrDef" and node_id and selected_ids:
+            selected_ids = [format_with_seventh_char(node_id, char) for char in selected_ids]
+
+        # Handle sevenChrDef batches
+        if batch_type == "sevenChrDef" and node_id:
+            # Add base node if not seen
+            if node_id not in seen_nodes:
+                seen_nodes.add(node_id)
+                if node_id in data:
+                    node_label = data[node_id].get("label", node_id)
+                    node_depth = data[node_id].get("depth", depth)
+                    node_category = "activator" if node_has_seven_chr_def(node_id) else "ancestor"
+                else:
+                    node_label = "Placeholder"
+                    node_depth = depth
+                    node_category = "placeholder"
+                nodes.append({
+                    "id": node_id, "code": node_id, "label": node_label,
+                    "depth": node_depth, "category": node_category, "billable": False,
+                })
+
+            if parent_id and parent_id != node_id:
+                edge_key = (parent_id, node_id)
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    edges.append({
+                        "source": parent_id, "target": node_id,
+                        "edge_type": "hierarchy", "rule": None,
+                    })
+
+            # Create 7th character node if selected
+            if selected_ids:
+                seventh_char = selected_ids[0][-1] if selected_ids[0] else ""
+                if "." in node_id:
+                    base_category, base_subcategory = node_id.split(".", 1)
+                else:
+                    base_category = node_id[:3] if len(node_id) >= 3 else node_id
+                    base_subcategory = node_id[3:] if len(node_id) > 3 else ""
+                full_code = f"{base_category}.{base_subcategory.ljust(3, 'X')}{seventh_char}"
+
+                # Transform candidates for label lookup
+                transformed_candidates = {}
+                for char, desc in candidates.items():
+                    transformed_code = format_with_seventh_char(node_id, char)
+                    transformed_candidates[transformed_code] = desc
+
+                base_depth = data.get(node_id, {}).get("depth", depth)
+                prev_node = node_id
+
+                # Create placeholder nodes if base is shallower than depth 6
+                if base_depth < 6:
+                    if "." in node_id:
+                        category, subcategory = node_id.split(".", 1)
+                    else:
+                        category = node_id[:3] if len(node_id) >= 3 else node_id
+                        subcategory = node_id[3:] if len(node_id) > 3 else ""
+
+                    current_sub = subcategory
+                    for i in range(len(subcategory), 3):
+                        current_sub += "X"
+                        placeholder_code = f"{category}.{current_sub}"
+                        placeholder_depth = base_depth + (i - len(subcategory) + 1)
+
+                        if placeholder_code not in seen_nodes:
+                            seen_nodes.add(placeholder_code)
+                            nodes.append({
+                                "id": placeholder_code, "code": placeholder_code,
+                                "label": "Placeholder", "depth": placeholder_depth,
+                                "category": "placeholder", "billable": False,
+                            })
+
+                        edge_key = (prev_node, placeholder_code)
+                        if edge_key not in seen_edges:
+                            seen_edges.add(edge_key)
+                            edges.append({
+                                "source": prev_node, "target": placeholder_code,
+                                "edge_type": "hierarchy", "rule": None,
+                            })
+                        prev_node = placeholder_code
+
+                # Create depth-6 parent if needed
+                if prev_node not in seen_nodes:
+                    seen_nodes.add(prev_node)
+                    nodes.append({
+                        "id": prev_node, "code": prev_node,
+                        "label": "Placeholder" if prev_node.endswith("X") else data.get(prev_node, {}).get("label", prev_node),
+                        "depth": 6,
+                        "category": "placeholder" if prev_node.endswith("X") else "ancestor",
+                        "billable": False,
+                    })
+
+                # Create final 7th character node
+                label = f"{seventh_char}: {transformed_candidates.get(full_code, seventh_char)}"
+                if full_code not in seen_nodes:
+                    seen_nodes.add(full_code)
+                    is_finalized = full_code in final_nodes_set
+                    nodes.append({
+                        "id": full_code, "code": full_code, "label": label,
+                        "depth": 7, "category": "finalized" if is_finalized else "ancestor", "billable": is_finalized,
+                    })
+
+                edge_key = (prev_node, full_code)
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    edges.append({
+                        "source": prev_node, "target": full_code,
+                        "edge_type": "lateral", "rule": "sevenChrDef",
+                    })
+
+        # Regular batches (children, codeFirst, codeAlso, etc.)
+        elif batch_type != "sevenChrDef":
+            # Add traversed node
+            if node_id and node_id != "ROOT" and node_id not in seen_nodes:
+                seen_nodes.add(node_id)
+                if node_id in data:
+                    node_label = data[node_id].get("label", node_id)
+                    node_depth = data[node_id].get("depth", depth)
+                else:
+                    node_label = "Placeholder" if node_id.endswith("X") else node_id
+                    node_depth = depth
+
+                if node_has_seven_chr_def(node_id):
+                    node_category = "activator"
+                elif node_id not in data and node_id.endswith("X"):
+                    node_category = "placeholder"
+                elif node_id in final_nodes_set:
+                    node_category = "finalized"
+                else:
+                    node_category = "ancestor"
+
+                nodes.append({
+                    "id": node_id, "code": node_id, "label": node_label,
+                    "depth": node_depth, "category": node_category, "billable": node_id in final_nodes_set,
+                })
+
+            if node_id and parent_id and parent_id != node_id:
+                edge_key = (parent_id, node_id)
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    edges.append({
+                        "source": parent_id, "target": node_id,
+                        "edge_type": "hierarchy", "rule": None,
+                    })
+
+            # Add selected children
+            for code in selected_ids:
+                if code not in seen_nodes:
+                    seen_nodes.add(code)
+                    label = candidates.get(code, code)
+
+                    if code in data:
+                        code_depth = data[code].get("depth", depth + 1)
+                    else:
+                        code_depth = depth + 1
+
+                    if node_has_seven_chr_def(code):
+                        code_category = "activator"
+                    elif code not in data and code.endswith("X"):
+                        code_category = "placeholder"
+                    elif code in final_nodes_set:
+                        code_category = "finalized"
+                    else:
+                        code_category = "ancestor"
+
+                    has_children = bool(data.get(code, {}).get("children"))
+                    has_authority = seven_chr_authority is not None
+                    is_activator = code_category == "activator"
+                    is_finalized = code in final_nodes_set
+                    billable = is_finalized or (not has_children and not has_authority and not is_activator)
+
+                    nodes.append({
+                        "id": code, "code": code, "label": label,
+                        "depth": code_depth, "category": code_category, "billable": billable,
+                    })
+
+                # Add edge
+                edge_source = node_id if node_id and node_id != "ROOT" else "ROOT"
+                edge_key = (edge_source, code)
+
+                if batch_type != "children":
+                    edge_type = "lateral"
+                    rule = batch_type
+                else:
+                    edge_type = "hierarchy"
+                    rule = None
+
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    edges.append({
+                        "source": edge_source, "target": code,
+                        "edge_type": edge_type, "rule": rule,
+                    })
+
+    return nodes, edges, seen_nodes, seen_edges
 
 
 # --- FastAPI App ---
@@ -427,9 +785,10 @@ async def delete_cache_entry(request: DeleteCacheRequest):
             model=request.model,
             temperature=request.temperature,
         )
+        # Delete ALL entries (ROOT + subgraphs) for complete cache clear
         deleted = await delete_persisted_state(
             partition_key=partition_key,
-            app_id="ROOT",
+            app_id=None,
             db_path="./cache.db",
             table_name="burr_state",
         )
@@ -462,8 +821,279 @@ async def delete_cache_entry(request: DeleteCacheRequest):
         )
 
 
+class InvalidateCacheRequest(BaseModel):
+    """Request to soft-invalidate cache for a configuration."""
+
+    clinical_note: str
+    provider: str
+    model: str
+    temperature: float = 0.0
+    system_prompt: str | None = None
+    scaffolded: bool = True
+
+
+class InvalidateCacheResponse(BaseModel):
+    """Response from cache invalidation."""
+
+    success: bool
+    new_version: int
+    message: str
+
+
+@app.post("/api/cache/invalidate", response_model=InvalidateCacheResponse)
+async def invalidate_cache(request: InvalidateCacheRequest):
+    """Hard-invalidate cache for a specific configuration.
+
+    Increments the cache version AND deletes any existing cached data
+    at the new version's key to guarantee a cache miss.
+    """
+    # Normalize parameters to match traversal endpoint
+    model = request.model or ""
+    temperature = request.temperature or 0.0
+
+    new_version = increment_cache_version(
+        clinical_note=request.clinical_note,
+        provider=request.provider,
+        model=model,
+        temperature=temperature,
+        system_prompt=request.system_prompt,
+        scaffolded=request.scaffolded,
+    )
+
+    # Generate the cache key that will be used for the new version
+    if request.scaffolded:
+        partition_key = generate_traversal_cache_key(
+            clinical_note=request.clinical_note,
+            provider=request.provider,
+            model=model,
+            temperature=temperature,
+            system_prompt=request.system_prompt,
+            use_cache=True,
+            cache_version=new_version,
+        )
+        table_name = "burr_state"
+    else:
+        partition_key = generate_zero_shot_cache_key(
+            clinical_note=request.clinical_note,
+            provider=request.provider,
+            model=model,
+            temperature=temperature,
+            system_prompt=request.system_prompt,
+            use_cache=True,
+            cache_version=new_version,
+        )
+        table_name = "zero_shot_state"
+
+    # Delete any existing cached data at the new version's key
+    deleted = await delete_persisted_state(
+        partition_key=partition_key,
+        app_id=None,  # Delete ALL entries (ROOT + subgraphs)
+        table_name=table_name,
+    )
+
+    action = "Deleted existing cache. " if deleted else ""
+    return InvalidateCacheResponse(
+        success=True,
+        new_version=new_version,
+        message=f"Cache invalidated. {action}Next run will use version {new_version}.",
+    )
+
+
+class ClearAllCacheResponse(BaseModel):
+    """Response from clearing session cache."""
+
+    success: bool
+    message: str
+    entries_deleted: int
+
+
+@app.post("/api/cache/clear-session", response_model=ClearAllCacheResponse)
+async def clear_session_cache():
+    """Clear cached state from this server session only.
+
+    Only clears entries created since the server started, preserving older cached runs.
+    Also clears the in-memory selector cache.
+    """
+    from candidate_selector.selector import clear_cache
+    import aiosqlite
+
+    total_deleted = 0
+
+    # Clear in-memory selector cache
+    clear_cache()
+
+    # Only clear entries from this session
+    if not SESSION_PARTITION_KEYS:
+        return ClearAllCacheResponse(
+            success=True,
+            message="No session cache entries to clear",
+            entries_deleted=0,
+        )
+
+    # Clear session entries from both SQLite tables
+    try:
+        async with aiosqlite.connect("./cache.db") as db:
+            placeholders = ",".join("?" * len(SESSION_PARTITION_KEYS))
+            keys = list(SESSION_PARTITION_KEYS)
+            for table in ["burr_state", "zero_shot_state"]:
+                cursor = await db.execute(
+                    f"DELETE FROM {table} WHERE partition_key IN ({placeholders})",
+                    keys,
+                )
+                total_deleted += cursor.rowcount
+            await db.commit()
+    except Exception as e:
+        return ClearAllCacheResponse(
+            success=False,
+            message=f"Error clearing cache: {e}",
+            entries_deleted=0,
+        )
+
+    # Clear the tracked session keys
+    SESSION_PARTITION_KEYS.clear()
+
+    return ClearAllCacheResponse(
+        success=True,
+        message="Session cache cleared successfully",
+        entries_deleted=total_deleted,
+    )
+
+
+@app.post("/api/traverse/cancel")
+async def cancel_traversal():
+    """Cancel the currently running traversal.
+
+    Uses task.cancel() to interrupt at the next await point.
+    The CancelledError propagates up through Burr's internals and
+    the task ends cleanly. Incomplete cache entries are deleted.
+    """
+    global RUNNING_TASK, CURRENT_APP
+
+    if RUNNING_TASK is not None and not RUNNING_TASK.done():
+        # Extract partition key BEFORE clearing CURRENT_APP
+        partition_key = getattr(CURRENT_APP, '_partition_key', None) if CURRENT_APP else None
+
+        RUNNING_TASK.cancel()
+        print("[CANCEL] Task cancelled")
+
+        # Wait for cancellation to complete
+        try:
+            await RUNNING_TASK
+        except asyncio.CancelledError:
+            pass  # Expected - task was cancelled
+        except Exception as e:
+            # Cleanup errors during cancellation (e.g., database already closed)
+            print(f"[CANCEL] Task cleanup error (ignored): {type(e).__name__}: {e}")
+
+        # Delete incomplete cache entry
+        if partition_key:
+            try:
+                await delete_persisted_state(partition_key=partition_key, app_id=None)
+                print(f"[CANCEL] Deleted incomplete cache for partition_key={partition_key}")
+            except Exception as e:
+                print(f"[CANCEL] Cache cleanup error (ignored): {e}")
+
+        CURRENT_APP = None
+        RUNNING_TASK = None
+    else:
+        print("[CANCEL] No running traversal to cancel")
+
+    return {"cancelled": True}
+
+
+@app.post("/api/cache/clear-last", response_model=ClearAllCacheResponse)
+async def clear_last_cache():
+    """Clear the most recent traversal run's cache.
+
+    Uses the currently running app's partition key if available.
+    """
+    from candidate_selector.selector import clear_cache
+    import aiosqlite
+
+    global CURRENT_APP
+
+    # Clear in-memory selector cache
+    clear_cache()
+
+    # Get partition key from running app if available
+    partition_key = CURRENT_APP._partition_key if CURRENT_APP is not None else None
+
+    if not partition_key:
+        return ClearAllCacheResponse(
+            success=True,
+            message="No recent run to clear",
+            entries_deleted=0,
+        )
+
+    total_deleted = 0
+
+    try:
+        async with aiosqlite.connect("./cache.db") as db:
+            for table in ["burr_state", "zero_shot_state"]:
+                cursor = await db.execute(
+                    f"DELETE FROM {table} WHERE partition_key = ?",
+                    (partition_key,),
+                )
+                total_deleted += cursor.rowcount
+            await db.commit()
+    except Exception as e:
+        return ClearAllCacheResponse(
+            success=False,
+            message=f"Error clearing cache: {e}",
+            entries_deleted=0,
+        )
+
+    # Remove from session keys
+    SESSION_PARTITION_KEYS.discard(partition_key)
+
+    return ClearAllCacheResponse(
+        success=True,
+        message="Last run cache cleared successfully",
+        entries_deleted=total_deleted,
+    )
+
+
+@app.post("/api/cache/clear-all", response_model=ClearAllCacheResponse)
+async def clear_all_cache():
+    """Clear all cached state from both database tables.
+
+    Clears everything including older cached runs from previous sessions.
+    Also clears the in-memory selector cache.
+    """
+    from candidate_selector.selector import clear_cache
+    import aiosqlite
+
+    total_deleted = 0
+
+    # Clear in-memory selector cache
+    clear_cache()
+
+    # Clear all entries from both SQLite tables
+    try:
+        async with aiosqlite.connect("./cache.db") as db:
+            for table in ["burr_state", "zero_shot_state"]:
+                cursor = await db.execute(f"DELETE FROM {table}")
+                total_deleted += cursor.rowcount
+            await db.commit()
+    except Exception as e:
+        return ClearAllCacheResponse(
+            success=False,
+            message=f"Error clearing cache: {e}",
+            entries_deleted=0,
+        )
+
+    # Clear the tracked session keys too
+    SESSION_PARTITION_KEYS.clear()
+
+    return ClearAllCacheResponse(
+        success=True,
+        message="All cache cleared successfully",
+        entries_deleted=total_deleted,
+    )
+
+
 @app.post("/api/traverse/stream")
-async def stream_traversal(request: TraversalRequest):
+async def stream_traversal(request: TraversalRequest, http_request: Request):
     """Run Burr-based DFS traversal with AG-UI streaming.
 
     Uses AG-UI protocol over SSE with JSON Patch (RFC 6902) for incremental updates.
@@ -488,6 +1118,7 @@ async def stream_traversal(request: TraversalRequest):
     seen_nodes: dict[str, int] = {"ROOT": 0}
     node_count = 1  # ROOT is index 0
     seen_edges: set[tuple[str, str]] = set()
+    seen_batches: set[str] = set()  # Track processed batches to avoid duplicate events
 
     # Helper to format 7th character code (same logic as actions.py)
     def format_with_seventh_char(base_code: str, seventh_char: str) -> str:
@@ -513,13 +1144,20 @@ async def stream_traversal(request: TraversalRequest):
     ):
         nonlocal node_count
         print(f"[CALLBACK] on_batch_complete called: batch_id={batch_id}, selected_ids={selected_ids}")
+
+        # Skip duplicate batch callbacks (can occur when multiple parallel paths reach same node)
+        if batch_id in seen_batches:
+            print(f"[CALLBACK] SKIP DUPLICATE: batch_id={batch_id} already processed")
+            return
+        seen_batches.add(batch_id)
+
         # Parse batch_type from batch_id
         batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
 
         # STEP_STARTED
         event_queue.put_nowait(AGUIEvent(
             type=AGUIEventType.STEP_STARTED,
-            step_id=batch_id,
+            stepName=batch_id,
         ))
 
         # STATE_DELTA - add nodes and edges
@@ -930,7 +1568,7 @@ async def stream_traversal(request: TraversalRequest):
         is_error = reasoning.startswith("API Error:") if reasoning else False
         event_queue.put_nowait(AGUIEvent(
             type=AGUIEventType.STEP_FINISHED,
-            step_id=batch_id,
+            stepName=batch_id,
             metadata={
                 "node_id": node_id,
                 "batch_type": batch_type,
@@ -944,6 +1582,13 @@ async def stream_traversal(request: TraversalRequest):
 
     async def event_generator() -> AsyncGenerator[str, None]:
         """Generate AG-UI SSE events."""
+        global CURRENT_APP, RUNNING_TASK
+
+        # Generate unique run ID for this invocation (AG-UI protocol compliance)
+        # threadId will be set to the partition key (stable for same clinical note/settings)
+        run_id = str(uuid.uuid4())
+        thread_id: str = ""  # Will be set to partition key after it's computed
+
         try:
             # Configure LLM (use create_config for correct provider base URLs)
             # Pass temperature and max_tokens if provided, otherwise use provider defaults
@@ -988,7 +1633,16 @@ async def stream_traversal(request: TraversalRequest):
 
             if not request.scaffolded:
                 # Zero-shot mode: check cache
-                await initialize_zero_shot_persister(reset=not request.persist_cache)
+                await initialize_zero_shot_persister(reset=False)
+                # Look up current cache version for this configuration
+                zs_cache_version = get_cache_version(
+                    clinical_note=request.clinical_note,
+                    provider=request.provider,
+                    model=request.model or "",
+                    temperature=request.temperature or 0.0,
+                    system_prompt=request.system_prompt,
+                    scaffolded=False,
+                )
                 zs_partition_key = generate_zero_shot_cache_key(
                     clinical_note=request.clinical_note,
                     provider=request.provider,
@@ -996,6 +1650,8 @@ async def stream_traversal(request: TraversalRequest):
                     temperature=request.temperature or 0.0,
                     max_completion_tokens=request.max_tokens,
                     system_prompt=request.system_prompt,
+                    use_cache=request.persist_cache,
+                    cache_version=zs_cache_version,
                 )
                 if ZERO_SHOT_PERSISTER is not None:
                     cached_state = await ZERO_SHOT_PERSISTER.load(
@@ -1007,20 +1663,37 @@ async def stream_traversal(request: TraversalRequest):
                         and cached_state.get("state", {}).get("selected_codes") is not None
                     )
                 print(f"[SERVER] Zero-shot cache check: partition_key={zs_partition_key}, cached={is_cached}")
+                # Use partition key as threadId (stable for same clinical note/settings)
+                thread_id = zs_partition_key
             else:
                 # Scaffolded mode: call build_app() directly (single source of truth for cache status)
                 # This eliminates the dual cache check issue - build_app() is the authoritative check
+                print(f"[SERVER] persist_cache={request.persist_cache} (use_cache for key generation)")
+                # Look up current cache version for this configuration
+                scaffolded_cache_version = get_cache_version(
+                    clinical_note=request.clinical_note,
+                    provider=request.provider,
+                    model=request.model or "",
+                    temperature=request.temperature or 0.0,
+                    system_prompt=request.system_prompt,
+                    scaffolded=True,
+                )
                 scaffolded_partition_key = generate_traversal_cache_key(
                     clinical_note=request.clinical_note,
                     provider=request.provider,
                     model=request.model or "",
                     temperature=request.temperature or 0.0,
                     system_prompt=request.system_prompt,
+                    use_cache=request.persist_cache,
+                    cache_version=scaffolded_cache_version,
                 )
+                SESSION_PARTITION_KEYS.add(scaffolded_partition_key)
                 print(f"[SERVER] Scaffolded cache key: {scaffolded_partition_key}")
+                # Use partition key as threadId (stable for same clinical note/settings)
+                thread_id = scaffolded_partition_key
 
-                # Initialize persister
-                await initialize_persister(reset=not request.persist_cache)
+                # Initialize persister (always keep existing data)
+                await initialize_persister(reset=False)
 
                 # Set callback for streaming (needed before build_app for live traversal)
                 set_batch_callback(on_batch_complete)
@@ -1035,9 +1708,14 @@ async def stream_traversal(request: TraversalRequest):
                 )
                 print(f"[SERVER] Scaffolded build_app result: cached={is_cached}")
 
+                # Set CURRENT_APP for cancel endpoint to access
+                CURRENT_APP = scaffolded_burr_app
+
             # RUN_STARTED with cache flag
             run_started_event = AGUIEvent(
                 type=AGUIEventType.RUN_STARTED,
+                threadId=thread_id,
+                runId=run_id,
                 metadata={'clinical_note': request.clinical_note[:100], 'cached': is_cached}
             )
             yield f"data: {run_started_event.model_dump_json()}\n\n"
@@ -1054,17 +1732,26 @@ async def stream_traversal(request: TraversalRequest):
                 )],
                 edges=[],
             )
-            yield f"data: {AGUIEvent(type=AGUIEventType.STATE_SNAPSHOT, state=initial_state).model_dump_json()}\n\n"
+            yield f"data: {AGUIEvent(type=AGUIEventType.STATE_SNAPSHOT, snapshot=initial_state).model_dump_json()}\n\n"
 
             # Branch based on scaffolded flag
             if not request.scaffolded:
                 # Zero-shot mode: Burr app with SQLite caching
                 print("[SERVER] Running in ZERO-SHOT mode (Burr app with caching)")
 
-                # Initialize zero-shot persister (reset if persist_cache=False)
-                await initialize_zero_shot_persister(reset=not request.persist_cache)
+                # Initialize zero-shot persister (always keep existing data)
+                await initialize_zero_shot_persister(reset=False)
 
                 # Generate cache key from request parameters
+                # Look up current cache version for this configuration
+                zs_run_cache_version = get_cache_version(
+                    clinical_note=request.clinical_note,
+                    provider=request.provider,
+                    model=request.model or "",
+                    temperature=request.temperature or 0.0,
+                    system_prompt=request.system_prompt,
+                    scaffolded=False,
+                )
                 partition_key = generate_zero_shot_cache_key(
                     clinical_note=request.clinical_note,
                     provider=request.provider,
@@ -1072,11 +1759,14 @@ async def stream_traversal(request: TraversalRequest):
                     temperature=request.temperature or 0.0,
                     max_completion_tokens=request.max_tokens,
                     system_prompt=request.system_prompt,
+                    use_cache=request.persist_cache,
+                    cache_version=zs_run_cache_version,
                 )
+                SESSION_PARTITION_KEYS.add(partition_key)
                 print(f"[SERVER] Zero-shot cache key: {partition_key}")
 
                 # STEP_STARTED for zero-shot batch
-                yield f"data: {AGUIEvent(type=AGUIEventType.STEP_STARTED, step_id='ROOT|zero-shot').model_dump_json()}\n\n"
+                yield f"data: {AGUIEvent(type=AGUIEventType.STEP_STARTED, stepName='ROOT|zero-shot').model_dump_json()}\n\n"
 
                 # Build zero-shot Burr app (checks cache)
                 zs_app, was_cached = await build_zero_shot_app(
@@ -1090,9 +1780,28 @@ async def stream_traversal(request: TraversalRequest):
                     selected_codes = zs_app.state.get("selected_codes", [])
                     reasoning = zs_app.state.get("reasoning", "")
                 else:
-                    # Cache miss - run the Burr app
+                    # Cache miss - run the Burr app in background task for cancellation support
                     print("[SERVER] Zero-shot CACHE MISS - calling LLM")
-                    _, _, final_state = await zs_app.arun(halt_after=["finish"])
+
+                    async def run_zero_shot():
+                        _, _, state = await zs_app.arun(halt_after=["finish"])
+                        return state
+
+                    zs_task = asyncio.create_task(run_zero_shot())
+
+                    # Poll for client disconnection while waiting
+                    while not zs_task.done():
+                        if await http_request.is_disconnected():
+                            print("[SERVER] Client disconnected during zero-shot - cancelling")
+                            zs_task.cancel()
+                            try:
+                                await zs_task
+                            except asyncio.CancelledError:
+                                pass
+                            return  # Exit generator
+                        await asyncio.sleep(0.1)
+
+                    final_state = await zs_task
                     selected_codes = final_state.get("selected_codes", [])
                     reasoning = final_state.get("reasoning", "")
 
@@ -1204,21 +1913,23 @@ async def stream_traversal(request: TraversalRequest):
 
                 # STEP_FINISHED with populated candidates and selected_details
                 is_error = reasoning.startswith("API Error:") if reasoning else False
-                yield f"data: {AGUIEvent(type=AGUIEventType.STEP_FINISHED, step_id='ROOT|zero-shot', metadata={'node_id': 'ROOT', 'batch_type': 'zero-shot', 'selected_ids': selected_codes, 'reasoning': reasoning, 'candidates': candidates, 'error': is_error, 'selected_details': selected_details}).model_dump_json()}\n\n"
+                yield f"data: {AGUIEvent(type=AGUIEventType.STEP_FINISHED, stepName='ROOT|zero-shot', metadata={'node_id': 'ROOT', 'batch_type': 'zero-shot', 'selected_ids': selected_codes, 'reasoning': reasoning, 'candidates': candidates, 'error': is_error, 'selected_details': selected_details}).model_dump_json()}\n\n"
 
-                # RUN_FINISHED
-                run_finished_metadata = {
-                    'final_nodes': selected_codes,
-                    'batch_count': 1,
-                    'mode': 'zero-shot',
-                    'cached': was_cached,
-                }
-                if is_error:
-                    run_finished_metadata['error'] = reasoning
-
+                # RUN_FINISHED or RUN_ERROR
                 cache_status = "CACHED" if was_cached else "NEW"
                 print(f"[SERVER] Zero-shot complete ({cache_status}): {len(selected_codes)} codes generated")
-                yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, metadata=run_finished_metadata).model_dump_json()}\n\n"
+
+                if is_error:
+                    # Emit RUN_ERROR for API errors
+                    yield f"data: {AGUIEvent(type=AGUIEventType.RUN_ERROR, threadId=thread_id, runId=run_id, error=reasoning).model_dump_json()}\n\n"
+                else:
+                    run_finished_metadata = {
+                        'final_nodes': selected_codes,
+                        'batch_count': 1,
+                        'mode': 'zero-shot',
+                        'cached': was_cached,
+                    }
+                    yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, threadId=thread_id, runId=run_id, metadata=run_finished_metadata).model_dump_json()}\n\n"
                 return  # Exit generator - zero-shot mode complete
 
             # Scaffolded mode: Tree traversal with Burr
@@ -1515,7 +2226,7 @@ async def stream_traversal(request: TraversalRequest):
                     nodes=[GraphNode(**n) for n in snapshot_nodes],
                     edges=[GraphEdge(**e) for e in snapshot_edges]
                 )
-                yield f"data: {AGUIEvent(type=AGUIEventType.STATE_SNAPSHOT, state=snapshot_state).model_dump_json()}\n\n"
+                yield f"data: {AGUIEvent(type=AGUIEventType.STATE_SNAPSHOT, snapshot=snapshot_state).model_dump_json()}\n\n"
 
                 # Emit RUN_FINISHED with final_nodes and all decisions
                 run_finished_metadata = {
@@ -1526,7 +2237,7 @@ async def stream_traversal(request: TraversalRequest):
                     'decisions': all_decisions,
                 }
                 print(f"[SERVER] Scaffolded complete (CACHED SNAPSHOT): {len(snapshot_nodes)} nodes, {len(snapshot_edges)} edges, {len(all_decisions)} decisions")
-                yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, metadata=run_finished_metadata).model_dump_json()}\n\n"
+                yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, threadId=thread_id, runId=run_id, metadata=run_finished_metadata).model_dump_json()}\n\n"
                 return  # Exit early for cache hit
 
             else:
@@ -1539,15 +2250,39 @@ async def stream_traversal(request: TraversalRequest):
                     return state
 
                 task = asyncio.create_task(run_app())
+                RUNNING_TASK = task
+                client_disconnected = False
 
                 # Stream events while running
                 while not task.done():
+                    # Check for client disconnection
+                    if await http_request.is_disconnected():
+                        print("[SERVER] Client disconnected - cancelling traversal")
+                        task.cancel()
+                        client_disconnected = True
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                        # Delete incomplete cache entry
+                        if scaffolded_partition_key:
+                            try:
+                                await delete_persisted_state(partition_key=scaffolded_partition_key, app_id=None)
+                                print(f"[SERVER] Deleted incomplete cache for partition_key={scaffolded_partition_key}")
+                            except Exception as e:
+                                print(f"[SERVER] Cache cleanup error (ignored): {e}")
+                        break
+
                     try:
                         event = await asyncio.wait_for(event_queue.get(), timeout=0.1)
                         if event is not None:
                             yield f"data: {event.model_dump_json()}\n\n"
                     except asyncio.TimeoutError:
                         continue
+
+                # If client disconnected, exit early
+                if client_disconnected:
+                    return
 
                 # Get final state
                 final_state = await task
@@ -1582,34 +2317,40 @@ async def stream_traversal(request: TraversalRequest):
             if finalize_ops:
                 yield f"data: {AGUIEvent(type=AGUIEventType.STATE_DELTA, delta=finalize_ops).model_dump_json()}\n\n"
 
-            # RUN_FINISHED - check if there was an LLM error
+            # RUN_FINISHED or RUN_ERROR - check if there was an LLM error
             batch_data = final_state.get("batch_data", {})
             root_reasoning = batch_data.get("ROOT", {}).get("reasoning", "")
             llm_error = root_reasoning if root_reasoning.startswith("API Error:") else None
 
-            run_finished_metadata = {
-                'final_nodes': final_nodes,
-                'batch_count': len(batch_data),
-                'mode': 'scaffolded',
-                'cached': is_cached,
-            }
-            if llm_error:
-                run_finished_metadata['error'] = llm_error
-
             cache_status = "CACHED" if is_cached else "NEW"
             print(f"[SERVER] Scaffolded complete ({cache_status}): final_nodes={final_nodes}, batch_count={len(batch_data)}, error={bool(llm_error)}")
-            yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, metadata=run_finished_metadata).model_dump_json()}\n\n"
+
+            if llm_error:
+                # Emit RUN_ERROR for LLM API errors
+                yield f"data: {AGUIEvent(type=AGUIEventType.RUN_ERROR, threadId=thread_id, runId=run_id, error=llm_error).model_dump_json()}\n\n"
+            else:
+                run_finished_metadata = {
+                    'final_nodes': final_nodes,
+                    'batch_count': len(batch_data),
+                    'mode': 'scaffolded',
+                    'cached': is_cached,
+                }
+                yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, threadId=thread_id, runId=run_id, metadata=run_finished_metadata).model_dump_json()}\n\n"
             print("[SERVER] Stream complete")
 
         except Exception as e:
+            # Emit RUN_ERROR for unexpected exceptions
             error_event = AGUIEvent(
-                type=AGUIEventType.RUN_FINISHED,
-                metadata={"error": str(e)},
+                type=AGUIEventType.RUN_ERROR,
+                threadId=thread_id,
+                runId=run_id,
+                error=str(e),
             )
             yield f"data: {error_event.model_dump_json()}\n\n"
 
         finally:
             # Cleanup
+            RUNNING_TASK = None
             set_batch_callback(None)
             await cleanup_persister()
 
@@ -1648,7 +2389,7 @@ async def run_traversal_sync(request: TraversalRequest):
 
 
 @app.post("/api/traverse/rewind")
-async def stream_rewind(request: RewindRequest):
+async def stream_rewind(request: RewindRequest, http_request: Request):
     """Rewind traversal from a specific batch with feedback.
 
     Uses Burr's fork pattern to branch from a checkpoint and inject corrective
@@ -1657,15 +2398,20 @@ async def stream_rewind(request: RewindRequest):
     The feedback is passed to the LLM selector as "CRITICAL ADDITIONAL GUIDANCE"
     that takes priority over the general clinical context.
 
+    The backend is the authoritative source for pre-rewind state - it loads the
+    cached state, prunes it to the rewind point, and emits a STATE_SNAPSHOT
+    so the frontend doesn't need to carry or manipulate state.
+
     Returns SSE stream with events:
     - RUN_STARTED: Rewind begins (includes rewind_from batch_id)
+    - STATE_SNAPSHOT: Pre-rewind graph state (pruned to rewind point)
     - STEP_STARTED: Batch processing begins
     - STATE_DELTA: JSON Patch ops to add nodes/edges
     - STEP_FINISHED: Batch complete with reasoning
     - RUN_FINISHED: Rewind complete with final codes
     """
     from agent import retry_node, initialize_persister, cleanup_persister, set_batch_callback
-    from agent.traversal import PARTITION_KEY, generate_traversal_cache_key
+    from agent.traversal import PARTITION_KEY, generate_traversal_cache_key, prune_state_for_rewind
     import agent.traversal as traversal_module
     from candidate_selector.providers import create_config
     import candidate_selector.config as llm_config
@@ -1674,14 +2420,11 @@ async def stream_rewind(request: RewindRequest):
     event_queue: asyncio.Queue[AGUIEvent | None] = asyncio.Queue()
 
     # Track seen nodes to avoid duplicates - dict maps node_id -> index for updates
-    # Pre-populate with existing nodes from the graph (for lateral target parent lookup)
-    seen_nodes: dict[str, int] = {"ROOT": 0}
-    node_count = 1  # ROOT is index 0
-    for existing_node in request.existing_nodes:
-        if existing_node not in seen_nodes:
-            seen_nodes[existing_node] = node_count
-            node_count += 1
+    # Will be populated from pre-rewind snapshot (backend is authoritative source)
+    seen_nodes: dict[str, int] = {}
+    node_count = 0  # Will be set from pre-rewind snapshot
     seen_edges: set[tuple[str, str]] = set()
+    seen_batches: set[str] = set()  # Track processed batches to avoid duplicate events
 
     # Helper to format 7th character code (same logic as actions.py)
     def format_with_seventh_char(base_code: str, seventh_char: str) -> str:
@@ -1707,12 +2450,19 @@ async def stream_rewind(request: RewindRequest):
     ):
         nonlocal node_count
         print(f"[REWIND CALLBACK] on_batch_complete: batch_id={batch_id}, selected_ids={selected_ids}")
+
+        # Skip duplicate batch callbacks (can occur when multiple parallel paths reach same node)
+        if batch_id in seen_batches:
+            print(f"[REWIND CALLBACK] SKIP DUPLICATE: batch_id={batch_id} already processed")
+            return
+        seen_batches.add(batch_id)
+
         batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
 
         # STEP_STARTED
         event_queue.put_nowait(AGUIEvent(
             type=AGUIEventType.STEP_STARTED,
-            step_id=batch_id,
+            stepName=batch_id,
         ))
 
         # STATE_DELTA - add nodes and edges
@@ -2044,7 +2794,7 @@ async def stream_rewind(request: RewindRequest):
         is_error = reasoning.startswith("API Error:") if reasoning else False
         event_queue.put_nowait(AGUIEvent(
             type=AGUIEventType.STEP_FINISHED,
-            step_id=batch_id,
+            stepName=batch_id,
             metadata={
                 "node_id": node_id,
                 "batch_type": batch_type,
@@ -2058,6 +2808,16 @@ async def stream_rewind(request: RewindRequest):
 
     async def event_generator() -> AsyncGenerator[str, None]:
         """Generate AG-UI SSE events for rewind."""
+        global RUNNING_TASK
+
+        # Generate unique run ID for this rewind invocation (AG-UI protocol compliance)
+        # threadId will be set to the partition key (stable for same clinical note/settings)
+        run_id = str(uuid.uuid4())
+        thread_id: str = ""  # Will be set to partition key after it's computed
+        # parentRunId indicates this run forks from a previous traversal
+        # We use the batch_id as a reference to the parent run context
+        parent_run_id = request.batch_id
+
         try:
             # Configure LLM
             config_kwargs: dict = {}
@@ -2079,26 +2839,78 @@ async def stream_rewind(request: RewindRequest):
             print(f"[REWIND] Feedback: {request.feedback[:100]}..." if len(request.feedback) > 100 else f"[REWIND] Feedback: {request.feedback}")
 
             # Generate partition key from clinical note (must match original traversal)
+            # Look up current cache version for this configuration
+            rewind_cache_version = get_cache_version(
+                clinical_note=request.clinical_note,
+                provider=request.provider,
+                model=request.model or "",
+                temperature=request.temperature or 0.0,
+                system_prompt=request.system_prompt,
+                scaffolded=True,
+            )
             partition_key = generate_traversal_cache_key(
                 clinical_note=request.clinical_note,
                 provider=request.provider,
                 model=request.model or "",
                 temperature=request.temperature or 0.0,
                 system_prompt=request.system_prompt,
+                cache_version=rewind_cache_version,
             )
+            SESSION_PARTITION_KEYS.add(partition_key)
             # Set global PARTITION_KEY so retry_node can use it for fork
             traversal_module.PARTITION_KEY = partition_key
             print(f"[REWIND] Partition key set: {partition_key}")
+            # Use partition key as threadId (stable for same clinical note/settings)
+            thread_id = partition_key
 
             # RUN_STARTED with rewind metadata
-            yield f"data: {AGUIEvent(type=AGUIEventType.RUN_STARTED, metadata={'rewind_from': request.batch_id, 'feedback': request.feedback[:100]}).model_dump_json()}\n\n"
+            yield f"data: {AGUIEvent(type=AGUIEventType.RUN_STARTED, threadId=thread_id, runId=run_id, parentRunId=parent_run_id, metadata={'rewind_from': request.batch_id, 'feedback': request.feedback[:100]}).model_dump_json()}\n\n"
 
-            # Initialize persister (reset if persist_cache=False)
-            # NOTE: If persist_cache=False, the database is reset and there's nothing to load!
-            print(f"[REWIND] Initializing persister with reset={not request.persist_cache}")
-            if not request.persist_cache:
-                print("[REWIND] WARNING: persist_cache=False will reset database - rewind may fail!")
-            await initialize_persister(reset=not request.persist_cache)
+            # Initialize persister (always keep existing data for rewind to find fork point)
+            await initialize_persister(reset=False)
+
+            # Load cached state and build pre-rewind snapshot (backend is authoritative)
+            # Use traversal_module.PERSISTER since initialize_persister() sets it after import
+            cached_state = await traversal_module.PERSISTER.load(
+                partition_key=partition_key,
+                app_id="ROOT",
+            )
+            if cached_state is None:
+                raise RuntimeError(
+                    f"Cannot rewind: ROOT checkpoint not found for partition_key={partition_key}"
+                )
+
+            # Extract state dict
+            state_obj = cached_state.get("state")
+            if state_obj is None:
+                raise RuntimeError("cached_state has no 'state' field")
+            state_dict = state_obj.get_all() if hasattr(state_obj, 'get_all') else dict(state_obj)
+
+            # Prune state to rewind point (removes descendants, keeps ancestors)
+            pruned_state = prune_state_for_rewind(state_dict, request.batch_id)
+            pruned_batch_data = pruned_state.get("batch_data", {})
+            pruned_final_nodes = pruned_state.get("final_nodes", [])
+
+            print(f"[REWIND] Pruned state: {len(pruned_batch_data)} batches, {len(pruned_final_nodes)} final nodes")
+
+            # Build graph from pruned batch_data
+            snapshot_nodes, snapshot_edges, snapshot_seen_nodes, snapshot_seen_edges = build_graph_from_batch_data(
+                pruned_batch_data, pruned_final_nodes
+            )
+
+            # Emit STATE_SNAPSHOT with pre-rewind graph
+            snapshot_state = GraphState(
+                nodes=[GraphNode(**n) for n in snapshot_nodes],
+                edges=[GraphEdge(**e) for e in snapshot_edges]
+            )
+            yield f"data: {AGUIEvent(type=AGUIEventType.STATE_SNAPSHOT, snapshot=snapshot_state).model_dump_json()}\n\n"
+            print(f"[REWIND] Emitted STATE_SNAPSHOT: {len(snapshot_nodes)} nodes, {len(snapshot_edges)} edges")
+
+            # Populate seen_nodes/seen_edges for incremental updates
+            # seen_nodes maps node_id -> index in the nodes array
+            for idx, node in enumerate(snapshot_nodes):
+                seen_nodes[node["id"]] = idx
+            seen_edges.update(snapshot_seen_edges)
 
             # Set callback for streaming
             set_batch_callback(on_batch_complete)
@@ -2123,15 +2935,32 @@ async def stream_rewind(request: RewindRequest):
                     raise
 
             task = asyncio.create_task(run_retry())
+            RUNNING_TASK = task
+            client_disconnected = False
 
             # Stream events while running
             while not task.done():
+                # Check for client disconnection
+                if await http_request.is_disconnected():
+                    print("[REWIND] Client disconnected - cancelling rewind")
+                    task.cancel()
+                    client_disconnected = True
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    break
+
                 try:
                     event = await asyncio.wait_for(event_queue.get(), timeout=0.1)
                     if event is not None:
                         yield f"data: {event.model_dump_json()}\n\n"
                 except asyncio.TimeoutError:
                     continue
+
+            # If client disconnected, exit early
+            if client_disconnected:
+                return
 
             # Get final state
             final_state = await task
@@ -2166,25 +2995,92 @@ async def stream_rewind(request: RewindRequest):
 
             # RUN_FINISHED
             batch_data = final_state.get("batch_data", {})
+
+            # Build all decisions from batch_data (matches cached replay pattern)
+            all_decisions: list[dict] = []
+            sorted_batches = sorted(batch_data.items(), key=lambda x: x[1].get("depth", 0))
+            for batch_id, batch_info in sorted_batches:
+                node_id = batch_info.get("node_id")
+                candidates = batch_info.get("candidates", {})
+                selected_ids = batch_info.get("selected_ids", [])
+                reasoning = batch_info.get("reasoning", "")
+                seven_chr_authority = batch_info.get("seven_chr_authority")
+                depth = batch_info.get("depth", 0)
+                batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
+
+                # Transform selected_ids for sevenChrDef
+                transformed_selected_ids = selected_ids
+                if batch_type == "sevenChrDef" and node_id and selected_ids:
+                    transformed_selected_ids = [format_with_seventh_char(node_id, char) for char in selected_ids]
+
+                # Transform candidates for sevenChrDef
+                step_candidates = candidates
+                if batch_type == "sevenChrDef" and node_id:
+                    step_candidates = {}
+                    for char, desc in candidates.items():
+                        transformed_code = format_with_seventh_char(node_id, char)
+                        step_candidates[transformed_code] = f"{char}: {desc}"
+
+                # Compute selected_details
+                selected_details: dict[str, dict] = {}
+                for code in transformed_selected_ids:
+                    code_data = data.get(code, {})
+                    if node_has_seven_chr_def(code):
+                        cat = "activator"
+                    elif "X" in code:
+                        cat = "placeholder"
+                    else:
+                        cat = "ancestor"
+
+                    if code in data:
+                        code_depth = code_data.get("depth", depth + 1)
+                    else:
+                        code_depth = depth + 1
+
+                    has_children = bool(code_data.get("children"))
+                    is_activator = cat == "activator"
+                    billable = not has_children and not (seven_chr_authority is not None) and not is_activator
+
+                    selected_details[code] = {
+                        "depth": code_depth,
+                        "category": cat,
+                        "billable": billable,
+                    }
+
+                all_decisions.append({
+                    'batch_id': batch_id,
+                    'node_id': node_id,
+                    'batch_type': batch_type,
+                    'candidates': step_candidates,
+                    'selected_ids': transformed_selected_ids,
+                    'reasoning': reasoning,
+                    'selected_details': selected_details,
+                })
+
             run_finished_metadata = {
                 'final_nodes': final_nodes,
                 'batch_count': len(batch_data),
                 'rewind_from': request.batch_id,
+                'decisions': all_decisions,
             }
 
             print(f"[REWIND] Sending RUN_FINISHED: final_nodes={final_nodes}")
-            yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, metadata=run_finished_metadata).model_dump_json()}\n\n"
+            yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, threadId=thread_id, runId=run_id, metadata=run_finished_metadata).model_dump_json()}\n\n"
             print("[REWIND] Stream complete")
 
         except Exception as e:
             print(f"[REWIND] Error: {e}")
+            # Emit RUN_ERROR for unexpected exceptions
             error_event = AGUIEvent(
-                type=AGUIEventType.RUN_FINISHED,
-                metadata={"error": str(e)},
+                type=AGUIEventType.RUN_ERROR,
+                threadId=thread_id,
+                runId=run_id,
+                error=str(e),
             )
             yield f"data: {error_event.model_dump_json()}\n\n"
 
         finally:
+            RUNNING_TASK = None
             set_batch_callback(None)
             await cleanup_persister()
 

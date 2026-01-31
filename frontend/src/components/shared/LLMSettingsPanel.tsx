@@ -14,6 +14,8 @@ interface LLMSettingsPanelProps {
   config: LLMConfig;
   onChange: (config: LLMConfig) => void;
   disabled?: boolean;
+  // Cache invalidation callback (called when user clicks "Clear Cache")
+  onInvalidateCache?: () => void | Promise<void>;
   // Benchmark mode props for independent Infer Precursor Nodes toggle
   benchmarkMode?: boolean;
   benchmarkInferPrecursors?: boolean;
@@ -25,6 +27,7 @@ export function LLMSettingsPanel({
   config,
   onChange,
   disabled,
+  onInvalidateCache,
   benchmarkMode,
   benchmarkInferPrecursors,
   onBenchmarkInferPrecursorsChange,
@@ -263,7 +266,7 @@ export function LLMSettingsPanel({
           />
         </div>
 
-        <div className="setting-row">
+        <div className="setting-row trajectory-section">
           <label>
             Trajectory Type
             <span
@@ -271,6 +274,23 @@ export function LLMSettingsPanel({
               title="Scaffolded: Traverses the ICD-10-CM hierarchy step-by-step, exploring chapters, blocks, categories, subcategories, subclassifications, and extension codes. Also explores cross-references (codeFirst, codeAlso, useAdditionalCode, sevenChrDef).&#10;&#10;Zero-shot: Directly predicts final ICD-10-CM codes without hierarchical traversal."
             >ⓘ</span>
           </label>
+          {!(config.scaffolded ?? true) && (
+            <label className="infer-precursor-toggle">
+              <span>Infer Precursor Nodes</span>
+              <input
+                type="checkbox"
+                checked={benchmarkMode ? (benchmarkInferPrecursors ?? false) : (config.visualizePrediction ?? false)}
+                onChange={(e) => {
+                  if (benchmarkMode && onBenchmarkInferPrecursorsChange) {
+                    onBenchmarkInferPrecursorsChange(e.target.checked);
+                  } else {
+                    onChange({ ...config, visualizePrediction: e.target.checked });
+                  }
+                }}
+                disabled={disabled || (benchmarkMode && !benchmarkComplete)}
+              />
+            </label>
+          )}
           <div className="trajectory-toggle">
             <button
               type="button"
@@ -299,25 +319,29 @@ export function LLMSettingsPanel({
           </div>
         </div>
 
-        {!(config.scaffolded ?? true) && (
-          <div className="setting-row visualize-row">
-            <label className="visualize-toggle">
-              <span>Infer Precursor Nodes</span>
-              <input
-                type="checkbox"
-                checked={benchmarkMode ? (benchmarkInferPrecursors ?? false) : (config.visualizePrediction ?? false)}
-                onChange={(e) => {
-                  if (benchmarkMode && onBenchmarkInferPrecursorsChange) {
-                    onBenchmarkInferPrecursorsChange(e.target.checked);
-                  } else {
-                    onChange({ ...config, visualizePrediction: e.target.checked });
-                  }
-                }}
-                disabled={disabled || (benchmarkMode && !benchmarkComplete)}
-              />
-            </label>
-          </div>
-        )}
+        {/* Cache */}
+        <div className="setting-row cache-row">
+          <label className="cache-header-label">
+            <span>Cached</span>
+            <input
+              type="checkbox"
+              checked={config.persistCache ?? true}
+              onChange={(e) => onChange({ ...config, persistCache: e.target.checked })}
+              disabled={disabled}
+            />
+          </label>
+          <button
+            type="button"
+            className="clear-cache-btn"
+            onClick={() => onInvalidateCache?.()}
+            disabled={disabled || !(config.persistCache ?? true) || !onInvalidateCache}
+            title={config.persistCache ?? true
+              ? 'Invalidate cache for current settings'
+              : 'Enable caching first'}
+          >
+            Clear Cache
+          </button>
+        </div>
       </div>
 
       <SystemPromptAccordion
