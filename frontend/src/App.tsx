@@ -42,7 +42,7 @@ function TraversalUI() {
   });
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>(SIDEBAR_TABS.CLINICAL_NOTE);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [_sidebarRefElement, setSidebarRefElement] = useState<HTMLElement | null>(null);
+  const [, setSidebarRefElement] = useState<HTMLElement | null>(null);
 
   // Per-feature view tab states (Graph vs Report)
   const [visualizeViewTab, setVisualizeViewTab] = useState<ViewTab>('graph');
@@ -58,12 +58,12 @@ function TraversalUI() {
   const [codeInput, setCodeInput] = useState('');
   const [graphData, setGraphData] = useState<{ nodes: GraphNode[]; edges: GraphEdge[] } | null>(null);
   const [isLoadingGraph, setIsLoadingGraph] = useState(false);
-  const [_graphError, setGraphError] = useState<string | null>(null);
+  const [, setGraphError] = useState<string | null>(null);
   const [visualizeFitTrigger, setVisualizeFitTrigger] = useState(0);
 
   // Zero-shot visualization graph (for Traverse tab when visualizePrediction is ON)
   const [zeroShotVisualization, setZeroShotVisualization] = useState<{ nodes: GraphNode[]; edges: GraphEdge[] } | null>(null);
-  const [_isLoadingZeroShotViz, setIsLoadingZeroShotViz] = useState(false);
+  const [, setIsLoadingZeroShotViz] = useState(false);
 
   // Effect to visualize zero-shot predictions when enabled
   useEffect(() => {
@@ -311,6 +311,7 @@ function TraversalUI() {
                     selectedNode={null}
                     onNodeClick={() => { }}
                     codesBarLabel="Submitted Codes"
+                    onEmptySpaceClick={() => setSidebarCollapsed(true)}
                   />
                 ) : (
                   <VisualizeReportViewer
@@ -355,7 +356,9 @@ function TraversalUI() {
                       allowRewind={true}
                       rewindingNodeId={traverse.state.rewindingNodeId}
                       onNodeRewindClick={traverse.actions.handleNodeRewindClick}
+                      elapsedTime={traverse.state.traverseElapsedTime}
                       codesBarLabel="Extracted Codes"
+                      onEmptySpaceClick={() => setSidebarCollapsed(true)}
                     />
                   ) : (
                     <TrajectoryViewer
@@ -406,14 +409,10 @@ function TraversalUI() {
                     streamingTraversedIds={benchmark.state.streamingTraversedIds}
                     showXMarkers={showXMarkers}
                     expectedLeaves={benchmark.state.benchmarkExpectedCodes}
-                    finalizedCodes={
-                      benchmark.state.benchmarkStatus === 'complete'
-                        ? [...benchmark.state.benchmarkExactMatchedCodes]
-                        : [...benchmark.state.benchmarkExpectedCodes]
-                    }
+                    finalizedCodes={[...benchmark.state.benchmarkExpectedCodes]}
                     codesBarLabel={
                       benchmark.state.benchmarkStatus === 'complete'
-                        ? "Matched Final Codes"
+                        ? "Benchmarked Final Codes"
                         : "Target Codes"
                     }
                     onRemoveExpectedCode={
@@ -421,13 +420,16 @@ function TraversalUI() {
                         ? benchmark.actions.handleBenchmarkRemoveCode
                         : undefined
                     }
+                    elapsedTime={benchmark.state.benchmarkElapsedTime}
+                    onEmptySpaceClick={() => setSidebarCollapsed(true)}
                   />
                 ) : (
                   <BenchmarkReportViewer
                     metrics={activeMetrics}
                     decisions={benchmark.state.benchmarkDecisions}
                     expectedCodes={benchmark.state.benchmarkExpectedCodes}
-                    combinedNodes={benchmark.state.benchmarkCombinedNodes}
+                    expectedGraph={benchmark.state.benchmarkExpectedGraph}
+                    combinedNodes={activeNodes}
                     traversedNodes={benchmark.state.benchmarkTraversedNodes}
                     status={benchmark.state.benchmarkStatus}
                     currentStep={benchmark.state.benchmarkCurrentStep}

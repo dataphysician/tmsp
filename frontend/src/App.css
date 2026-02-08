@@ -868,11 +868,33 @@ input[type="checkbox"]:disabled {
   font-size: 0.75rem;
   font-family: monospace;
   font-weight: 500;
+  cursor: default;
 }
 
 .code-badge.invalid {
   background: rgba(239, 68, 68, 0.15);
   color: var(--error);
+}
+
+/* Benchmark outcome code-badge colors */
+.code-badge.outcome-exact {
+  background: rgba(34, 197, 94, 0.1);
+  color: #16a34a;
+}
+
+.code-badge.outcome-undershoot {
+  background: rgba(245, 158, 11, 0.1);
+  color: #f59e0b;
+}
+
+.code-badge.outcome-overshoot {
+  background: rgba(239, 68, 68, 0.1);
+  color: #ef4444;
+}
+
+.code-badge.outcome-missed {
+  background: rgba(99, 102, 241, 0.1);
+  color: #6366f1;
 }
 
 .codes-sort {
@@ -1279,18 +1301,26 @@ input[type="checkbox"]:disabled {
 /* Shared View Header Bar (used by Graph and Trajectory views) */
 .view-header-bar {
   display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
+  align-items: flex-start;
+  gap: 1rem;
   padding: 0.5rem 1rem 0.75rem 1rem;
   border-bottom: 1px solid var(--border);
   background: var(--bg);
   flex-shrink: 0;
+  overflow: hidden;
 }
 
-.view-header-top-row {
+.view-header-info {
   display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
+  flex-direction: column;
+  gap: 0.25rem;
+  flex: 1;
+  min-width: 0;
+}
+
+.view-header-actions {
+  flex-shrink: 0;
+  padding-top: 0.125rem;
 }
 
 .view-status-section {
@@ -2417,6 +2447,56 @@ input[type="checkbox"]:disabled {
   text-transform: uppercase;
 }
 
+/* Dual-stat layout: two pairs [X LABEL] [Y LABEL] side-by-side */
+.count-item.dual-stat {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  padding: 0.25rem 0.5rem;
+}
+
+.count-item.dual-stat .dual-pair {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.count-item.dual-stat .dual-pair + .dual-pair {
+  border-left: 1px solid var(--border);
+  margin-left: 0.625rem;
+  padding-left: 0.625rem;
+}
+
+.count-item.dual-stat .dual-value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1;
+}
+
+.count-item.dual-stat.missed .dual-value {
+  color: #6366f1;
+}
+
+.count-item.dual-stat .dual-value.dual-total {
+  opacity: 0.55;
+}
+
+.count-item.dual-stat .dual-label {
+  font-size: 0.625rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.count-item.dual-stat .count-qualifier {
+  font-size: 0.5625rem;
+  opacity: 0.7;
+}
+
 .count-item.exact .count-value {
   color: #16a34a;
 }
@@ -2877,12 +2957,17 @@ input[type="checkbox"]:disabled {
   font-style: italic;
 }
 
-/* Benchmark outcome counts in status line */
+/* Benchmark outcome counts in alignment line */
 .benchmark-outcome-counts {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
-  margin-left: 0.75rem;
+}
+
+.benchmark-outcome-prefix {
+  color: var(--text-secondary);
+  font-weight: 500;
+  margin-right: 0.25rem;
 }
 
 .benchmark-outcome-counts .benchmark-stat {
@@ -2900,8 +2985,14 @@ input[type="checkbox"]:disabled {
   color: #16a34a; /* green */
 }
 
-.benchmark-outcome-counts .benchmark-stat.overshoot .outcome-label {
+.benchmark-outcome-counts .benchmark-stat.missed .outcome-label {
   color: #6366f1; /* periwinkle/indigo */
+  font-weight: 700;
+}
+
+.benchmark-outcome-counts .benchmark-stat.overshoot .outcome-label {
+  color: #ef4444; /* red */
+  font-weight: 700;
 }
 
 .benchmark-outcome-counts .benchmark-stat.undershoot .outcome-label {
@@ -3555,6 +3646,7 @@ input[type="checkbox"]:disabled {
 
 .confirm-modal-body {
   padding: 1.25rem;
+  text-align: center;
 }
 
 .confirm-modal-body p {

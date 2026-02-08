@@ -233,35 +233,77 @@ uv run tmsp-server --port 8080
 
 ### Programmatic API
 
+#### Visualize
+
+```python
+from graph import build_graph
+
+result = build_graph(
+    codes=["E11.65", "N18.3"],
+)
+
+print(result["nodes"])          # set of all nodes in the graph
+print(result["tree"])           # dict mapping parent -> set of children
+print(result["leaves"])         # the original input codes
+print(result["lateral_links"])  # list of (source_node, anchor_code, key)
+```
+
+#### Traverse
+
 ```python
 from agent import run_traversal
 
 result = await run_traversal(
     clinical_note="Patient with type 2 diabetes and chronic kidney disease stage 3",
-    provider="openai",
-    api_key="sk-...",
-    selector="llm",
+    provider="vertexai",
 )
 
 print(result["final_nodes"])  # ['E11.65', 'N18.3']
 print(result["batch_data"])   # Full decision tree with reasoning
 ```
 
-#### Zero-Shot Mode
+#### Zero-Shot
 
 ```python
-# Zero-shot mode (direct generation)
 from agent import run_zero_shot
 
 codes, reasoning, was_cached = await run_zero_shot(
     clinical_note="Patient with type 2 diabetes and chronic kidney disease stage 3",
-    provider="openai",
-    model="gpt-4o",
+    provider="vertexai",
+    model="gemini-2.5-flash",
     temperature=0.0,
 )
 
 print(codes)      # ['E11.65', 'N18.3']
 print(reasoning)  # Full reasoning explanation
+```
+
+#### Benchmark
+
+```python
+from agent.benchmark import run_benchmark
+
+code_metrics, path_metrics = await run_benchmark(
+    clinical_note="Patient with type 2 diabetes and chronic kidney disease stage 3",
+    expected_codes=["E11.65", "N18.3"],
+    provider="vertexai",
+)
+
+print(f"Recall: {code_metrics['recall']:.2%}")
+print(f"Missed: {code_metrics['missed']}")
+print(f"Undershoot: {code_metrics['undershoot']}")
+```
+
+Zero-shot benchmark:
+
+```python
+code_metrics, path_metrics = await run_benchmark(
+    clinical_note="...",
+    expected_codes=["E11.65", "N18.3"],
+    provider="vertexai",
+    model="gemini-2.5-flash",
+    scaffolded=False,
+)
 ```
 
 ## Supported LLM Providers

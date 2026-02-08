@@ -422,9 +422,6 @@ export function BenchmarkReportViewer({
     });
     metrics?.otherCodes.forEach(code => finalizedCodes.add(code));
 
-    // Build set of traversed node IDs for quick lookup (authoritative source for what was visited)
-    const traversedIds = new Set(traversedNodes?.map(n => n.id) || []);
-
     // 1. Target + Shared interim: from combinedNodes (expected graph with status overlays)
     const nodes = combinedNodes || [];
     nodes.forEach(n => {
@@ -433,11 +430,11 @@ export function BenchmarkReportViewer({
 
       const status = 'benchmarkStatus' in n ? n.benchmarkStatus : undefined;
 
-      if (status === 'expected' && !traversedIds.has(n.id)) {
+      if (status === 'expected') {
         // Target interim: expected nodes that were never traversed (missed path ancestors)
         target.push(n);
-      } else if (traversedIds.has(n.id) && expectedNodeIds.has(n.id)) {
-        // Shared interim: traversed nodes that are in expected graph
+      } else if (status === 'traversed' && expectedNodeIds.has(n.id)) {
+        // Shared interim: traversed nodes that are in expected graph (includes precursors)
         shared.push(n);
       }
     });
@@ -546,7 +543,7 @@ export function BenchmarkReportViewer({
               onClick={() => toggleSection('metrics')}
             >
               <span className="section-toggle">{expandedSections.has('metrics') ? '−' : '+'}</span>
-              <span className="section-title">Benchmark Metrics</span>
+              <span className="section-title">Traversal Metrics</span>
             </button>
             {expandedSections.has('metrics') && (
               <div className="section-content metrics-panel">
@@ -559,37 +556,7 @@ export function BenchmarkReportViewer({
                 {/* Count Summary (Right Side) */}
                 <div className="metrics-counts compact">
                   <div className="count-grid two-row">
-                    {/* Row 1: Column-level highlights (expand interim, highlight column) */}
-                    <div className="count-row column-level">
-                      <div
-                        className={`count-item missed interactive ${highlightMode === 'missed' ? 'selected' : ''}`}
-                        onClick={(e) => handleHighlightClick('missed', e)}
-                        role="button"
-                        tabIndex={0}
-                      >
-                        <span className="count-value">{hideOvershootUndershoot ? metrics.missedCount + metrics.overshootCount + metrics.undershootCount : metrics.missedCount}</span>
-                        <span className="count-label">Missed</span>
-                      </div>
-                      <div
-                        className={`count-item interactive ${highlightMode === 'shared' ? 'selected' : ''}`}
-                        onClick={(e) => handleHighlightClick('shared', e)}
-                        role="button"
-                        tabIndex={0}
-                      >
-                        <span className="count-value">{metrics.exactCount + (hideOvershootUndershoot ? 0 : metrics.undershootCount)}</span>
-                        <span className="count-label">Correct</span>
-                      </div>
-                      <div
-                        className={`count-item interactive ${highlightMode === 'other' ? 'selected' : ''}`}
-                        onClick={(e) => handleHighlightClick('other', e)}
-                        role="button"
-                        tabIndex={0}
-                      >
-                        <span className="count-value">{metrics.otherCount + (hideOvershootUndershoot ? 0 : metrics.overshootCount)}</span>
-                        <span className="count-label">Extra</span>
-                      </div>
-                    </div>
-                    {/* Row 2: Code-level highlights (collapse interim, highlight codes) */}
+                    {/* Row 1: Code-level highlights (collapse interim, highlight codes) */}
                     <div className="count-row code-level">
                       <div
                         className={`count-item exact interactive ${highlightMode === 'matched' ? 'selected' : ''}`}
@@ -617,6 +584,72 @@ export function BenchmarkReportViewer({
                       >
                         <span className="count-value">{hideOvershootUndershoot ? 0 : metrics.overshootCount}</span>
                         <span className="count-label">Overshot</span>
+                      </div>
+                    </div>
+                    {/* Row 2: Column-level highlights (expand interim, highlight column) */}
+                    <div className="count-row column-level">
+                      <div
+                        className={`count-item missed interactive dual-stat ${highlightMode === 'missed' ? 'selected' : ''}`}
+                        onClick={(e) => handleHighlightClick('missed', e)}
+                        role="button"
+                        tabIndex={0}
+                      >
+                        {(() => {
+                          const finalCount = hideOvershootUndershoot ? metrics.missedCount + metrics.overshootCount + metrics.undershootCount : metrics.missedCount;
+                          const totalCount = finalCount + interimTarget.length;
+                          return (<>
+                            <span className="dual-pair">
+                              <span className="dual-value">{finalCount}</span>
+                              <span className="dual-label">Missed<br /><span className="count-qualifier">(Final)</span></span>
+                            </span>
+                            <span className="dual-pair">
+                              <span className="dual-value dual-total">{totalCount}</span>
+                              <span className="dual-label">Missed<br /><span className="count-qualifier">(Total)</span></span>
+                            </span>
+                          </>);
+                        })()}
+                      </div>
+                      <div
+                        className={`count-item interactive dual-stat ${highlightMode === 'shared' ? 'selected' : ''}`}
+                        onClick={(e) => handleHighlightClick('shared', e)}
+                        role="button"
+                        tabIndex={0}
+                      >
+                        {(() => {
+                          const finalCount = metrics.exactCount + (hideOvershootUndershoot ? 0 : metrics.undershootCount);
+                          const totalCount = finalCount + interimShared.length;
+                          return (<>
+                            <span className="dual-pair">
+                              <span className="dual-value">{finalCount}</span>
+                              <span className="dual-label">Aligned<br /><span className="count-qualifier">(Final)</span></span>
+                            </span>
+                            <span className="dual-pair">
+                              <span className="dual-value dual-total">{totalCount}</span>
+                              <span className="dual-label">Aligned<br /><span className="count-qualifier">(Total)</span></span>
+                            </span>
+                          </>);
+                        })()}
+                      </div>
+                      <div
+                        className={`count-item interactive dual-stat ${highlightMode === 'other' ? 'selected' : ''}`}
+                        onClick={(e) => handleHighlightClick('other', e)}
+                        role="button"
+                        tabIndex={0}
+                      >
+                        {(() => {
+                          const finalCount = metrics.otherCount + (hideOvershootUndershoot ? 0 : metrics.overshootCount);
+                          const totalCount = finalCount + interimBenchmark.length;
+                          return (<>
+                            <span className="dual-pair">
+                              <span className="dual-value">{finalCount}</span>
+                              <span className="dual-label">Extra<br /><span className="count-qualifier">(Final)</span></span>
+                            </span>
+                            <span className="dual-pair">
+                              <span className="dual-value dual-total">{totalCount}</span>
+                              <span className="dual-label">Extra<br /><span className="count-qualifier">(Total)</span></span>
+                            </span>
+                          </>);
+                        })()}
                       </div>
                     </div>
                   </div>
@@ -688,7 +721,7 @@ export function BenchmarkReportViewer({
                   style={{ cursor: 'pointer' }}
                 >
                   <div className="venn-region-label interactive">
-                    Correct
+                    Aligned
                   </div>
                   <div className="venn-codes">
                     {groupedOutcomes.exact.map(outcome => (

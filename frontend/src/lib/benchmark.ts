@@ -809,14 +809,33 @@ export function computeFinalizedComparison(
     const targetTraversed = traversedSet.has(tgt);
 
     if (sourceTraversed && !targetTraversed) {
-      const descendants = expectedDescendantsMap.get(tgt) || new Set();
-      const anyDescendantTraversed = [...descendants].some((d) => traversedSet.has(d));
+      // Show X marker for ANY skipped edge (visual indicator of path deviation)
+      // Even if descendants were reached via alternate path, the direct edge was skipped
+      missedEdgeMarkers.push({
+        edgeSource: src,
+        edgeTarget: tgt,
+        missedCode: tgt,
+      });
+    }
+  }
 
-      if (!anyDescendantTraversed) {
+  // Explicitly handle ROOT → Chapter missed edges for expected chapters
+  // Mark as missed if the Chapter itself was never traversed (never selected at ROOT)
+  for (const node of nodes) {
+    // Only check Chapter nodes (depth 1, excluding ROOT)
+    if (node.depth !== 1 || node.id === 'ROOT') continue;
+
+    // If this expected chapter was not traversed, the ROOT → Chapter decision was missed
+    if (!traversedSet.has(node.id)) {
+      // Avoid duplicate markers
+      const alreadyMarked = missedEdgeMarkers.some(
+        m => m.edgeSource === 'ROOT' && m.edgeTarget === node.id
+      );
+      if (!alreadyMarked) {
         missedEdgeMarkers.push({
-          edgeSource: src,
-          edgeTarget: tgt,
-          missedCode: tgt,
+          edgeSource: 'ROOT',
+          edgeTarget: node.id,
+          missedCode: node.id,
         });
       }
     }

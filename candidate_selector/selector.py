@@ -927,21 +927,3 @@ SELECTOR_REGISTRY: dict[str, SelectorProtocol] = {
 }
 
 
-def get_selector(name: str) -> SelectorProtocol:
-    """Get a selector function by name.
-
-    Args:
-        name: Selector name ("llm" or "manual")
-
-    Returns:
-        Selector function conforming to SelectorProtocol
-
-    Raises:
-        ValueError: If selector name is unknown
-    """
-    if name not in SELECTOR_REGISTRY:
-        raise ValueError(
-            f"Unknown selector: {name}. "
-            f"Available: {', '.join(SELECTOR_REGISTRY.keys())}"
-        )
-    return SELECTOR_REGISTRY[name]

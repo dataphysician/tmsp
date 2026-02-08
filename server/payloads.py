@@ -15,6 +15,7 @@ class GraphRequest(BaseModel):
     """Request body for building a graph from ICD-10-CM codes."""
 
     codes: list[str]
+    full_paths: bool = False  # If true, use full paths to ROOT (no nearest-anchor optimization)
 
 
 class GraphStats(BaseModel):

@@ -147,19 +147,6 @@ def trace_ancestors(code: str, index: dict[str, dict] = data) -> list[str]:
     return ancestors
 
 
-def trace_ancestors_batch(codes: list[str], index: dict[str, dict] = data) -> list[list[str]]:
-    """Trace ancestors for multiple codes.
-
-    Args:
-        codes: List of ICD-10-CM codes to trace
-        index: The flat index dict (defaults to loaded data)
-
-    Returns:
-        List of ancestor lists, one per input code
-    """
-    return [trace_ancestors(code, index) for code in codes]
-
-
 # Lateral link keys - create anchors to other codes in the batch
 LATERAL_KEYS = ("useAdditionalCode", "codeFirst", "codeAlso")
 
@@ -167,24 +154,7 @@ LATERAL_KEYS = ("useAdditionalCode", "codeFirst", "codeAlso")
 VERTICAL_KEYS = ("sevenChrDef",)
 
 
-def get_lateral_links(code: str, index: dict[str, dict] = data) -> set[str]:
-    """Extract all codes linked via lateral metadata keys from a code's metadata."""
-    if code not in index:
-        return set()
-
-    metadata = index[code].get("metadata", {})
-    linked: set[str] = set()
-
-    for key in LATERAL_KEYS:
-        if key in metadata:
-            value = metadata[key]
-            if isinstance(value, dict):
-                linked.update(value.keys())
-
-    return linked
-
-
-def get_seventh_char_def(
+def trace_seventh_char_def(
     code: str, index: dict[str, dict] = data
 ) -> tuple[dict[str, str], str] | None:
     """Find sevenChrDef in the direct parent-child ancestry of a code.
@@ -513,191 +483,47 @@ def trace_with_nearest_anchor(
     return result
 
 
-def build_graph(
-    codes: list[str],
-    index: dict[str, dict] = data,
-) -> dict:
-    """Find the minimal set of nodes to cover all paths from ROOT to end codes.
+# ============================================================================
+# Build Graph Helper Methods
+# ============================================================================
 
-    Uses Nearest-Anchor Provenance to reduce paths where lateral links exist.
-    Tracks sevenChrDef for leaf nodes in their direct parent-child ancestry.
 
-    Args:
-        codes: List of end codes
-        index: The flat index dict
+def _collect_seventh_char_info(
+    code: str,
+    index: dict[str, dict],
+) -> tuple[tuple[str, str, str] | None, set[str]]:
+    """Collect 7th char info and placeholder codes for a code.
 
     Returns:
-        dict with:
-        - nodes: set of all required nodes
-        - tree: dict mapping parent -> set of children
-        - roots: set of top-level nodes (connect to ROOT)
-        - leaves: the original input codes
-        - anchored: dict of code -> (anchor_code, key, source_node)
-        - lateral_links: list of (source_node, anchor_code, key) for visualization
-        - seventh_char: dict of code -> (char, meaning, source_node) for codes with 7th char
-        - placeholders: set of placeholder codes (ending in X)
+        (seventh_char_entry or None, placeholder_codes)
     """
-    provenance = trace_with_nearest_anchor(codes, index)
+    char = extract_seventh_char(code)
+    if not char:
+        return None, set()
 
-    all_nodes: set[str] = set()
-    tree: dict[str, set[str]] = {}
-    roots: set[str] = set()
-    anchored: dict[str, tuple[str, str, str]] = {}
-    lateral_links: list[tuple[str, str, str]] = []  # (source, anchor, key)
-    seventh_char: dict[str, tuple[str, str, str]] = {}
-    placeholders: set[str] = set()
+    result = trace_seventh_char_def(code, index)
+    if result:
+        seven_def, source_node = result
+        if char in seven_def:
+            return (char, seven_def[char], source_node), get_placeholder_codes(code, index)
+    return None, get_placeholder_codes(code, index)
 
-    for code in codes:
-        info = provenance[code]
-        ancestors = info["ancestors"]
-        anchor = info["anchor"]
-        chain_lateral_links = info.get("lateral_links", [])
 
-        # Add code and all ancestors to node set
-        all_nodes.add(code)
-        all_nodes.update(ancestors)
+def _build_tree_edges(tree: dict[str, set[str]], chain: list[str]) -> None:
+    """Add edges to tree from a code->ancestors chain (mutates tree)."""
+    for i in range(len(chain) - 1):
+        child, parent = chain[i], chain[i + 1]
+        if parent not in tree:
+            tree[parent] = set()
+        tree[parent].add(child)
 
-        # Record direct anchor for this code
-        if anchor:
-            anchored[code] = anchor
 
-        # Collect ALL lateral links from this chain (including intermediate ancestors)
-        for src, tgt, key in chain_lateral_links:
-            lateral_links.append((src, tgt, key))
-
-        # Check for 7th character in leaf nodes (all input codes)
-        char = extract_seventh_char(code)
-        if char:
-            result = get_seventh_char_def(code, index)
-            if result:
-                seven_def, source_node = result
-                if char in seven_def:
-                    seventh_char[code] = (char, seven_def[char], source_node)
-            # Collect placeholder codes from the chain
-            placeholders.update(get_placeholder_codes(code, index))
-
-        # Build tree edges (child -> parent relationship, but we store parent -> children)
-        # Lateral links ARE included in tree for connectivity - they're marked as LATERAL
-        # edge type in the server for styling purposes
-        chain = [code] + ancestors
-        for i in range(len(chain) - 1):
-            child, parent = chain[i], chain[i + 1]
-            if parent not in tree:
-                tree[parent] = set()
-            tree[parent].add(child)
-
-        # Identify root of this chain
-        # If the chain has any lateral links, the root is determined by the first non-lateral ancestor
-        # Otherwise, use the top of the chain
-        if not chain_lateral_links:
-            # No lateral links - use top ancestor as root
-            if ancestors:
-                root = ancestors[-1]
-            else:
-                root = code
-            roots.add(root)
-        # If there are lateral links, the chain connects to an existing tree via lateral edge
-
-    # Filter lateral links to only show when both endpoints are in the graph
-    lateral_links = [
-        (src, tgt, key)
-        for src, tgt, key in set(lateral_links)
-        if src in all_nodes and tgt in all_nodes
-    ]
-
-    return {
-        "nodes": all_nodes,
-        "tree": tree,
-        "roots": roots,
-        "leaves": set(codes),
-        "anchored": anchored,
-        "lateral_links": lateral_links,
-        "seventh_char": seventh_char,
-        "placeholders": placeholders,
-        "count": len(all_nodes),
-    }
-
-def build_graph_full_paths(
-    codes: list[str],
-    index: dict[str, dict] = data,
-) -> dict:
-    """Build graph showing all full paths from ROOT to target codes.
-
-    This is the "Show all paths" mode - every target code gets its complete
-    ancestry traced to ROOT, with lateral links shown as visual annotations.
-
-    Algorithm:
-    1. Walk parent(code) to ROOT for each target, collecting all ancestors
-    2. Build tree edges by connecting each node to its closest retained ancestor
-    3. Add lateral links as separate visual edges (only if both endpoints in nodes)
-
-    Args:
-        codes: List of end codes
-        index: The flat index dict
-
-    Returns:
-        dict with:
-        - nodes: set of all required nodes
-        - tree: dict mapping parent -> set of children
-        - roots: set of top-level nodes (connect to ROOT)
-        - leaves: the original input codes
-        - anchored: dict (empty, kept for API compatibility)
-        - lateral_links: list of (source_node, target_code, key) for visualization
-        - seventh_char: dict of code -> (char, meaning, source_node) for codes with 7th char
-        - placeholders: set of placeholder codes (ending in X)
-    """
-    all_nodes: set[str] = set()
-    leaves = set(codes)
-    seventh_char: dict[str, tuple[str, str, str]] = {}
-    placeholders: set[str] = set()
-
-    # Step 1: Collect all nodes by walking each target to ROOT
-    code_ancestors: dict[str, list[str]] = {}
-    for code in codes:
-        ancestors = trace_ancestors(code, index)
-        code_ancestors[code] = ancestors
-        all_nodes.add(code)
-        all_nodes.update(ancestors)
-
-        # Collect 7th char and placeholder info
-        char = extract_seventh_char(code)
-        if char:
-            result = get_seventh_char_def(code, index)
-            if result:
-                seven_def, source_node = result
-                if char in seven_def:
-                    seventh_char[code] = (char, seven_def[char], source_node)
-            placeholders.update(get_placeholder_codes(code, index))
-
-    # Step 2: Build tree edges (parent -> children)
-    tree: dict[str, set[str]] = {}
-    roots: set[str] = set()
-
-    for node in all_nodes:
-        if node not in index:
-            continue
-        # Find closest ancestor that's also in all_nodes
-        parent = get_parent_code(index[node])
-        if parent is None or parent == "ROOT":
-            roots.add(node)
-            continue
-
-        # Walk up until we find a retained ancestor
-        current = parent
-        while current and current not in all_nodes:
-            if current not in index:
-                break
-            current = get_parent_code(index[current])
-
-        if current is None or current == "ROOT" or current not in all_nodes:
-            roots.add(node)
-        else:
-            if current not in tree:
-                tree[current] = set()
-            tree[current].add(node)
-
-    # Step 3: Collect lateral links (only if both endpoints in nodes)
-    lateral_links: list[tuple[str, str, str]] = []
+def _collect_lateral_links_from_nodes(
+    all_nodes: set[str],
+    index: dict[str, dict],
+) -> list[tuple[str, str, str]]:
+    """Scan all nodes for lateral links (used in show_all_paths mode)."""
+    lateral_links = []
     for node in all_nodes:
         if node not in index:
             continue
@@ -711,16 +537,109 @@ def build_graph_full_paths(
             for linked in linked_codes:
                 if linked in all_nodes:
                     lateral_links.append((node, linked, key))
+    return list(set(lateral_links))
 
-    # Deduplicate lateral links
-    lateral_links = list(set(lateral_links))
+
+# ============================================================================
+# Build Graph
+# ============================================================================
+
+
+def build_graph(
+    codes: list[str],
+    index: dict[str, dict] = data,
+    show_all_paths: bool = False,
+) -> dict:
+    """Build graph from ROOT to target codes.
+
+    Args:
+        codes: List of end codes
+        index: The flat index dict
+        show_all_paths: If False (default), use nearest-anchor provenance
+                        for minimal graph. If True, show complete paths
+                        to ROOT for all codes.
+
+    Returns:
+        dict with:
+        - nodes: set of all required nodes
+        - tree: dict mapping parent -> set of children
+        - roots: set of top-level nodes (connect to ROOT)
+        - leaves: the original input codes
+        - anchored: dict of code -> (anchor_code, key, source_node)
+        - lateral_links: list of (source_node, anchor_code, key) for visualization
+        - seventh_char: dict of code -> (char, meaning, source_node) for codes with 7th char
+        - placeholders: set of placeholder codes (ending in X)
+    """
+    all_nodes: set[str] = set()
+    tree: dict[str, set[str]] = {}
+    roots: set[str] = set()
+    anchored: dict[str, tuple[str, str, str]] = {}
+    lateral_links: list[tuple[str, str, str]] = []
+    seventh_char: dict[str, tuple[str, str, str]] = {}
+    placeholders: set[str] = set()
+
+    # Compute provenance once for all codes (batch mode enables cross-code lateral discovery)
+    provenance = None if show_all_paths else trace_with_nearest_anchor(codes, index)
+
+    for code in codes:
+        if show_all_paths:
+            # Full paths mode: simple ancestry trace
+            ancestors = trace_ancestors(code, index)
+            chain_lateral_links: list[tuple[str, str, str]] = []
+            anchor = None
+        else:
+            # Minimal mode: use nearest-anchor provenance
+            info = provenance[code]
+            ancestors = info["ancestors"]
+            anchor = info["anchor"]
+            chain_lateral_links = info.get("lateral_links", [])
+
+        # Add code and ancestors to node set
+        all_nodes.add(code)
+        all_nodes.update(ancestors)
+
+        # Record anchor (minimal mode only)
+        if anchor:
+            anchored[code] = anchor
+
+        # Collect lateral links from provenance (minimal mode only)
+        for src, tgt, key in chain_lateral_links:
+            lateral_links.append((src, tgt, key))
+
+        # Collect 7th char info
+        seventh_entry, placeholder_codes = _collect_seventh_char_info(code, index)
+        if seventh_entry:
+            seventh_char[code] = seventh_entry
+        placeholders.update(placeholder_codes)
+
+        # Build tree edges
+        chain = [code] + ancestors
+        _build_tree_edges(tree, chain)
+
+        # Identify root
+        if show_all_paths or not chain_lateral_links:
+            if ancestors:
+                roots.add(ancestors[-1])
+            else:
+                roots.add(code)
+
+    # Collect lateral links (different approach per mode)
+    if show_all_paths:
+        lateral_links = _collect_lateral_links_from_nodes(all_nodes, index)
+    else:
+        # Filter to only show when both endpoints in graph
+        lateral_links = [
+            (src, tgt, key)
+            for src, tgt, key in set(lateral_links)
+            if src in all_nodes and tgt in all_nodes
+        ]
 
     return {
         "nodes": all_nodes,
         "tree": tree,
         "roots": roots,
-        "leaves": leaves,
-        "anchored": {},  # No longer used, kept for API compatibility
+        "leaves": set(codes),
+        "anchored": anchored,
         "lateral_links": lateral_links,
         "seventh_char": seventh_char,
         "placeholders": placeholders,

@@ -1,12 +1,12 @@
 """Main Burr application for ICD-10-CM traversal
 
 Provides:
-- build_app(): Creates Burr application with optional persistence
+- build_traversal_app(): Creates Burr application with optional persistence
 - retry_node(): Retry from checkpoint with feedback
 - generate_traversal_cache_key(): Generate cache key for cross-run caching
 
 Usage:
-    from agent.traversal import build_app, generate_traversal_cache_key
+    from agent.traversal import build_traversal_app, generate_traversal_cache_key
     from candidate_selector import configure_llm, LLM_CONFIG
 
     # Configure LLM (required for candidate_selector)
@@ -25,7 +25,7 @@ Usage:
     )
 
     # Build and run (uses cache if available)
-    app = await build_app(
+    app = await build_traversal_app(
         context="Patient with type 2 diabetes...",
         default_selector="llm",
         partition_key=partition_key,
@@ -249,7 +249,8 @@ def prune_state_for_rewind(state_dict: dict, rewind_batch_id: str) -> dict:
     This ensures that when we rewind to a batch:
     1. The rewind batch's selection is cleared (will be re-computed with feedback)
     2. All descendant batches are removed
-    3. Final nodes from descendants are removed
+    3. Sibling sevenChrDef batches are removed (they depend on children selection)
+    4. Final nodes from descendants are removed
 
     Args:
         state_dict: The full state dict from checkpoint
@@ -263,6 +264,15 @@ def prune_state_for_rewind(state_dict: dict, rewind_batch_id: str) -> dict:
 
     # Find all descendant batch_ids
     descendants = get_descendant_batch_ids(rewind_batch_id, batch_data)
+
+    # When rewinding a children batch, also prune sibling sevenChrDef batch on same node
+    # The sevenChrDef batch creates placeholder nodes that should be removed
+    rewind_batch_type = rewind_batch_id.rsplit("|", 1)[1] if "|" in rewind_batch_id else "children"
+    rewind_node = rewind_batch_id.rsplit("|", 1)[0] if "|" in rewind_batch_id else rewind_batch_id
+    if rewind_batch_type == "children":
+        sibling_seven_chr_batch = f"{rewind_node}|sevenChrDef"
+        if sibling_seven_chr_batch in batch_data:
+            descendants.add(sibling_seven_chr_batch)
 
     # Collect final_nodes from descendant batches
     descendant_finals: set[str] = set()
@@ -333,7 +343,7 @@ def prune_state_for_rewind(state_dict: dict, rewind_batch_id: str) -> dict:
 # ============================================================================
 
 
-async def build_app(
+async def build_traversal_app(
     app_id: str = "ROOT",
     with_persistence: bool = True,
     context: str = "",
@@ -378,7 +388,7 @@ async def build_app(
         )
 
         # Build and run
-        app, cached = await build_app(
+        app, cached = await build_traversal_app(
             context="Patient with diabetes presenting with hyperglycemia...",
             default_selector="llm",
             partition_key=partition_key,
@@ -535,10 +545,10 @@ async def build_app(
 
 async def retry_node(
     batch_id: str,
-    feedback: str,
+    feedback: str | None = None,
     selector: str | None = None,
 ) -> State:
-    """Retry from a checkpoint with EXPLICIT feedback injection.
+    """Retry from a checkpoint with optional feedback injection.
 
     Workflow: inject_feedback → select_candidates → spawn_parallel → finish
 
@@ -547,18 +557,25 @@ async def retry_node(
 
     Args:
         batch_id: Batch to retry from ("ROOT" or "B19.2|children" etc.)
-        feedback: Feedback string for the target batch
+        feedback: Optional feedback string for the target batch. If None,
+                  the LLM selector runs fresh without guidance.
         selector: Optional selector override ("llm", "manual")
 
     Returns:
         Final state from retry execution
 
-    Example:
+    Examples:
+        # Retry with feedback
         final_state = await retry_node(
             batch_id="E08.3|children",
             feedback="select E08.32 - this is the correct code for diabetic retinopathy",
-            selector="llm",
         )
+
+        # Retry without feedback (re-run LLM fresh)
+        final_state = await retry_node(batch_id="E08.3|children")
+
+        # Retry with different selector
+        final_state = await retry_node(batch_id="E08.3|children", selector="manual")
     """
     if PERSISTER is None:
         raise RuntimeError(
@@ -566,11 +583,11 @@ async def retry_node(
         )
 
     print(f"\n{'=' * 60}")
-    print(f"RETRY NODE (Explicit Feedback Injection): {batch_id}")
+    print(f"RETRY NODE: {batch_id}")
     print(f"Loading state from: app_id=ROOT, partition_key={PARTITION_KEY}")
     print(f"Entrypoint: inject_feedback")
     print(f"Selector: {selector if selector else 'default (llm)'}")
-    print(f"Feedback: {feedback[:100]}{'...' if len(feedback) > 100 else ''}")
+    print(f"Feedback: {feedback[:100] if feedback else 'None'}{'...' if feedback and len(feedback) > 100 else ''}")
     print(f"{'=' * 60}\n")
 
     # Load the ROOT checkpoint state directly (more reliable than fork for cached traversals)
@@ -633,12 +650,10 @@ async def retry_node(
     pruned_state_dict.pop("halted_by_exception", None)
     print(f"[RETRY] Removed Burr internal keys: {burr_internal_keys}")
 
-    # Set current_batch_id in state for consistency
+    # Set current_batch_id and pending_feedback directly in state
+    # inject_feedback will read these values (no longer passed via inputs)
     pruned_state_dict["current_batch_id"] = batch_id
-    # Ensure pending_feedback is None (inject_feedback will set it)
-    pruned_state_dict["pending_feedback"] = None
-    # Clear old feedback_map if present (we use pending_feedback now)
-    pruned_state_dict["feedback_map"] = {}
+    pruned_state_dict["pending_feedback"] = feedback or None
 
     # Build retry application with PRUNED state
     # Entrypoint is inject_feedback which makes feedback injection VISIBLE
@@ -698,21 +713,15 @@ async def retry_node(
         .abuild()
     )
 
-    # Build inputs dict for inject_feedback action
-    inputs: dict[str, str] = {
-        "batch_id": batch_id,
-        "feedback": feedback,
-    }
+    print(f"[RETRY] About to run app")
+    print(f"[RETRY] batch_id = {batch_id}")
+    print(f"[RETRY] feedback = {feedback[:100] if feedback else 'None'}{'...' if feedback and len(feedback) > 100 else ''}")
     if selector is not None:
-        inputs["selector"] = selector
+        print(f"[RETRY] selector = {selector}")
 
-    print(f"[RETRY] About to run app with inputs: {list(inputs.keys())}")
-    print(f"[RETRY] inputs['batch_id'] = {inputs['batch_id']}")
-    print(f"[RETRY] inputs['feedback'] = {inputs['feedback'][:100]}..." if len(inputs.get('feedback', '')) > 100 else f"[RETRY] inputs['feedback'] = {inputs.get('feedback')}")
-
-    # Run - starts at inject_feedback which sets pending_feedback in state
+    # Run - starts at inject_feedback which reads pending_feedback from state
     try:
-        _, _, final_state = await retry_app.arun(halt_after=["finish"], inputs=inputs)
+        _, _, final_state = await retry_app.arun(halt_after=["finish"])
         print(f"[RETRY] App completed successfully")
     except Exception as e:
         print(f"[RETRY] App raised exception: {e}")
@@ -843,7 +852,7 @@ async def run_traversal(
 
     try:
         # Build app (may return cached result)
-        app, cached = await build_app(
+        app, cached = await build_traversal_app(
             context=clinical_note,
             default_selector=selector,
             with_persistence=with_persistence,
@@ -899,7 +908,7 @@ async def main():
 
     try:
         # Build app (may return cached result)
-        app, cached = await build_app(
+        app, cached = await build_traversal_app(
             context=clinical_note,
             default_selector="llm",
             with_persistence=True,

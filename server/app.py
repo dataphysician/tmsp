@@ -30,7 +30,7 @@ from graph import (
     get_activator_nodes,
     get_node_category,
     get_parent_code,
-    get_seventh_char_def,
+    trace_seventh_char_def,
     resolve_code,
 )
 
@@ -495,8 +495,8 @@ async def get_graph(request: GraphRequest) -> GraphResponse:
             invalid_codes=invalid_codes,
         )
 
-    # Build the graph using trace_tree
-    result = build_graph(valid_codes, data)
+    # Build the graph
+    result = build_graph(valid_codes, data, show_all_paths=request.full_paths)
 
     # Extract sets for categorization
     leaves = result["leaves"]
@@ -556,7 +556,7 @@ async def get_graph(request: GraphRequest) -> GraphResponse:
 
         # For depth 7 nodes, show only the 7th character key-value pair (e.g., "A: initial encounter")
         if depth == 7:
-            seven_chr_def, _ = get_seventh_char_def(code, data)
+            seven_chr_def, _ = trace_seventh_char_def(code, data)
             if seven_chr_def:
                 # 7th char is always the last character (4th position after the period)
                 seventh_char_key = code[-1]
@@ -712,7 +712,7 @@ async def get_node_detail(code: str) -> NodeDetailResponse:
             metadata[key] = {k: str(v) for k, v in raw_metadata[key].items()}
 
     # Get sevenChrDef if present
-    seven_chr_result = get_seventh_char_def(code, data)
+    seven_chr_result = trace_seventh_char_def(code, data)
     seven_chr_def = seven_chr_result[0] if seven_chr_result else None
 
     return NodeDetailResponse(
@@ -847,56 +847,62 @@ async def invalidate_cache(request: InvalidateCacheRequest):
     Increments the cache version AND deletes any existing cached data
     at the new version's key to guarantee a cache miss.
     """
-    # Normalize parameters to match traversal endpoint
-    model = request.model or ""
-    temperature = request.temperature or 0.0
+    try:
+        # Normalize parameters to match traversal endpoint
+        model = request.model or ""
+        temperature = request.temperature or 0.0
 
-    new_version = increment_cache_version(
-        clinical_note=request.clinical_note,
-        provider=request.provider,
-        model=model,
-        temperature=temperature,
-        system_prompt=request.system_prompt,
-        scaffolded=request.scaffolded,
-    )
-
-    # Generate the cache key that will be used for the new version
-    if request.scaffolded:
-        partition_key = generate_traversal_cache_key(
+        new_version = increment_cache_version(
             clinical_note=request.clinical_note,
             provider=request.provider,
             model=model,
             temperature=temperature,
             system_prompt=request.system_prompt,
-            use_cache=True,
-            cache_version=new_version,
+            scaffolded=request.scaffolded,
         )
-        table_name = "burr_state"
-    else:
-        partition_key = generate_zero_shot_cache_key(
-            clinical_note=request.clinical_note,
-            provider=request.provider,
-            model=model,
-            temperature=temperature,
-            system_prompt=request.system_prompt,
-            use_cache=True,
-            cache_version=new_version,
+
+        # Generate the cache key that will be used for the new version
+        if request.scaffolded:
+            partition_key = generate_traversal_cache_key(
+                clinical_note=request.clinical_note,
+                provider=request.provider,
+                model=model,
+                temperature=temperature,
+                system_prompt=request.system_prompt,
+                use_cache=True,
+                cache_version=new_version,
+            )
+            table_name = "burr_state"
+        else:
+            partition_key = generate_zero_shot_cache_key(
+                clinical_note=request.clinical_note,
+                provider=request.provider,
+                model=model,
+                temperature=temperature,
+                system_prompt=request.system_prompt,
+                use_cache=True,
+                cache_version=new_version,
+            )
+            table_name = "zero_shot_state"
+
+        # Delete any existing cached data at the new version's key
+        deleted = await delete_persisted_state(
+            partition_key=partition_key,
+            app_id=None,  # Delete ALL entries (ROOT + subgraphs)
+            table_name=table_name,
         )
-        table_name = "zero_shot_state"
 
-    # Delete any existing cached data at the new version's key
-    deleted = await delete_persisted_state(
-        partition_key=partition_key,
-        app_id=None,  # Delete ALL entries (ROOT + subgraphs)
-        table_name=table_name,
-    )
-
-    action = "Deleted existing cache. " if deleted else ""
-    return InvalidateCacheResponse(
-        success=True,
-        new_version=new_version,
-        message=f"Cache invalidated. {action}Next run will use version {new_version}.",
-    )
+        action = "Deleted existing cache. " if deleted else ""
+        return InvalidateCacheResponse(
+            success=True,
+            new_version=new_version,
+            message=f"Cache invalidated. {action}Next run will use version {new_version}.",
+        )
+    except Exception as e:
+        print(f"[CACHE] Error in invalidate_cache: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 class ClearAllCacheResponse(BaseModel):
@@ -1107,7 +1113,7 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
     - RUN_FINISHED: Traversal complete with final codes
     """
     # Import Burr components
-    from agent import build_app, initialize_persister, cleanup_persister, set_batch_callback
+    from agent import build_traversal_app, initialize_persister, cleanup_persister, set_batch_callback
     from candidate_selector.providers import create_config
     import candidate_selector.config as llm_config
 
@@ -1362,6 +1368,41 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                         path="/edges/-",
                         value=final_edge_data,
                     ))
+
+        elif batch_type == "sevenChrDef" and not selected_ids and node_id:
+            # Create a placeholder node for missing 7th character at depth 7
+            # This IS a placeholder - standing in for the real 7th char code (T84.53XA, etc.)
+            missing_code = f"{node_id}?"  # Use ? suffix for missing 7th char
+            print(f"[SEVENCHRDEF] Empty selection for {node_id}, creating placeholder: {missing_code}")
+
+            if missing_code not in seen_nodes:
+                seen_nodes[missing_code] = node_count
+                node_count += 1
+
+                missing_node_data = {
+                    "id": missing_code,
+                    "code": missing_code,
+                    "label": "Missing Seventh Character Extension",
+                    "depth": 7,  # Always depth 7 for 7th char
+                    "category": "placeholder",  # It IS a placeholder (synthetic node)
+                    "billable": False,
+                }
+                ops.append(JsonPatchOp(op="add", path="/nodes/-", value=missing_node_data))
+                batch_nodes.append(missing_node_data)
+
+            # Edge from depth-6 node to placeholder
+            edge_key = (node_id, missing_code)
+            if edge_key not in seen_edges:
+                seen_edges.add(edge_key)
+                missing_edge_data = {
+                    "source": node_id,
+                    "target": missing_code,
+                    "edge_type": "lateral",
+                    "rule": "sevenChrDef",
+                }
+                ops.append(JsonPatchOp(op="add", path="/edges/-", value=missing_edge_data))
+                batch_edges.append(missing_edge_data)
+
         else:
             # Regular batches (children, codeFirst, codeAlso, etc.)
             print(f"[BATCH] Processing {batch_id}: node_id={node_id}, selected_ids={selected_ids}")
@@ -1624,9 +1665,9 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
             # Check cache BEFORE emitting RUN_STARTED
             # This allows frontend to know upfront if this is a cached replay
             #
-            # IMPORTANT: For scaffolded mode, we call build_app() here (single source of truth)
+            # IMPORTANT: For scaffolded mode, we call build_traversal_app() here (single source of truth)
             # rather than doing a separate cache check. This eliminates the dual cache check
-            # issue where the early check and build_app() could disagree about cache status.
+            # issue where the early check and build_traversal_app() could disagree about cache status.
             is_cached = False
             scaffolded_burr_app = None  # Will be set for scaffolded mode
             scaffolded_partition_key = None
@@ -1666,8 +1707,8 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                 # Use partition key as threadId (stable for same clinical note/settings)
                 thread_id = zs_partition_key
             else:
-                # Scaffolded mode: call build_app() directly (single source of truth for cache status)
-                # This eliminates the dual cache check issue - build_app() is the authoritative check
+                # Scaffolded mode: call build_traversal_app() directly (single source of truth for cache status)
+                # This eliminates the dual cache check issue - build_traversal_app() is the authoritative check
                 print(f"[SERVER] persist_cache={request.persist_cache} (use_cache for key generation)")
                 # Look up current cache version for this configuration
                 scaffolded_cache_version = get_cache_version(
@@ -1695,18 +1736,18 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                 # Initialize persister (always keep existing data)
                 await initialize_persister(reset=False)
 
-                # Set callback for streaming (needed before build_app for live traversal)
+                # Set callback for streaming (needed before build_traversal_app for live traversal)
                 set_batch_callback(on_batch_complete)
                 print("[SERVER] Batch callback registered")
 
                 # Build app - this is the SINGLE cache check (no separate early check)
-                scaffolded_burr_app, is_cached = await build_app(
+                scaffolded_burr_app, is_cached = await build_traversal_app(
                     context=request.clinical_note,
                     default_selector=request.selector,
                     with_persistence=True,
                     partition_key=scaffolded_partition_key,
                 )
-                print(f"[SERVER] Scaffolded build_app result: cached={is_cached}")
+                print(f"[SERVER] Scaffolded build_traversal_app result: cached={is_cached}")
 
                 # Set CURRENT_APP for cancel endpoint to access
                 CURRENT_APP = scaffolded_burr_app
@@ -1843,7 +1884,7 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
 
                         # Get 7th char meaning from sevenChrDef
                         seventh_char_meaning = ""
-                        seven_def_result = get_seventh_char_def(code, data)
+                        seven_def_result = trace_seventh_char_def(code, data)
                         if seven_def_result:
                             seven_def, _ = seven_def_result
                             seventh_char_meaning = seven_def.get(seventh_char, "")
@@ -1933,7 +1974,7 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                 return  # Exit generator - zero-shot mode complete
 
             # Scaffolded mode: Tree traversal with Burr
-            # NOTE: build_app() was already called in the early check section above
+            # NOTE: build_traversal_app() was already called in the early check section above
             # This ensures RUN_STARTED has the accurate cache status (single source of truth)
             # Just use the already-built app and cache status
             burr_app = scaffolded_burr_app
@@ -2079,6 +2120,24 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                                 snapshot_seen_edges.add(edge_key)
                                 snapshot_edges.append({
                                     "source": prev_node, "target": full_code,
+                                    "edge_type": "lateral", "rule": "sevenChrDef",
+                                })
+                        else:
+                            # Empty sevenChrDef selection - create placeholder for missing 7th char
+                            missing_code = f"{node_id}?"
+                            if missing_code not in snapshot_seen_nodes:
+                                snapshot_seen_nodes.add(missing_code)
+                                snapshot_nodes.append({
+                                    "id": missing_code, "code": missing_code,
+                                    "label": "Missing Seventh Character Extension",
+                                    "depth": 7, "category": "placeholder", "billable": False,
+                                })
+
+                            edge_key = (node_id, missing_code)
+                            if edge_key not in snapshot_seen_edges:
+                                snapshot_seen_edges.add(edge_key)
+                                snapshot_edges.append({
+                                    "source": node_id, "target": missing_code,
                                     "edge_type": "lateral", "rule": "sevenChrDef",
                                 })
 
@@ -2594,6 +2653,39 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
                         path="/edges/-",
                         value=final_edge_data,
                     ))
+
+        elif batch_type == "sevenChrDef" and not selected_ids and node_id:
+            # Create a placeholder node for missing 7th character at depth 7
+            missing_code = f"{node_id}?"
+            print(f"[REWIND SEVENCHRDEF] Empty selection for {node_id}, creating placeholder: {missing_code}")
+
+            if missing_code not in seen_nodes:
+                seen_nodes[missing_code] = node_count
+                node_count += 1
+
+                missing_node_data = {
+                    "id": missing_code,
+                    "code": missing_code,
+                    "label": "Missing Seventh Character Extension",
+                    "depth": 7,
+                    "category": "placeholder",
+                    "billable": False,
+                }
+                ops.append(JsonPatchOp(op="add", path="/nodes/-", value=missing_node_data))
+                batch_nodes.append(missing_node_data)
+
+            edge_key = (node_id, missing_code)
+            if edge_key not in seen_edges:
+                seen_edges.add(edge_key)
+                missing_edge_data = {
+                    "source": node_id,
+                    "target": missing_code,
+                    "edge_type": "lateral",
+                    "rule": "sevenChrDef",
+                }
+                ops.append(JsonPatchOp(op="add", path="/edges/-", value=missing_edge_data))
+                batch_edges.append(missing_edge_data)
+
         else:
             # Regular batches
             if (
@@ -3057,15 +3149,23 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
                     'selected_details': selected_details,
                 })
 
-            run_finished_metadata = {
-                'final_nodes': final_nodes,
-                'batch_count': len(batch_data),
-                'rewind_from': request.batch_id,
-                'decisions': all_decisions,
-            }
+            # Check for LLM API errors in the rewind batch (same pattern as stream_traversal)
+            rewind_batch_reasoning = batch_data.get(request.batch_id, {}).get("reasoning", "")
+            llm_error = rewind_batch_reasoning if rewind_batch_reasoning.startswith("API Error:") else None
 
-            print(f"[REWIND] Sending RUN_FINISHED: final_nodes={final_nodes}")
-            yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, threadId=thread_id, runId=run_id, metadata=run_finished_metadata).model_dump_json()}\n\n"
+            print(f"[REWIND] Complete: final_nodes={final_nodes}, error={bool(llm_error)}")
+
+            if llm_error:
+                # Emit RUN_ERROR for LLM API errors
+                yield f"data: {AGUIEvent(type=AGUIEventType.RUN_ERROR, threadId=thread_id, runId=run_id, error=llm_error).model_dump_json()}\n\n"
+            else:
+                run_finished_metadata = {
+                    'final_nodes': final_nodes,
+                    'batch_count': len(batch_data),
+                    'rewind_from': request.batch_id,
+                    'decisions': all_decisions,
+                }
+                yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, threadId=thread_id, runId=run_id, metadata=run_finished_metadata).model_dump_json()}\n\n"
             print("[REWIND] Stream complete")
 
         except Exception as e:

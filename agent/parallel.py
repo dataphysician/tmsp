@@ -9,7 +9,7 @@ from typing import Any, Generator
 from burr.core import ApplicationContext, GraphBuilder, State, expr
 from burr.core.parallelism import MapStates, RunnableGraph, SubGraphTask, _cascade_adapter
 
-from graph import get_seventh_char_def
+from graph import trace_seventh_char_def
 from .actions import ICD_INDEX, finish_batch, load_node, select_candidates
 
 
@@ -137,7 +137,7 @@ class SpawnParallelBatches(MapStates):
                 # If no direct sevenChrDef, check ancestry (self-activation)
                 # This handles nodes like T81.44 whose ancestor T81 has sevenChrDef
                 if child_authority is None:
-                    seven_chr_result = get_seventh_char_def(node_id, ICD_INDEX)
+                    seven_chr_result = trace_seventh_char_def(node_id, ICD_INDEX)
                     if seven_chr_result is not None:
                         _, ancestor_with_def = seven_chr_result
                         child_authority = {
@@ -325,7 +325,7 @@ class SpawnParallelBatches(MapStates):
         """Disable persistence for parallel branches.
 
         Parallel batch persistence causes SQLite UNIQUE constraint conflicts.
-        Cross-run caching is handled at the ROOT app level in build_app().
+        Cross-run caching is handled at the ROOT app level in build_traversal_app().
         """
         return None
 
@@ -333,7 +333,7 @@ class SpawnParallelBatches(MapStates):
         """Disable state loading for parallel branches.
 
         State initialization for parallel batches is handled via the states() generator.
-        Cross-run caching is handled at the ROOT app level in build_app().
+        Cross-run caching is handled at the ROOT app level in build_traversal_app().
         """
         return None
 
@@ -362,8 +362,8 @@ class SpawnSevenChr(MapStates):
 
         Logic uses CODE STRUCTURE instead of tracked depth (which can desync):
         1. Extract subcategory from code (chars after the dot)
-        2. If subcategory < 3 chars AND no real children → placeholder needed
-        3. If subcategory >= 3 chars OR has real children → spawn sevenChrDef
+        2. If subcategory < 3 chars → placeholder needed (pad with X to reach depth 6)
+        3. If subcategory >= 3 chars → spawn sevenChrDef batch
 
         ICD-10-CM rule: 7th character must be in 7th position.
         Subcategory must have 3 chars before 7th char can be added.
@@ -385,14 +385,7 @@ class SpawnSevenChr(MapStates):
             print(f"{'=' * 60}\n")
             return
 
-        # Check if node exists in ICD_INDEX with real children
-        # If so, LLM already saw them and opted out - don't create artificial placeholder
-        node_has_real_children = (
-            base_node_id in ICD_INDEX and
-            bool(ICD_INDEX[base_node_id].get("children"))
-        )
-
-        # CRITICAL FIX: Use CODE STRUCTURE instead of tracked depth
+        # Use CODE STRUCTURE instead of tracked depth
         # Extract subcategory (chars after the dot) to determine placeholder need
         if "." in base_node_id:
             subcategory = base_node_id.split(".", 1)[1]
@@ -438,7 +431,7 @@ class SpawnSevenChr(MapStates):
             return
 
         # ICD-10-CM: subcategory needs 3 chars before 7th char can be added
-        needs_placeholder = len(subcategory) < 3 and not node_has_real_children
+        needs_placeholder = len(subcategory) < 3
 
         if needs_placeholder:
             # Subcategory too short - create placeholder

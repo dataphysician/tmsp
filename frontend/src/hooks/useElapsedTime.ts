@@ -1,39 +1,53 @@
-import { useState, useEffect, useRef } from 'react';
-import type { TraversalStatus } from '../lib/types';
+import { useState, useEffect, useRef, useCallback } from 'react';
 
 /**
- * Hook to track elapsed time during traversal.
- * Starts timer when status transitions to 'traversing'.
- * Stops timer when status transitions to 'complete' or 'error'.
- * Resets when status returns to 'idle'.
+ * Hook to track elapsed time with active ticking.
+ * Starts timer when `running` transitions false → true.
+ * Stops and freezes when `running` transitions true → false.
+ * Returns [elapsedTime, reset]:
+ *   - elapsedTime: null when not yet started, elapsed ms otherwise
+ *   - reset: clears elapsed time back to null
  */
-export function useElapsedTime(status: TraversalStatus): number | null {
+export function useElapsedTime(running: boolean): [number | null, () => void] {
   const [elapsedTime, setElapsedTime] = useState<number | null>(null);
   const startTimeRef = useRef<number | null>(null);
-  const prevStatusRef = useRef<TraversalStatus>('idle');
+  const prevRunningRef = useRef(false);
 
   useEffect(() => {
-    // Started: any status -> traversing (handles re-runs from complete/error)
-    if (prevStatusRef.current !== 'traversing' && status === 'traversing') {
+    // Start: false → true
+    if (!prevRunningRef.current && running) {
       startTimeRef.current = Date.now();
-      setElapsedTime(null);
+      setElapsedTime(0);
     }
 
-    // Finished: traversing -> complete or error
-    if (prevStatusRef.current === 'traversing' && (status === 'complete' || status === 'error')) {
+    // Stop: true → false — freeze at final value
+    if (prevRunningRef.current && !running) {
       if (startTimeRef.current) {
         setElapsedTime(Date.now() - startTimeRef.current);
       }
-    }
-
-    // Reset when going back to idle
-    if (status === 'idle') {
       startTimeRef.current = null;
-      setElapsedTime(null);
     }
 
-    prevStatusRef.current = status;
-  }, [status]);
+    prevRunningRef.current = running;
+  }, [running]);
 
-  return elapsedTime;
+  // Active ticking while running
+  useEffect(() => {
+    if (!running || !startTimeRef.current) return;
+
+    const interval = setInterval(() => {
+      if (startTimeRef.current) {
+        setElapsedTime(Date.now() - startTimeRef.current);
+      }
+    }, 100);
+
+    return () => clearInterval(interval);
+  }, [running]);
+
+  const reset = useCallback(() => {
+    setElapsedTime(null);
+    startTimeRef.current = null;
+  }, []);
+
+  return [elapsedTime, reset];
 }

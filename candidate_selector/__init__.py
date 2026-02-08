@@ -43,7 +43,6 @@ from .selector import (
     CodeSelectionResult,
     SelectorProtocol,
     clear_cache,
-    get_selector,
     llm_selector,
     manual_selector,
 )
@@ -68,6 +67,5 @@ __all__ = [
     "SELECTOR_REGISTRY",
     "llm_selector",
     "manual_selector",
-    "get_selector",
     "clear_cache",
 ]

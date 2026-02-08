@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { useElapsedTime } from '../../hooks/useElapsedTime';
 import {
     streamTraversal,
     buildGraph,
@@ -39,7 +40,7 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
     const [benchmarkCodeInput, setBenchmarkCodeInput] = useState('');
     const [benchmarkExpectedGraph, setBenchmarkExpectedGraph] = useState<{ nodes: GraphNode[]; edges: GraphEdge[] } | null>(null);
     const [benchmarkTraversedNodes, setBenchmarkTraversedNodes] = useState<GraphNode[]>([]);
-    const [_benchmarkTraversedEdges, setBenchmarkTraversedEdges] = useState<GraphEdge[]>([]);
+    const [, setBenchmarkTraversedEdges] = useState<GraphEdge[]>([]);
     const [benchmarkCombinedNodes, setBenchmarkCombinedNodes] = useState<BenchmarkGraphNode[]>([]);
     const [benchmarkCombinedEdges, setBenchmarkCombinedEdges] = useState<GraphEdge[]>([]);
     const [benchmarkOvershootMarkers, setBenchmarkOvershootMarkers] = useState<OvershootMarker[]>([]);
@@ -82,34 +83,16 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
     const benchmarkIsCachedReplayRef = useRef<boolean>(false);
     const benchmarkWasZeroShotRef = useRef<boolean>(false);
     const lastVisualUpdateTimeRef = useRef<number>(0);
-    const benchmarkStartTimeRef = useRef<number | null>(null);
-    const prevBenchmarkStatusRef = useRef<TraversalStatus>('idle');
     const benchmarkLastInteractionRef = useRef<number>(0);
 
     const VISUAL_UPDATE_THROTTLE_MS = 100;
 
-    // Track elapsed time
-    const [benchmarkElapsedTime, setBenchmarkElapsedTime] = useState<number | null>(null);
+    // Track elapsed time (with active ticking during traversal)
+    const [benchmarkTimerRunning, setBenchmarkTimerRunning] = useState(false);
+    const [benchmarkElapsedTime, resetBenchmarkTimer] = useElapsedTime(benchmarkTimerRunning);
 
     // Track exact matched codes (for "Matched Final Codes" display after benchmark completes)
     const [benchmarkExactMatchedCodes, setBenchmarkExactMatchedCodes] = useState<Set<string>>(new Set());
-
-    useEffect(() => {
-        if (prevBenchmarkStatusRef.current !== 'traversing' && benchmarkStatus === 'traversing') {
-            benchmarkStartTimeRef.current = Date.now();
-            setBenchmarkElapsedTime(null);
-        }
-        if (prevBenchmarkStatusRef.current === 'traversing' && (benchmarkStatus === 'complete' || benchmarkStatus === 'error')) {
-            if (benchmarkStartTimeRef.current) {
-                setBenchmarkElapsedTime(Date.now() - benchmarkStartTimeRef.current);
-            }
-        }
-        if (benchmarkStatus === 'idle') {
-            benchmarkStartTimeRef.current = null;
-            setBenchmarkElapsedTime(null);
-        }
-        prevBenchmarkStatusRef.current = benchmarkStatus;
-    }, [benchmarkStatus]);
 
     // Fit-to-window logic
     const benchmarkHadNodesRef = useRef(false);
@@ -162,6 +145,8 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
     const handleBenchmarkEvent = useCallback((event: AGUIEvent) => {
         switch (event.type) {
             case 'RUN_STARTED':
+                setBenchmarkTimerRunning(true);
+
                 if (event.metadata?.cached) {
                     console.log('[Benchmark] Cached replay - expecting STATE_SNAPSHOT');
                     benchmarkIsCachedReplayRef.current = true;
@@ -198,9 +183,11 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
                 break;
 
             case 'STATE_SNAPSHOT':
+                // Process unconditionally — handler only writes to refs, never setState.
+                // State is applied later in RUN_FINISHED. SSE ordering guarantees no
+                // stale snapshots arrive after RUN_FINISHED.
                 if (event.snapshot) {
-                    const nodes = event.snapshot.nodes as GraphNode[];
-                    const edges = event.snapshot.edges as GraphEdge[];
+                    const { nodes, edges } = event.snapshot;
                     benchmarkTraversedNodesRef.current = nodes;
                     benchmarkTraversedEdgesRef.current = edges;
 
@@ -299,6 +286,7 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
 
             case 'RUN_ERROR':
                 // Handle dedicated error events (AG-UI protocol)
+                setBenchmarkTimerRunning(false);
                 setBenchmarkStatus('error');
                 setBenchmarkError(event.error);
                 setBenchmarkCurrentStep('Error');
@@ -424,7 +412,7 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
                         if (wasZeroShot && finalNodesRaw.length > 0) {
                             setTimeout(async () => {
                                 try {
-                                    const inferredGraph = await buildGraph(finalNodesRaw);
+                                    const inferredGraph = await buildGraph(finalNodesRaw, true);  // full_paths for Benchmark
 
                                     if (inferredGraph.invalid_codes && inferredGraph.invalid_codes.length > 0) {
                                         console.log('[BenchmarkInferredView] Filtered out invalid codes:', inferredGraph.invalid_codes);
@@ -505,6 +493,7 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
                         }
                     }
 
+                setBenchmarkTimerRunning(false);
                 setStreamingTraversedIds(new Set(benchmarkStreamedIdsRef.current));
                 setBenchmarkStatus('complete');
                 setBenchmarkCurrentStep(`Complete - ${finalNodes.size} codes finalized`);
@@ -515,6 +504,7 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
     }, [benchmarkExpectedGraph, benchmarkExpectedCodes, llmConfig]);
 
     const handleBenchmarkError = useCallback((error: Error) => {
+        setBenchmarkTimerRunning(false);
         setBenchmarkStatus('error');
         setBenchmarkError(error.message);
     }, []);
@@ -588,6 +578,8 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
             benchmarkControllerRef.current.abort();
             benchmarkControllerRef.current = null;
         }
+        setBenchmarkTimerRunning(false);
+        resetBenchmarkTimer();
         setBenchmarkStatus('idle');
         setBenchmarkCurrentStep('Cancelled');
     }, []);
@@ -615,7 +607,8 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
         setStreamingTraversedIds(new Set());
         setBenchmarkWasZeroShot(false);
         setBenchmarkInferredView(null);
-        setBenchmarkElapsedTime(null);
+        setBenchmarkTimerRunning(false);
+        resetBenchmarkTimer();
         setBenchmarkExactMatchedCodes(new Set());
         setBenchmarkTraversedNodes([]);
         setBenchmarkTraversedEdges([]);
@@ -640,7 +633,6 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
         benchmarkIsCachedReplayRef.current = false;
         benchmarkWasZeroShotRef.current = false;
         benchmarkHadNodesRef.current = false;
-        benchmarkStartTimeRef.current = null;
     }, []);
 
     // Build expected graph from codes
@@ -651,7 +643,7 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
         setBenchmarkCurrentStep('Building expected graph...');
 
         try {
-            const result = await buildGraph([...codes]);
+            const result = await buildGraph([...codes]);  // minimal expected graph
             setBenchmarkExpectedGraph(result);
 
             // Initialize combined graph
@@ -681,7 +673,7 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
                 const validCodes = new Set([...codes].filter(c => !invalidCodes.includes(c)));
                 if (validCodes.size > 0) {
                     try {
-                        const result = await buildGraph([...validCodes]);
+                        const result = await buildGraph([...validCodes]);  // minimal expected graph
                         setBenchmarkExpectedGraph(result);
                         const combinedNodes = result.nodes.map(node => ({
                             ...node,

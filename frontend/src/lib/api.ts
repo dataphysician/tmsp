@@ -200,15 +200,16 @@ export function streamRewind(
  * Build a graph from ICD-10-CM codes.
  *
  * @param codes - Array of ICD-10-CM codes to visualize
+ * @param fullPaths - If true, use full paths to ROOT (no nearest-anchor optimization). Useful for Benchmark mode.
  * @returns Promise with nodes, edges, and stats
  */
-export async function buildGraph(codes: string[]): Promise<GraphResponse> {
+export async function buildGraph(codes: string[], fullPaths = false): Promise<GraphResponse> {
   const response = await fetch('/api/graph', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ codes }),
+    body: JSON.stringify({ codes, full_paths: fullPaths }),
   });
 
   if (!response.ok) {
@@ -358,8 +359,16 @@ export async function invalidateCache(
   });
 
   if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.detail || 'Failed to invalidate cache');
+    let errorMessage = `Failed to invalidate cache: ${response.status} ${response.statusText}`;
+    try {
+      const errorBody = await response.json() as { detail?: string };
+      if (errorBody.detail) {
+        errorMessage = errorBody.detail;
+      }
+    } catch {
+      // Response body wasn't valid JSON, use default message
+    }
+    throw new Error(errorMessage);
   }
 
   return response.json();

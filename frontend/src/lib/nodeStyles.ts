@@ -12,7 +12,7 @@ import type { GraphNode, BenchmarkGraphNode, DecisionPoint } from './types';
 // ============================================================================
 
 /** Check if node is a leaf node (billable, finalized category, or in finalized codes list) */
-export function isLeafNode(node: GraphNode, finalizedCodes: Set<string>): boolean {
+function isLeafNode(node: GraphNode, finalizedCodes: Set<string>): boolean {
   return node.billable || node.category === 'finalized' || finalizedCodes.has(node.code);
 }
 
@@ -22,12 +22,12 @@ export function isFinalizedNode(node: GraphNode, finalizedCodes: Set<string>): b
 }
 
 /** Check if node is an activator (has sevenChrDef metadata) */
-export function isActivatorNode(node: GraphNode): boolean {
+function isActivatorNode(node: GraphNode): boolean {
   return node.category === 'activator';
 }
 
 /** Check if node is a placeholder (synthetic X-padded code) */
-export function isPlaceholderNode(node: GraphNode): boolean {
+function isPlaceholderNode(node: GraphNode): boolean {
   return node.category === 'placeholder';
 }
 
@@ -45,28 +45,29 @@ export function isSevenChrDefFinalizedNode(node: GraphNode, finalizedCodes?: Set
 // ============================================================================
 // Standard Mode Node Styling
 // ============================================================================
-// Priority: activator (blue) > placeholder (dashed gray) > finalized/depth7 (green) > ancestor (black)
+// Priority: activator (blue) > placeholder (dashed gray) > finalized/depth7 (green) > ancestor (dark)
+// Styling aligned with benchmark mode for visual consistency
 
 export function getNodeFill(node: GraphNode, finalizedCodes: Set<string>): string {
   if (isActivatorNode(node)) return '#ffffff';
-  if (isSevenChrDefFinalizedNode(node, finalizedCodes)) return '#f0fdf4';
-  if (isFinalizedNode(node, finalizedCodes)) return '#f0fdf4';
+  if (isSevenChrDefFinalizedNode(node, finalizedCodes)) return '#dcfce7';  // Match benchmark 'matched' fill
+  if (isFinalizedNode(node, finalizedCodes)) return '#dcfce7';  // Match benchmark 'matched' fill
   if (isPlaceholderNode(node)) return '#ffffff';
   return '#ffffff';
 }
 
 export function getNodeStroke(node: GraphNode, finalizedCodes: Set<string>): string {
   if (isActivatorNode(node)) return '#3b82f6';
-  if (isSevenChrDefFinalizedNode(node, finalizedCodes)) return '#22c55e';
-  if (isFinalizedNode(node, finalizedCodes)) return '#22c55e';
+  if (isSevenChrDefFinalizedNode(node, finalizedCodes)) return '#16a34a';  // Match benchmark green
+  if (isFinalizedNode(node, finalizedCodes)) return '#16a34a';  // Match benchmark green
   if (isPlaceholderNode(node)) return '#94a3b8';
-  return '#334155';
+  return '#1e293b';  // Match benchmark 'expected' stroke
 }
 
 export function getNodeStrokeWidth(node: GraphNode, finalizedCodes: Set<string>): number {
   if (isActivatorNode(node)) return 2;
-  if (isSevenChrDefFinalizedNode(node, finalizedCodes)) return 2.5;
-  if (isFinalizedNode(node, finalizedCodes)) return 2.5;
+  if (isSevenChrDefFinalizedNode(node, finalizedCodes)) return 4.5;
+  if (isFinalizedNode(node, finalizedCodes)) return 4.5;
   if (isPlaceholderNode(node)) return 1.5;
   return 1.5;
 }
@@ -83,15 +84,16 @@ export function getOverlayColors(
   const placeholder = isPlaceholderNode(node);
   const finalized = !placeholder && isFinalizedNode(node, finalizedCodes);
 
+  // Aligned with benchmark mode colors for consistency
   const bgColor = activator ? 'rgba(239, 246, 255, 0.98)' :
     placeholder ? 'rgba(248, 250, 252, 0.98)' :
-      finalized ? 'rgba(240, 253, 244, 0.98)' :
+      finalized ? 'rgba(220, 252, 231, 0.98)' :  // Match benchmark 'matched' fill (#dcfce7)
         'rgba(255, 255, 255, 0.98)';
 
   const borderColor = activator ? '#2563eb' :
     placeholder ? '#94a3b8' :
-      finalized ? '#16a34a' :
-        '#475569';
+      finalized ? '#16a34a' :  // Match benchmark green
+        '#1e293b';  // Match benchmark 'expected' stroke
 
   return { bgColor, borderColor };
 }
@@ -130,16 +132,6 @@ export function shouldIncludeDecision(
     return false;
   }
 
-  return true;
-}
-
-/** Check if a batch section should be shown in overlay */
-export function shouldShowBatch(
-  _batchName: string,
-  _node: GraphNode,
-  _finalizedCodes: Set<string>,
-  _nodesWithSevenChrDefChildren: Set<string>
-): boolean {
   return true;
 }
 

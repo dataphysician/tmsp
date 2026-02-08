@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
+import { useElapsedTime } from '../../hooks/useElapsedTime';
 import { applyPatch, type Operation } from 'fast-json-patch';
 import {
   streamTraversal,
@@ -20,7 +21,6 @@ import type {
   DecisionPoint,
   CandidateDecision,
   LLMConfig,
-  TraversalStatus,
 } from '../../lib/types';
 import { INITIAL_TRAVERSAL_STATE, type SidebarTab } from '../../lib/constants';
 import { cancelTraversal } from '../../lib/api';
@@ -37,9 +37,10 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [batchCount, setBatchCount] = useState(0);
-  const [_sidebarTab, _setSidebarTab] = useState<SidebarTab>('clinical-note'); // Internal sidebar tab state if needed, but App uses shared one
+
   const [traverseFitTrigger, setTraverseFitTrigger] = useState(0);
-  const [traverseElapsedTime, setTraverseElapsedTime] = useState<number | null>(null);
+  const [traverseTimerRunning, setTraverseTimerRunning] = useState(false);
+  const [traverseElapsedTime, resetTraverseTimer] = useElapsedTime(traverseTimerRunning);
 
   // Rewind state
   const [rewindTargetNode, setRewindTargetNode] = useState<GraphNode | null>(null);
@@ -57,31 +58,10 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
   const traverseEdgesRef = useRef<GraphEdge[]>([]);
   const traverseDecisionsRef = useRef<DecisionPoint[]>([]);
   const traverseBatchCountRef = useRef<number>(0);
-  const traverseStartTimeRef = useRef<number | null>(null);
-  const prevTraverseStatusRef = useRef<TraversalStatus>('idle');
   const traverseLastInteractionRef = useRef<number>(0);
   const traverseHadNodesRef = useRef(false);
   const wasRewindRef = useRef(false);
   const wasZeroShotRef = useRef(false);
-
-  // Track elapsed time
-  useEffect(() => {
-    const currentStatus = state.status;
-    if (prevTraverseStatusRef.current !== 'traversing' && currentStatus === 'traversing') {
-      traverseStartTimeRef.current = Date.now();
-      setTraverseElapsedTime(null);
-    }
-    if (prevTraverseStatusRef.current === 'traversing' && (currentStatus === 'complete' || currentStatus === 'error')) {
-      if (traverseStartTimeRef.current) {
-        setTraverseElapsedTime(Date.now() - traverseStartTimeRef.current);
-      }
-    }
-    if (currentStatus === 'idle') {
-      traverseStartTimeRef.current = null;
-      setTraverseElapsedTime(null);
-    }
-    prevTraverseStatusRef.current = currentStatus;
-  }, [state.status]);
 
   // Fit-to-window logic (skip during rewind)
   useEffect(() => {
@@ -125,6 +105,7 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
 
     switch (event.type) {
       case 'RUN_STARTED':
+        setTraverseTimerRunning(true);
         setState(prev => ({
           ...prev,
           status: 'traversing',
@@ -298,6 +279,7 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
 
       case 'RUN_ERROR':
         // Handle dedicated error events (AG-UI protocol)
+        setTraverseTimerRunning(false);
         setState(prev => ({
           ...prev,
           status: 'error',
@@ -339,6 +321,7 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
           }));
         }
 
+        setTraverseTimerRunning(false);
         setState(prev => ({
           ...prev,
           status: 'complete',
@@ -353,6 +336,7 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
   }, []);
 
   const handleTraverseError = useCallback((error: Error) => {
+    setTraverseTimerRunning(false);
     setState(prev => ({
       ...prev,
       status: 'error',
@@ -362,7 +346,7 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
     setIsLoading(false);
   }, []);
 
-  const handleTraverse = useCallback((): boolean => {
+  const handleTraverse = useCallback((options?: { bypassCache?: boolean }): boolean => {
     if (!clinicalNote.trim()) return false;
     if (!llmConfig.apiKey) {
       alert('Please configure your API key in LLM Settings');
@@ -379,7 +363,7 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
     setState({
       ...INITIAL_TRAVERSAL_STATE,
       status: 'traversing',
-      current_step: 'Starting traversal',
+      current_step: options?.bypassCache ? 'Regenerating (bypassing cache)' : 'Starting traversal',
     });
 
     // Reset refs
@@ -389,6 +373,9 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
     traverseBatchCountRef.current = 0;
     wasRewindRef.current = false;
     wasZeroShotRef.current = !(llmConfig.scaffolded ?? true);
+
+    // When bypassCache is true, set persist_cache to false to skip cache lookup
+    const useCache = options?.bypassCache ? false : (llmConfig.persistCache ?? true);
 
     controllerRef.current = streamTraversal(
       {
@@ -402,7 +389,7 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
         extra: llmConfig.extra,
         system_prompt: llmConfig.systemPrompt || undefined,
         scaffolded: llmConfig.scaffolded ?? true,
-        persist_cache: llmConfig.persistCache ?? true,
+        persist_cache: useCache,
       },
       handleTraverseEvent,
       handleTraverseError
@@ -427,6 +414,8 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
 
     setIsLoading(false);
     setIsRewinding(false);
+    setTraverseTimerRunning(false);
+    resetTraverseTimer();
 
     // Clear refs
     traverseNodesRef.current = [];
@@ -462,7 +451,8 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
     setBatchCount(0);
     setSelectedNode(null);
     setTraverseFitTrigger(0);
-    setTraverseElapsedTime(null);
+    setTraverseTimerRunning(false);
+    resetTraverseTimer();
     setState(INITIAL_TRAVERSAL_STATE);
 
     // Reset rewind state
@@ -512,9 +502,11 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
       const batchType = batchId!.split('|')[1] || 'children';
 
       // Set status to traversing while we wait for backend STATE_SNAPSHOT
+      // Clear any previous error state
       setState(prev => ({
         ...prev,
         status: 'traversing',
+        error: null,
         current_step: `Rewinding from ${nodeId} (${batchType} batch)...`,
       }));
 
@@ -543,6 +535,7 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
         (error) => {
           setRewindError(error.message);
           setIsRewinding(false);
+          setTraverseTimerRunning(false);
           setState(prev => ({
             ...prev,
             status: 'error',
@@ -567,41 +560,17 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
   }, [isRewinding]);
 
   const handleNodeRewindClick = useCallback((nodeId: string, batchType?: string, feedback?: string) => {
-    let node = state.nodes.find(n => n.id === nodeId);
+    const node = state.nodes.find(n => n.id === nodeId);
     if (!node) return;
-    if (nodeId === 'ROOT' || state.status === 'idle') return;
+    if (state.status === 'idle') return;
 
-    // For placeholder nodes (seven_chr_def depth 7), find the nearest non-placeholder ancestor
-    // This is the lowest valid node in the ancestry before the placeholder
-    let targetNodeId = nodeId;
-    if (node.category === 'placeholder') {
-      // Build a parent map from edges (target -> source)
-      const parentMap = new Map<string, string>();
-      for (const edge of state.edges) {
-        parentMap.set(String(edge.target), String(edge.source));
-      }
-
-      // Traverse up to find nearest non-placeholder ancestor
-      let currentId = nodeId;
-      while (currentId && currentId !== 'ROOT') {
-        const parentId = parentMap.get(currentId);
-        if (!parentId) break;
-
-        const parentNode = state.nodes.find(n => n.id === parentId);
-        if (parentNode && parentNode.category !== 'placeholder') {
-          // Found a non-placeholder ancestor
-          node = parentNode;
-          targetNodeId = parentId;
-          break;
-        }
-        currentId = parentId;
-      }
-    }
-
-    const batchId = batchType ? `${targetNodeId}|${batchType}` : null;
+    // Every node with "Investigate Batch" owns its own batch
+    // batch_id is simply nodeId|batchType - no traversal needed
+    // For ROOT, batchType will be 'children' and batch_id will be 'ROOT|children'
+    const batchId = batchType ? `${nodeId}|${batchType}` : null;
 
     if (feedback && feedback.trim().length > 0 && batchId) {
-      handleRewindSubmit(targetNodeId, feedback, batchId);
+      handleRewindSubmit(nodeId, feedback, batchId);
       return;
     }
 
@@ -610,7 +579,7 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
     setRewindFeedbackText(feedback || '');
     setIsRewindModalOpen(true);
     setRewindError(null);
-  }, [state.nodes, state.edges, state.status, handleRewindSubmit]);
+  }, [state.nodes, state.status, handleRewindSubmit]);
 
   // Effect to reset isRewinding when traversal completes
   useEffect(() => {

@@ -31,7 +31,7 @@ See CLAUDE.md "Critical: Cached Traversal Node Positioning" for full implementat
 
 ## Example usage
 
-    from agent import build_app, run_traversal, initialize_persister
+    from agent import build_traversal_app, run_traversal, initialize_persister
     from candidate_selector import configure_llm
     import candidate_selector.config as llm_config
 
@@ -51,7 +51,7 @@ See CLAUDE.md "Critical: Cached Traversal Node Positioning" for full implementat
 
     # Option 2: Low-level API with more control
     await initialize_persister()
-    app = await build_app(
+    app = await build_traversal_app(
         context="Patient with type 2 diabetes...",
         default_selector="llm"
     )
@@ -74,7 +74,7 @@ from .state_types import CandidateDecision, DecisionPoint, TraversalState
 from .traversal import (
     PARTITION_KEY,
     PERSISTER,
-    build_app,
+    build_traversal_app,
     cleanup_persister,
     delete_persisted_state,
     generate_traversal_cache_key,
@@ -112,7 +112,7 @@ __all__ = [
     "SpawnParallelBatches",
     "SpawnSevenChr",
     # Traversal
-    "build_app",
+    "build_traversal_app",
     "retry_node",
     "run_traversal",
     "initialize_persister",

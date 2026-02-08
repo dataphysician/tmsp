@@ -58,6 +58,8 @@ interface GraphViewerProps {
   streamingTraversedIds?: Set<string>;
   // Node ID currently being rewound (shows loading state)
   rewindingNodeId?: string | null;
+  // Callback when clicking empty space (not on nodes/overlays)
+  onEmptySpaceClick?: () => void;
 }
 
 // Base constants (designed for ~600px container height / 1080p display)
@@ -94,6 +96,7 @@ function GraphViewerInner({
   showXMarkers = true,
   streamingTraversedIds,
   rewindingNodeId = null,
+  onEmptySpaceClick,
 }: GraphViewerProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -105,6 +108,8 @@ function GraphViewerInner({
   const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Ref for onNodeRewindClick to avoid stale closures in D3 event handlers
   const onNodeRewindClickRef = useRef(onNodeRewindClick);
+  // Ref for onEmptySpaceClick to avoid D3 useEffect re-runs from inline lambdas
+  const onEmptySpaceClickRef = useRef(onEmptySpaceClick);
 
   // Keep refs in sync with props/state for D3 event handlers
   useEffect(() => {
@@ -114,6 +119,10 @@ function GraphViewerInner({
   useEffect(() => {
     onNodeRewindClickRef.current = onNodeRewindClick;
   }, [onNodeRewindClick]);
+
+  useEffect(() => {
+    onEmptySpaceClickRef.current = onEmptySpaceClick;
+  }, [onEmptySpaceClick]);
 
   // Clear pinned state when the pinned node is no longer in the graph
   useEffect(() => {
@@ -150,6 +159,67 @@ function GraphViewerInner({
   useEffect(() => {
     onGraphInteractionRef.current = onGraphInteraction;
   }, [onGraphInteraction]);
+
+  // Build outcome status map for benchmark code-badge coloring
+  const outcomeStatusMap = useMemo(() => {
+    if (!benchmarkMode || !benchmarkMetrics?.outcomes) return new Map<string, string>();
+    const map = new Map<string, string>();
+    for (const o of benchmarkMetrics.outcomes) {
+      map.set(o.expectedCode, o.status);
+    }
+    return map;
+  }, [benchmarkMode, benchmarkMetrics]);
+
+  // Build code → label map for tooltip on code badges (handles sevenChrDef naming)
+  const codeLabelMap = useMemo(() => {
+    const map = new Map<string, string>();
+    if (nodes.length === 0) return map;
+
+    const nodeMap = new Map<string, GraphNode>();
+    for (const n of nodes) {
+      if (n.code) nodeMap.set(n.code, n);
+    }
+
+    const hierarchyParentMap = new Map<string, string>();
+    const sevenChrDefParentMap = new Map<string, string>();
+    for (const e of edges) {
+      const src = String(e.source);
+      const tgt = String(e.target);
+      if (e.edge_type === 'hierarchy') {
+        hierarchyParentMap.set(tgt, src);
+      } else if (e.edge_type === 'lateral' && e.rule === 'sevenChrDef') {
+        sevenChrDefParentMap.set(tgt, src);
+      }
+    }
+
+    for (const code of finalizedCodes) {
+      const node = nodeMap.get(code);
+      if (!node) continue;
+
+      if (node.depth === 7) {
+        const parentId = sevenChrDefParentMap.get(node.id);
+        let ancestorLabel = '';
+        if (parentId) {
+          let currentId = parentId;
+          while (currentId && currentId !== 'ROOT') {
+            const ancestor = nodeMap.get(currentId);
+            if (ancestor && ancestor.category !== 'placeholder') {
+              ancestorLabel = ancestor.label;
+              break;
+            }
+            currentId = hierarchyParentMap.get(currentId) ?? '';
+          }
+        }
+        const charLabel = node.label.includes(': ')
+          ? node.label.split(': ').slice(1).join(': ')
+          : node.label;
+        map.set(code, ancestorLabel ? `${ancestorLabel}, ${charLabel}` : charLabel);
+      } else {
+        map.set(code, node.label);
+      }
+    }
+    return map;
+  }, [nodes, edges, finalizedCodes]);
 
   const sortedFinalizedCodes = useMemo(() => {
     if (codeSortMode === 'default') return finalizedCodes;
@@ -286,6 +356,28 @@ function GraphViewerInner({
     svg.selectAll('*').remove();
     const g = svg.append('g').attr('class', 'main-group');
 
+    // Always attach click handler for empty space (even when graph is empty)
+    // This allows sidebar collapse to work on blank/reset graphs
+    svg.on('click', (event: MouseEvent) => {
+      const target = event.target as Element;
+      const isInsideOverlay = target.closest('.expanded-overlay') !== null ||
+        target.closest('.expanded-node') !== null ||
+        target.closest('.batch-panel') !== null ||
+        target.tagName.toLowerCase() === 'textarea' ||
+        target.closest('foreignObject') !== null;
+      if (isInsideOverlay) return;
+
+      // If overlay is open, just close it (don't collapse sidebar)
+      if (pinnedNodeIdRef.current) {
+        setPinnedNodeId(null);
+        hideExpandedNode();
+        return;
+      }
+
+      // Only collapse sidebar when no overlay was open
+      onEmptySpaceClickRef.current?.();
+    });
+
     // Only render content when traversing or has nodes
     if (nodes.length === 0 && !isTraversing) {
       return;
@@ -346,103 +438,135 @@ function GraphViewerInner({
       });
     }
 
-    // Build TWO children maps:
-    // 1. hierarchyChildren: Only hierarchy edges - used for tree positioning in Phase 2
-    // 2. allChildren: All edges - used for subtree width calculation and positioning children of lateral nodes
-    const hierarchyChildren = new Map<string, string[]>();
+    // Build allChildren map for subtree width calculation (includes all edges)
     const allChildren = new Map<string, string[]>();
+    edges.forEach(e => {
+      const sourceId = String(e.source);
+      const targetId = String(e.target);
+      if (!allChildren.has(sourceId)) allChildren.set(sourceId, []);
+      allChildren.get(sourceId)!.push(targetId);
+    });
 
     // Create finalized codes set for position calculation
     const finalizedCodesSet = new Set(finalizedCodes);
 
-    // Track which nodes have a hierarchy parent (for orphan detection)
-    const hasHierarchyParent = new Set<string>();
+    // =========================================================================
+    // ITERATIVE EXPANSION ALGORITHM
+    // Correctly classifies nodes as hierarchy-connected vs lateral-only by
+    // processing nodes in BFS order from ROOT.
+    // =========================================================================
+    const rendered = new Set<string>(['ROOT']);
+    const hierarchyChildren = new Map<string, string[]>();
+    const lateralOnlyNodes = new Set<string>();
+    const lateralOnlySources = new Map<string, string>(); // target → lateral source (for positioning)
 
-    // First pass: build maps from hierarchy edges
-    // IMPORTANT: For ROOT edges, we relax the sourceNode check since ROOT may not be
-    // in the nodes array during streaming (it's added via STATE_SNAPSHOT but may not
-    // have propagated yet when edges arrive via STATE_DELTA)
-    edges.forEach(e => {
-      const sourceId = String(e.source);
-      const targetId = String(e.target);
-
-      // All edges go into allChildren (for width calculation)
-      if (!allChildren.has(sourceId)) allChildren.set(sourceId, []);
-      allChildren.get(sourceId)!.push(targetId);
-
-      // Only hierarchy edges go into hierarchyChildren
-      // We enforce a strict depth check (source.depth < target.depth) to break cycles needed for the tree layout.
-      // This ensures that "back-edges" or "cross-edges" don't confuse the layout algorithm.
-      const isHierarchy = e.edge_type === 'hierarchy';
+    // Helper to check if a hierarchy edge is valid (depth ordering)
+    const isValidHierarchyEdge = (sourceId: string, targetId: string): boolean => {
       const sourceNode = nodeMap.get(sourceId);
       const targetNode = nodeMap.get(targetId);
 
-      // Special handling for ROOT edges: ROOT has depth 0, so any chapter (depth 1+) is deeper
-      // We don't require sourceNode to exist for ROOT since it may not be in nodeMap during streaming
-      if (isHierarchy && sourceId === 'ROOT' && targetNode) {
-        const targetDepth = targetNode.depth || 0;
-        if (targetDepth > 0) {  // Any non-ROOT node is a valid child of ROOT
-          if (!hierarchyChildren.has('ROOT')) hierarchyChildren.set('ROOT', []);
-          hierarchyChildren.get('ROOT')!.push(targetId);
-          hasHierarchyParent.add(targetId);
+      // ROOT → any non-ROOT node is valid
+      if (sourceId === 'ROOT' && targetNode) {
+        return (targetNode.depth || 0) > 0;
+      }
+
+      if (!sourceNode || !targetNode) return false;
+
+      const sourceDepth = sourceNode.depth || 0;
+      const targetDepth = targetNode.depth || 0;
+
+      // Valid if target is deeper, or same depth with ID ordering (breaks cycles)
+      return targetDepth > sourceDepth || (targetDepth === sourceDepth && sourceId < targetId);
+    };
+
+    // Iterative expansion: process nodes in waves until stable
+    // IMPORTANT: Handles streaming where edges arrive incrementally in DFS order.
+    // A node initially classified as lateral-only may later get a hierarchy path.
+    let changed = true;
+    while (changed) {
+      changed = false;
+
+      // Phase 1: Add hierarchy children of rendered nodes
+      // Also handles RECLASSIFICATION for streaming: if a hierarchy edge arrives
+      // for a node already classified as lateral-only, demote it and reclassify.
+      for (const e of edges) {
+        if (e.edge_type !== 'hierarchy') continue;
+        const sourceId = String(e.source);
+        const targetId = String(e.target);
+
+        if (rendered.has(sourceId) && !rendered.has(targetId)) {
+          // Normal case: add new hierarchy child
+          if (isValidHierarchyEdge(sourceId, targetId)) {
+            if (!hierarchyChildren.has(sourceId)) hierarchyChildren.set(sourceId, []);
+            if (!hierarchyChildren.get(sourceId)!.includes(targetId)) {
+              hierarchyChildren.get(sourceId)!.push(targetId);
+            }
+            rendered.add(targetId);
+            changed = true;
+          }
+        } else if (rendered.has(sourceId) && lateralOnlyNodes.has(targetId)) {
+          // RECLASSIFICATION: Node was lateral-only but now has a hierarchy path.
+          // This happens during streaming when hierarchy edges arrive after lateral edges.
+          if (isValidHierarchyEdge(sourceId, targetId)) {
+            // Remove from lateral-only classification
+            lateralOnlyNodes.delete(targetId);
+            lateralOnlySources.delete(targetId);
+            // Remove from old parent's children list
+            for (const [, children] of hierarchyChildren.entries()) {
+              const idx = children.indexOf(targetId);
+              if (idx !== -1) {
+                children.splice(idx, 1);
+                break;
+              }
+            }
+            // Add to new hierarchy parent
+            if (!hierarchyChildren.has(sourceId)) hierarchyChildren.set(sourceId, []);
+            if (!hierarchyChildren.get(sourceId)!.includes(targetId)) {
+              hierarchyChildren.get(sourceId)!.push(targetId);
+            }
+            changed = true;
+          }
         }
-      } else if (isHierarchy && sourceNode && targetNode) {
-        // Only treat as structural hierarchy if moving "down" the tree (deeper)
-        // If depth is missing/zero (e.g. ROOT), treat it as lower depth
-        const sourceDepth = sourceNode.depth || 0;
-        const targetDepth = targetNode.depth || 0;
+      }
 
-        // Break cycles:
-        // 1. Strictly favor deeper targets (parent -> child)
-        // 2. If same depth (sibling/circular dependency), use ID tie-breaker to pick ONE direction
-        //    This ensures we don't remove BOTH edges in a tight cycle (A<->B), which would orphan one node.
-        const isDeeper = targetDepth > sourceDepth;
-        const isSameDepthAndOrdered = targetDepth === sourceDepth && sourceId < targetId;
+      // Phase 2: Add lateral-only targets (source rendered, target not reachable via hierarchy)
+      for (const e of edges) {
+        if (e.edge_type !== 'lateral' || e.rule === 'sevenChrDef') continue;
+        const sourceId = String(e.source);
+        const targetId = String(e.target);
 
-        if (isDeeper || isSameDepthAndOrdered) {
+        if (rendered.has(sourceId) && !rendered.has(targetId)) {
+          // This node can only be reached via lateral edge - mark as lateral-only
+          lateralOnlyNodes.add(targetId);
+          lateralOnlySources.set(targetId, sourceId);
+
+          // Add to hierarchyChildren for positioning (will be positioned relative to source)
+          // The positioning algorithm uses this to place it to the right of the source
           if (!hierarchyChildren.has(sourceId)) hierarchyChildren.set(sourceId, []);
-          hierarchyChildren.get(sourceId)!.push(targetId);
-          hasHierarchyParent.add(targetId);
+          if (!hierarchyChildren.get(sourceId)!.includes(targetId)) {
+            hierarchyChildren.get(sourceId)!.push(targetId);
+          }
+          rendered.add(targetId);
+          changed = true;
         }
       }
-    });
+    }
 
-    // Track nodes that are "orphan rescued" via lateral edges
-    // These should be positioned as hierarchy children, not as lateral targets
-    const orphanRescuedNodes = new Set<string>();
-
-    // Second pass: include lateral edges that connect orphaned subtrees
-    // These are lateral edges (codeFirst, codeAlso, useAdditionalCode) where the target
-    // has no hierarchy parent and would otherwise be disconnected from the tree
-    edges.forEach(e => {
-      const sourceId = String(e.source);
-      const targetId = String(e.target);
-
-      // Only process lateral edges (not sevenChrDef which is handled separately)
-      const isLateral = e.edge_type === 'lateral' && e.rule !== 'sevenChrDef';
-      if (!isLateral) return;
-
-      // If target already has a hierarchy parent, skip (it's already positioned)
-      if (hasHierarchyParent.has(targetId)) return;
-
-      // For orphaned subtrees, always add the lateral edge regardless of depth ordering
-      // This rescues subtrees that are connected via lateral links (codeFirst, codeAlso, etc.)
-      // We don't use alphabetical ordering here because the whole point is to rescue orphans
-      if (!hierarchyChildren.has(sourceId)) hierarchyChildren.set(sourceId, []);
-      if (!hierarchyChildren.get(sourceId)!.includes(targetId)) {
-        hierarchyChildren.get(sourceId)!.push(targetId);
-        hasHierarchyParent.add(targetId);
-        orphanRescuedNodes.add(targetId);  // Track for hierarchyParent mapping
-      }
-    });
+    // For backwards compatibility with positioning code, create orphanRescuedNodes alias
+    const orphanRescuedNodes = lateralOnlyNodes;
 
     // Filter edges by type for rendering
-    // - ROOT edges: dark black solid straight lines
-    // - Hierarchy edges: solid straight lines (bottom-middle to top-middle)
-    // - sevenChrDef edges: dashed straight lines (same path as hierarchy, different style)
+    // - ROOT edges: solid straight lines
+    // - Hierarchy edges: solid straight lines (but NOT to lateral-only nodes)
+    // - sevenChrDef edges: dashed straight lines
     // - Other lateral edges: dashed curved lines
     const rootEdges = edges.filter(e => e.edge_type === 'hierarchy' && String(e.source) === 'ROOT');
-    const hierarchyEdges = edges.filter(e => e.edge_type === 'hierarchy' && String(e.source) !== 'ROOT');
+    // Exclude edges TO lateral-only nodes - they only have lateral connections
+    const hierarchyEdges = edges.filter(e =>
+      e.edge_type === 'hierarchy' &&
+      String(e.source) !== 'ROOT' &&
+      !lateralOnlyNodes.has(String(e.target))
+    );
     const sevenChrDefEdges = edges.filter(e => e.edge_type === 'lateral' && e.rule === 'sevenChrDef');
     const otherLateralEdges = edges.filter(e => e.edge_type === 'lateral' && e.rule !== 'sevenChrDef');
 
@@ -593,8 +717,9 @@ function GraphViewerInner({
           .attr('x', NODE_WIDTH / 2)
           .attr('y', NODE_HEIGHT / 2 + 4)
           .attr('text-anchor', 'middle')
-          .attr('font-size', 13)
+          .attr('font-size', 11)
           .attr('font-weight', 600)
+          .attr('font-family', 'ui-monospace, monospace')
           .attr('fill', '#1e293b')
           .text('ROOT');
 
@@ -628,6 +753,10 @@ function GraphViewerInner({
       }
     };
 
+    // Create getter for current zoom transform (dynamic, not stale)
+    const svgNode = svg.node()!;
+    const getTransform = () => d3.zoomTransform(svgNode);
+
     // Build overlay context for the extracted renderer
     const overlayContext: OverlayContext = {
       overlayGroup: expandedOverlayGroup,
@@ -652,10 +781,12 @@ function GraphViewerInner({
       allChildren,
       sevenChrDefEdges,
       otherLateralEdges,
+      viewportBounds: { width, height, topMargin: 0, bottomMargin: 0 },
+      getTransform,
     };
 
     // Helper function to show expanded node overlay (uses extracted renderer)
-    const showExpandedNode = (d: GraphNode, _nodeGroup: SVGGElement) => {
+    const showExpandedNode = (d: GraphNode) => {
       showNodeOverlay(d, overlayContext, cancelShowTimeout);
     };
 
@@ -667,7 +798,7 @@ function GraphViewerInner({
           event.stopPropagation();
           setPinnedNodeId('ROOT');
           pinnedNodeIdRef.current = 'ROOT';
-          showExpandedNode(rootNode, this as SVGGElement);
+          showExpandedNode(rootNode);
           onNodeClick('ROOT');
         })
         .on('mouseenter', function () {
@@ -677,13 +808,12 @@ function GraphViewerInner({
           }
           cancelShowTimeout();
           cancelHideTimeout();
-          const nodeGroup = this as SVGGElement;
           if (pinnedNodeIdRef.current === 'ROOT') {
-            showExpandedNode(rootNode, nodeGroup);
+            showExpandedNode(rootNode);
             return;
           }
           showTimeoutRef.current = setTimeout(() => {
-            showExpandedNode(rootNode, nodeGroup);
+            showExpandedNode(rootNode);
           }, 1000);
         })
         .on('mouseleave', () => {
@@ -736,11 +866,11 @@ function GraphViewerInner({
         return d.category === 'placeholder' ? '4,2' : null;
       });
 
-    // Add node code text
+    // Add node code text (y scales with node height: 18/60 = 0.3)
     nodeGroups.append('text')
       .attr('class', 'node-code')
       .attr('x', NODE_WIDTH / 2)
-      .attr('y', 18)
+      .attr('y', NODE_HEIGHT * 0.30)
       .attr('text-anchor', 'middle')
       .attr('font-size', 11)
       .attr('font-weight', 600)
@@ -748,32 +878,32 @@ function GraphViewerInner({
       .attr('fill', '#1e293b')
       .text(d => getDisplayCode(d));
 
-    // Add billable indicator
+    // Add billable indicator (y scales with node height: 16/60 = 0.267)
     nodeGroups.append('text')
       .attr('class', 'node-billable')
       .attr('x', NODE_WIDTH - 6)
-      .attr('y', 16)
+      .attr('y', NODE_HEIGHT * 0.267)
       .attr('text-anchor', 'end')
       .attr('font-size', 12)
       .attr('font-weight', 700)
       .attr('fill', '#16a34a')
       .text(d => d.billable ? '$' : '');
 
-    // Add label line 1
+    // Add label line 1 (y scales with node height: 32/60 = 0.533)
     nodeGroups.append('text')
       .attr('class', 'node-label node-label-1')
       .attr('x', NODE_WIDTH / 2)
-      .attr('y', 32)
+      .attr('y', NODE_HEIGHT * 0.533)
       .attr('text-anchor', 'middle')
       .attr('font-size', 9)
       .attr('fill', '#64748b')
       .text(d => wrapNodeLabel(d.label, 22)[0]);
 
-    // Add label line 2
+    // Add label line 2 (y scales with node height: 44/60 = 0.733)
     nodeGroups.append('text')
       .attr('class', 'node-label node-label-2')
       .attr('x', NODE_WIDTH / 2)
-      .attr('y', 44)
+      .attr('y', NODE_HEIGHT * 0.733)
       .attr('text-anchor', 'middle')
       .attr('font-size', 9)
       .attr('fill', '#64748b')
@@ -785,7 +915,7 @@ function GraphViewerInner({
         event.stopPropagation();
         setPinnedNodeId(d.id);
         pinnedNodeIdRef.current = d.id;
-        showExpandedNode(d, this as SVGGElement);
+        showExpandedNode(d);
         onNodeClick(d.id);
       })
       .on('mouseenter', function (_, d) {
@@ -795,13 +925,12 @@ function GraphViewerInner({
         }
         cancelShowTimeout();
         cancelHideTimeout();
-        const nodeGroup = this as SVGGElement;
         if (pinnedNodeIdRef.current === d.id) {
-          showExpandedNode(d, nodeGroup);
+          showExpandedNode(d);
           return;
         }
         showTimeoutRef.current = setTimeout(() => {
-          showExpandedNode(d, nodeGroup);
+          showExpandedNode(d);
         }, 1000);
       })
       .on('mouseleave', () => {
@@ -972,31 +1101,14 @@ function GraphViewerInner({
       const pinnedNode = nodes.find(n => n.id === pinnedNodeIdRef.current);
       if (pinnedNode) {
         // Pass null for nodeGroup as it's not actually used for positioning (positions map is used)
-        showExpandedNode(pinnedNode, null as unknown as SVGGElement);
+        showExpandedNode(pinnedNode);
       }
     }
 
-    // Click on SVG background (any click not stopped by nodes/buttons) releases the pinned overlay
-    svg.on('click', (event: MouseEvent) => {
-      if (pinnedNodeIdRef.current) {
-        // Don't unpin if clicking inside the overlay (foreignObject clicks may not stop propagation correctly)
-        const target = event.target as Element;
-        const isInsideOverlay = target.closest('.expanded-overlay') !== null ||
-          target.closest('.expanded-node') !== null ||
-          target.closest('.batch-panel') !== null ||
-          target.tagName.toLowerCase() === 'textarea' ||
-          target.closest('foreignObject') !== null;
-        if (isInsideOverlay) return;
-
-        setPinnedNodeId(null);
-        hideExpandedNode();
-      }
-    });
-
     // IMPORTANT: Apply the current transform to the new <g> element
     // This preserves the user's pan/zoom position when the graph re-renders
-    const currentTransform = d3.zoomTransform(svg.node()!);
-    g.attr('transform', currentTransform.toString());
+    const savedTransform = d3.zoomTransform(svg.node()!);
+    g.attr('transform', savedTransform.toString());
 
     // NOTE: Automatic fit-to-window removed - D3 render positions content correctly.
     // User can manually click the fit-to-window button (⤢) when needed.
@@ -1062,7 +1174,7 @@ function GraphViewerInner({
   return (
     <div className="graph-container" ref={containerRef}>
       <div className="view-header-bar">
-        <div className="view-header-top-row">
+        <div className="view-header-info">
           <div className="status-line">
             <span className="status-label">Status:</span>
             {status === 'idle' ? (
@@ -1074,13 +1186,42 @@ function GraphViewerInner({
             ) : (
               <span className="status-value status-processing">PROCESSING</span>
             )}
-            {(status === 'complete' || status === 'error') && elapsedTime !== null && (
+            {status !== 'idle' && elapsedTime !== null && (
               <span className="status-elapsed">({formatElapsedTime(elapsedTime)})</span>
             )}
-            {benchmarkMode && benchmarkMetrics && status === 'complete' && (
+            {status === 'error' && errorMessage && (
+              <span className="status-message">{errorMessage}</span>
+            )}
+            {isTraversing && currentStep && (
+              <span className="status-message">{currentStep}</span>
+            )}
+          </div>
+        {benchmarkMode && benchmarkMetrics ? (
+          <>
+            <div className="report-line">
+              <span className="report-label">Benchmark:</span>
+              <span className="benchmark-scores">
+                <span className="benchmark-score">
+                  Traversal Recall: <strong>{(benchmarkMetrics.traversalRecall * 100).toFixed(1)}%</strong>
+                  {' '}({benchmarkMetrics.expectedNodesTraversed}/{benchmarkMetrics.expectedNodesCount})
+                </span>
+                <span className="stat-separator">·</span>
+                <span className="benchmark-score">
+                  Final Codes Recall: <strong>{(benchmarkMetrics.finalCodesRecall * 100).toFixed(1)}%</strong>
+                  {' '}({benchmarkMetrics.exactCount}/{benchmarkMetrics.expectedCount})
+                </span>
+              </span>
+            </div>
+            <div className="report-line">
+              <span className="report-label">Alignment:</span>
               <span className="benchmark-outcome-counts">
+                <span className="benchmark-outcome-prefix">Final Code(s):</span>
                 <span className="benchmark-stat exact">
                   {benchmarkMetrics.exactCount} <span className="outcome-label">matched</span>
+                </span>
+                <span className="stat-separator">·</span>
+                <span className="benchmark-stat missed">
+                  {benchmarkMetrics.missedCount} <span className="outcome-label">missed</span>
                 </span>
                 <span className="stat-separator">·</span>
                 <span className="benchmark-stat undershoot">
@@ -1091,41 +1232,8 @@ function GraphViewerInner({
                   {benchmarkMetrics.overshootCount} <span className="outcome-label">overshot</span>
                 </span>
               </span>
-            )}
-            {status === 'error' && errorMessage && (
-              <span className="status-message">{errorMessage}</span>
-            )}
-            {isTraversing && currentStep && (
-              <span className="status-message">{currentStep}</span>
-            )}
-          </div>
-          <button
-            className="export-btn"
-            onClick={handleExportSvg}
-            title="Export as SVG"
-            disabled={
-              nodes.length === 0 ||
-              (benchmarkMode && status !== 'complete' && status !== 'error')
-            }
-          >
-            Export SVG
-          </button>
-        </div>
-        {benchmarkMode && benchmarkMetrics ? (
-          <div className="report-line">
-            <span className="report-label">Benchmark:</span>
-            <span className="benchmark-scores">
-              <span className="benchmark-score">
-                Traversal Recall: <strong>{(benchmarkMetrics.traversalRecall * 100).toFixed(1)}%</strong>
-                {' '}({benchmarkMetrics.expectedNodesTraversed}/{benchmarkMetrics.expectedNodesCount})
-              </span>
-              <span className="stat-separator">·</span>
-              <span className="benchmark-score">
-                Final Codes Recall: <strong>{(benchmarkMetrics.finalCodesRecall * 100).toFixed(1)}%</strong>
-                {' '}({benchmarkMetrics.exactCount}/{benchmarkMetrics.expectedCount})
-              </span>
-            </span>
-          </div>
+            </div>
+          </>
         ) : benchmarkMode && !benchmarkMetrics && nodeCount > 0 ? (
           // Benchmark mode: before or during traversal
           <div className="report-line">
@@ -1136,18 +1244,30 @@ function GraphViewerInner({
                 <>
                   <strong>{nodeCount}</strong> target nodes
                 </>
-              ) : (
-                // During traversal: show intersecting traversed nodes count
-                <>
-                  <strong>
-                    {(nodes as BenchmarkGraphNode[]).filter(
+              ) : (() => {
+                const traversedCount = status === 'traversing' && streamingTraversedIds
+                  ? streamingTraversedIds.size
+                  : (nodes as BenchmarkGraphNode[]).filter(
                       n => n.benchmarkStatus === 'traversed' || n.benchmarkStatus === 'matched'
-                    ).length}
-                  </strong> nodes traversed
-                  <span className="stat-separator">·</span>
-                  <strong>{nodeCount}</strong> target nodes
-                </>
-              )}
+                    ).length;
+                const expectedNodeIds = new Set(nodes.filter(n => n.id !== 'ROOT').map(n => n.id));
+                const expectedNodesTraversed = status === 'traversing' && streamingTraversedIds
+                  ? [...expectedNodeIds].filter(id => streamingTraversedIds.has(id)).length
+                  : (nodes as BenchmarkGraphNode[]).filter(
+                      n => n.benchmarkStatus === 'traversed' || n.benchmarkStatus === 'matched'
+                    ).length;
+                const extraCount = traversedCount - expectedNodesTraversed;
+                return (
+                  <>
+                    <strong>{traversedCount}</strong> <strong style={{ color: 'var(--text)' }}>explored</strong> nodes
+                    {' '}(<strong style={{ color: '#16a34a' }}>aligned</strong>{' '}
+                    <strong>{expectedNodesTraversed}</strong>/<strong>{expectedNodeIds.size}</strong>{' '}
+                    to target nodes,
+                    {' '}<strong>{extraCount}</strong>{' '}
+                    <strong style={{ color: '#6b7280' }}>extra</strong> nodes)
+                  </>
+                );
+              })()}
             </span>
           </div>
         ) : (nodeCount > 0 || finalizedCodes.length > 0 || decisionCount > 0) && (
@@ -1178,6 +1298,20 @@ function GraphViewerInner({
             </span>
           </div>
         )}
+        </div>
+        <div className="view-header-actions">
+          <button
+            className="export-btn"
+            onClick={handleExportSvg}
+            title="Export as SVG"
+            disabled={
+              nodes.length === 0 ||
+              (benchmarkMode && status !== 'complete' && status !== 'error')
+            }
+          >
+            Export SVG
+          </button>
+        </div>
       </div>
       <div className="graph-svg-area">
         <svg ref={svgRef} width="100%" height="100%" />
@@ -1261,20 +1395,33 @@ function GraphViewerInner({
         <div className="finalized-codes-bar">
           {codesBarLabel && <span className="codes-bar-label">{codesBarLabel} ({finalizedCodes.length})</span>}
           <div className="codes-list">
-            {sortedFinalizedCodes.map(code => (
-              benchmarkMode && onRemoveExpectedCode ? (
+            {sortedFinalizedCodes.map(code => {
+              const outcomeClass = outcomeStatusMap.get(code) ?? '';
+              const tooltip = codeLabelMap.get(code) ?? '';
+              const outcomeLabel = outcomeClass === 'exact' ? '\t\t\u00A0\u00A0\u00A0\u00A0\u00A0Alignment:\u00A0MATCHED'
+                : outcomeClass === 'undershoot' ? '\t\t\u00A0\u00A0\u00A0\u00A0\u00A0Alignment:\u00A0UNDERSHOT'
+                : outcomeClass === 'overshoot' ? '\t\t\u00A0\u00A0\u00A0\u00A0\u00A0Alignment:\u00A0OVERSHOT'
+                : outcomeClass === 'missed' ? '\t\t\u00A0\u00A0\u00A0\u00A0\u00A0Alignment:\u00A0MISSED'
+                : '';
+              const paddedCode = code.padEnd(8, '\u00A0');
+              const codeLine = tooltip ? `${paddedCode}\t${tooltip}` : code;
+              const fullTooltip = outcomeLabel
+                ? `${codeLine}\n${outcomeLabel}`
+                : codeLine;
+              return benchmarkMode && onRemoveExpectedCode ? (
                 <span
                   key={code}
-                  className={`code-badge removable${invalidCodes.has(code) ? ' invalid' : ''}`}
+                  className={`code-badge removable${invalidCodes.has(code) ? ' invalid' : ''}${outcomeClass ? ` outcome-${outcomeClass}` : ''}`}
+                  title={fullTooltip}
                   onClick={() => onRemoveExpectedCode(code)}
                 >
                   {code}
                   <span className="remove-icon">×</span>
                 </span>
               ) : (
-                <span key={code} className={`code-badge${invalidCodes.has(code) ? ' invalid' : ''}`}>{code}</span>
-              )
-            ))}
+                <span key={code} className={`code-badge${invalidCodes.has(code) ? ' invalid' : ''}${outcomeClass ? ` outcome-${outcomeClass}` : ''}`} title={fullTooltip}>{code}</span>
+              );
+            })}
           </div>
           <button
             className="sort-toggle"

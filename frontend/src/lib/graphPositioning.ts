@@ -307,10 +307,10 @@ export function calculatePositions(
     currentX = right + CHAPTER_PADDING;
   }
 
-  // ===== PHASE 3: Position ROOT =====
+  // ===== PHASE 3: Position all nodes =====
   positions.set('ROOT', { x: containerWidth / 2, y: 25 });
 
-  // ===== PHASE 4: Bounded Region Positioning =====
+  // Bounded Region Positioning (recursive)
   const positionedNodes = new Set<string>();
   const nodePositionedUnderChapter = new Map<string, string>();
 
@@ -439,10 +439,8 @@ export function calculatePositions(
           right: regionX + childWidth
         };
 
-        const childHierarchyWidth = childBounds?.hierarchyChildrenWidth ?? 0;
-        const childSelfWidth = layoutWidth + nodePadding;
-        const hierarchyPortionWidth = Math.max(childSelfWidth, childHierarchyWidth);
-        const childParentX = childRegion.left + hierarchyPortionWidth / 2;
+        const childHierarchyOnlyWidth = childBounds?.hierarchyOnlyWidth ?? (layoutWidth + nodePadding);
+        const childParentX = childRegion.left + childHierarchyOnlyWidth / 2;
 
         childAnchors.push(childParentX);
 
@@ -455,8 +453,7 @@ export function calculatePositions(
 
         usedLeft = Math.min(usedLeft, childResult.usedLeft);
         usedRight = Math.max(usedRight, childResult.usedRight);
-        usedRight = Math.max(usedRight, childResult.usedRight, childRegion.right);
-        regionX = Math.max(childRegion.right, childResult.usedRight) + nodePadding;
+        regionX = childResult.usedRight + nodePadding;
       }
 
       const allocatedRegionEnd = regionX - nodePadding;
@@ -599,7 +596,7 @@ export function calculatePositions(
           for (const checkNodeId of nodesToCheck) {
             const checkPos = positions.get(checkNodeId);
             if (checkPos) {
-              const minLateralX = checkPos.x + minGap + layoutWidth / 2;
+              const minLateralX = checkPos.x + minGap;
               if (targetX < minLateralX) {
                 targetX = minLateralX;
                 alignedWithParent = false;
@@ -645,58 +642,12 @@ export function calculatePositions(
     });
   }
 
-  // ===== PHASE 5: Resolve Chapter Collisions =====
+  // ===== PHASE 4: Chapter layout (collision resolution, compaction) =====
   const wasPositionedUnderChapter = (nodeId: string, chapterId: string): boolean => {
     return nodePositionedUnderChapter.get(nodeId) === chapterId;
   };
 
-  const resolveChapterCollisions = (): boolean => {
-    let anyShifted = false;
-    const sortedBoundaries = sortedChapters.map(id => chapterBoundaries.get(id)!);
-
-    for (let i = 0; i < sortedBoundaries.length - 1; i++) {
-      const leftChapter = sortedBoundaries[i];
-      const rightChapter = sortedBoundaries[i + 1];
-
-      const overlap = leftChapter.right + CHAPTER_PADDING - rightChapter.left;
-      if (overlap > 0) {
-        anyShifted = true;
-        const shiftAmount = overlap;
-
-        rightChapter.left += shiftAmount;
-        rightChapter.right += shiftAmount;
-        rightChapter.centerX += shiftAmount;
-
-        for (const [nodeId, pos] of positions.entries()) {
-          if (nodeId === 'ROOT') continue;
-          if (wasPositionedUnderChapter(nodeId, rightChapter.chapterId)) {
-            positions.set(nodeId, { x: pos.x + shiftAmount, y: pos.y });
-          }
-        }
-
-        for (let j = i + 2; j < sortedBoundaries.length; j++) {
-          const cascadeChapter = sortedBoundaries[j];
-          cascadeChapter.left += shiftAmount;
-          cascadeChapter.right += shiftAmount;
-          cascadeChapter.centerX += shiftAmount;
-
-          for (const [nodeId, pos] of positions.entries()) {
-            if (nodeId === 'ROOT') continue;
-            if (wasPositionedUnderChapter(nodeId, cascadeChapter.chapterId)) {
-              positions.set(nodeId, { x: pos.x + shiftAmount, y: pos.y });
-            }
-          }
-        }
-      }
-    }
-    return anyShifted;
-  };
-
-  for (let pass = 0; pass < 5; pass++) {
-    if (!resolveChapterCollisions()) break;
-  }
-
-  // ===== PHASE 6: Helper Functions =====
+  // Helper functions for chapter layout (must be defined before resolveChapterCollisions)
   const getAllDescendants = (nodeId: string): Set<string> => {
     const descendants = new Set<string>();
     const stack = [nodeId];
@@ -731,94 +682,83 @@ export function calculatePositions(
     }
   };
 
-  // ===== PHASE 7: Recalculate boundaries =====
-  for (const chapterId of sortedChapters) {
-    const boundary = chapterBoundaries.get(chapterId)!;
-    let actualLeft = Infinity;
-    let actualRight = -Infinity;
-
+  // Helper: shift ALL nodes in a chapter + update that chapter's boundary
+  const shiftEntireChapter = (chapterId: string, deltaX: number) => {
     for (const [nodeId, pos] of positions.entries()) {
       if (nodeId === 'ROOT') continue;
       if (wasPositionedUnderChapter(nodeId, chapterId)) {
-        actualLeft = Math.min(actualLeft, pos.x - layoutWidth / 2);
-        actualRight = Math.max(actualRight, pos.x + layoutWidth / 2);
+        positions.set(nodeId, { x: pos.x + deltaX, y: pos.y });
       }
     }
-
-    if (actualLeft !== Infinity && actualRight !== -Infinity) {
-      boundary.left = actualLeft;
-      boundary.right = actualRight;
-      boundary.centerX = (actualLeft + actualRight) / 2;
+    const boundary = chapterBoundaries.get(chapterId);
+    if (boundary) {
+      boundary.left += deltaX;
+      boundary.right += deltaX;
+      boundary.centerX += deltaX;
     }
-  }
+  };
 
-  // ===== PHASE 7a: Compact chapters =====
-  for (let i = 1; i < sortedChapters.length; i++) {
-    const prevChapterId = sortedChapters[i - 1];
-    const currChapterId = sortedChapters[i];
-    const prevBoundary = chapterBoundaries.get(prevChapterId)!;
-    const currBoundary = chapterBoundaries.get(currChapterId)!;
+  const resolveChapterCollisions = (): boolean => {
+    let anyShifted = false;
+    const sortedBoundaries = sortedChapters.map(id => chapterBoundaries.get(id)!);
 
-    const desiredLeft = prevBoundary.right + CHAPTER_PADDING;
-    const shiftAmount = currBoundary.left - desiredLeft;
+    for (let i = 0; i < sortedBoundaries.length - 1; i++) {
+      const leftChapter = sortedBoundaries[i];
+      const rightChapter = sortedBoundaries[i + 1];
 
-    if (shiftAmount > 1) {
-      for (const [nodeId, pos] of positions.entries()) {
-        if (nodeId === 'ROOT') continue;
-        if (wasPositionedUnderChapter(nodeId, currChapterId)) {
-          positions.set(nodeId, { x: pos.x - shiftAmount, y: pos.y });
+      const overlap = leftChapter.right + CHAPTER_PADDING - rightChapter.left;
+      if (overlap > 0) {
+        anyShifted = true;
+        // Shift this chapter and all subsequent chapters
+        for (let j = i + 1; j < sortedBoundaries.length; j++) {
+          shiftEntireChapter(sortedBoundaries[j].chapterId, overlap);
         }
       }
-
-      currBoundary.left -= shiftAmount;
-      currBoundary.right -= shiftAmount;
-      currBoundary.centerX -= shiftAmount;
     }
-  }
+    return anyShifted;
+  };
 
   for (let pass = 0; pass < 5; pass++) {
     if (!resolveChapterCollisions()) break;
   }
 
-  // ===== PHASE 7.5: Re-center chapter nodes =====
-  for (const chapterId of sortedChapters) {
-    const chapterPos = positions.get(chapterId);
-    if (!chapterPos) continue;
+  // Helper: get true hierarchy children (rendered, non-orphan, non-placeholder-leaf)
+  const getTrueHierarchyChildren = (nodeId: string): string[] => {
+    const children = hierarchyChildren.get(nodeId) || [];
+    const renderedChildren = children.filter(id => {
+      if (!isPlaceholderNode(id)) return true;
+      const hasSevenChrTargets = (sevenChrDefTargetsPerSource.get(id) || []).length > 0;
+      const hasChildren = (hierarchyChildren.get(id) || []).length > 0;
+      return hasSevenChrTargets || hasChildren;
+    });
+    return renderedChildren.filter(id => !orphanRescuedNodes.has(id));
+  };
 
-    const chapterNode = nodeMap.get(chapterId);
-    const chapterDepth = chapterNode?.depth ?? 1;
-    const immediateChildren = (hierarchyChildren.get(chapterId) || [])
-      .filter(childId => {
-        const childNode = nodeMap.get(childId);
-        return childNode && childNode.depth === chapterDepth + 1;
-      });
-
-    const trueHierarchyChildren = immediateChildren.filter(id => !orphanRescuedNodes.has(id));
-
-    if (trueHierarchyChildren.length >= 2) {
-      let minChildX = Infinity;
-      let maxChildX = -Infinity;
-      for (const childId of trueHierarchyChildren) {
-        const childPos = positions.get(childId);
-        if (childPos) {
-          minChildX = Math.min(minChildX, childPos.x);
-          maxChildX = Math.max(maxChildX, childPos.x);
+  // Helper: recalculate chapter boundaries from actual node positions
+  const recalculateChapterBoundaries = () => {
+    for (const chapterId of sortedChapters) {
+      const boundary = chapterBoundaries.get(chapterId)!;
+      let actualLeft = Infinity;
+      let actualRight = -Infinity;
+      for (const [nodeId, pos] of positions.entries()) {
+        if (nodeId === 'ROOT') continue;
+        if (wasPositionedUnderChapter(nodeId, chapterId)) {
+          actualLeft = Math.min(actualLeft, pos.x - layoutWidth / 2);
+          actualRight = Math.max(actualRight, pos.x + layoutWidth / 2);
         }
       }
-
-      if (minChildX !== Infinity && maxChildX !== -Infinity) {
-        const targetX = (minChildX + maxChildX) / 2;
-        positions.set(chapterId, { x: targetX, y: chapterPos.y });
-      }
-    } else if (trueHierarchyChildren.length === 1) {
-      const childPos = positions.get(trueHierarchyChildren[0]);
-      if (childPos) {
-        positions.set(chapterId, { x: childPos.x, y: chapterPos.y });
+      if (actualLeft !== Infinity && actualRight !== -Infinity) {
+        boundary.left = actualLeft;
+        boundary.right = actualRight;
+        boundary.centerX = (actualLeft + actualRight) / 2;
       }
     }
-  }
+  };
 
-  // ===== PHASE 7.6: Re-center ALL parent nodes =====
+  // Recalculate boundaries after collision resolution
+  recalculateChapterBoundaries();
+
+  // centerParentsBottomUp: Re-center non-chapter parent nodes over their children
   const centerParentsBottomUp = () => {
     const nodesByDepth: Array<{ id: string; depth: number }> = [];
     for (const node of _nodes) {
@@ -830,21 +770,24 @@ export function calculatePositions(
     for (const { id: nodeId } of nodesByDepth) {
       if (sortedChapters.includes(nodeId)) continue;
 
-      const children = hierarchyChildren.get(nodeId) || [];
-      const renderedChildren = children.filter(id => {
-        if (!isPlaceholderNode(id)) return true;
-        const hasSevenChrTargets = (sevenChrDefTargetsPerSource.get(id) || []).length > 0;
-        const hasChildren = (hierarchyChildren.get(id) || []).length > 0;
-        return hasSevenChrTargets || hasChildren;
-      });
+      const trueHierarchyChildren = getTrueHierarchyChildren(nodeId);
+      if (trueHierarchyChildren.length === 0) continue;
 
-      const trueHierarchyChildren = renderedChildren.filter(id => !orphanRescuedNodes.has(id));
+      // Single child: align directly to child
+      if (trueHierarchyChildren.length === 1) {
+        const nodePos = positions.get(nodeId);
+        const childPos = positions.get(trueHierarchyChildren[0]);
+        if (nodePos && childPos && Math.abs(nodePos.x - childPos.x) > 0.5) {
+          positions.set(nodeId, { x: childPos.x, y: nodePos.y });
+        }
+        continue;
+      }
 
-      if (trueHierarchyChildren.length < 2) continue;
-
+      // Multiple children: use tie detection logic
       const nodePos = positions.get(nodeId);
       if (!nodePos) continue;
 
+      // Calculate midpoint of all children
       let minChildX = Infinity;
       let maxChildX = -Infinity;
       for (const childId of trueHierarchyChildren) {
@@ -856,16 +799,36 @@ export function calculatePositions(
       }
 
       if (minChildX !== Infinity && maxChildX !== -Infinity) {
-        const targetX = (minChildX + maxChildX) / 2;
+        const midpointX = (minChildX + maxChildX) / 2;
+        // Find closest child to midpoint and check for ties
+        let closestChildX = minChildX;
+        let closestDistance = Infinity;
+        let tieCount = 0;
+        const TIE_TOLERANCE = 5; // pixels - distances within this are considered equal
+        for (const childId of trueHierarchyChildren) {
+          const childPos = positions.get(childId);
+          if (childPos) {
+            const distance = Math.abs(childPos.x - midpointX);
+            if (distance < closestDistance - TIE_TOLERANCE) {
+              closestDistance = distance;
+              closestChildX = childPos.x;
+              tieCount = 1;
+            } else if (Math.abs(distance - closestDistance) <= TIE_TOLERANCE) {
+              tieCount++;
+            }
+          }
+        }
+        // If tie (evenly spaced), stay at midpoint; otherwise snap to closest child
+        const targetX = tieCount > 1 ? midpointX : closestChildX;
+
         if (Math.abs(nodePos.x - targetX) > 0.5) {
           positions.set(nodeId, { x: targetX, y: nodePos.y });
         }
       }
     }
   };
-  centerParentsBottomUp();
 
-  // ===== PHASE 8: Force sevenChrDef alignment =====
+  // ===== PHASE 5: Force sevenChrDef alignment =====
   for (const [sourceId, targets] of sevenChrDefTargetsPerSource.entries()) {
     const sourcePos = positions.get(sourceId);
     if (!sourcePos) continue;
@@ -879,7 +842,327 @@ export function calculatePositions(
     }
   }
 
-  // ===== PHASE 9: Final chapter centering =====
+  // Centering (Phase 6) and collision resolution (Phase 7) work better in
+  // the spacious pre-compaction layout where cross-chapter collisions are rare.
+
+  // Inline collision guard: after moving a node during upward propagation,
+  // check its row for collisions and shift any rightward-colliding nodes.
+  // Cross-chapter aware: shifts entire later chapter when nodes belong to
+  // different chapters.
+  const chapterIndexMap = new Map<string, number>();
+  sortedChapters.forEach((id, i) => chapterIndexMap.set(id, i));
+
+  const resolveInlineCollision = (movedNodeId: string) => {
+    const movedPos = positions.get(movedNodeId);
+    if (!movedPos) return;
+    const rowY = Math.round(movedPos.y);
+    const minGapInline = layoutWidth + nodePadding;
+
+    // Collect all nodes at the same row
+    const sameRowNodes: Array<{ id: string; x: number }> = [];
+    for (const [nodeId, pos] of positions.entries()) {
+      if (nodeId === 'ROOT') continue;
+      if (Math.round(pos.y) === rowY) {
+        sameRowNodes.push({ id: nodeId, x: pos.x });
+      }
+    }
+    if (sameRowNodes.length < 2) return;
+    sameRowNodes.sort((a, b) => a.x - b.x);
+
+    // Find the moved node in the sorted row
+    const movedIdx = sameRowNodes.findIndex(n => n.id === movedNodeId);
+    if (movedIdx < 0) return;
+
+    // Check collision with right neighbor
+    if (movedIdx < sameRowNodes.length - 1) {
+      const rightNeighbor = sameRowNodes[movedIdx + 1];
+      const gap = rightNeighbor.x - sameRowNodes[movedIdx].x;
+      if (gap < minGapInline) {
+        const shiftNeeded = minGapInline - gap;
+
+        // Cross-chapter check
+        const movedChapterId = nodePositionedUnderChapter.get(movedNodeId);
+        const rightChapterId = nodePositionedUnderChapter.get(rightNeighbor.id);
+
+        if (movedChapterId && rightChapterId && movedChapterId !== rightChapterId) {
+          // Cross-chapter: shift entire later chapter + subsequent
+          const rightIdx = chapterIndexMap.get(rightChapterId) ?? -1;
+          if (rightIdx >= 0) {
+            for (let j = rightIdx; j < sortedChapters.length; j++) {
+              shiftEntireChapter(sortedChapters[j], shiftNeeded);
+            }
+          }
+        } else {
+          // Same chapter: shift individual rightward nodes
+          for (let j = movedIdx + 1; j < sameRowNodes.length; j++) {
+            shiftNodeAndDescendants(sameRowNodes[j].id, shiftNeeded);
+          }
+        }
+      }
+    }
+  };
+
+  // Column-aware collision resolution: shifts colliding nodes + propagates
+  // upward through single-chain ancestors to maintain collinearity, re-centers
+  // branching parents at midpoint. Eliminates chicken-and-egg between centering
+  // and collision resolution.
+  const sortedChaptersSet = new Set(sortedChapters);
+  const columnAwareCollisionResolution = (maxPasses: number) => {
+    const minGapRequired = layoutWidth + nodePadding;
+
+    for (let pass = 0; pass < maxPasses; pass++) {
+      // Build fresh row grouping each pass (positions change between passes)
+      const nodesByRow = new Map<number, Array<{ id: string; x: number }>>();
+      for (const [nodeId, pos] of positions.entries()) {
+        if (nodeId === 'ROOT') continue;
+        const rowY = Math.round(pos.y);
+        if (!nodesByRow.has(rowY)) nodesByRow.set(rowY, []);
+        nodesByRow.get(rowY)!.push({ id: nodeId, x: pos.x });
+      }
+
+      let foundCollision = false;
+
+      for (const [, nodesInRow] of nodesByRow.entries()) {
+        if (nodesInRow.length < 2) continue;
+        nodesInRow.sort((a, b) => a.x - b.x);
+
+        for (let i = 0; i < nodesInRow.length - 1; i++) {
+          const leftNode = nodesInRow[i];
+          const rightNode = nodesInRow[i + 1];
+          const actualGap = rightNode.x - leftNode.x;
+
+          if (actualGap < minGapRequired) {
+            const shiftNeeded = minGapRequired - actualGap;
+
+            // Cross-chapter check: shift entire later chapter instead of individual nodes
+            const leftChapterId = nodePositionedUnderChapter.get(leftNode.id);
+            const rightChapterId = nodePositionedUnderChapter.get(rightNode.id);
+
+            if (leftChapterId && rightChapterId && leftChapterId !== rightChapterId) {
+              const rightIdx = chapterIndexMap.get(rightChapterId) ?? -1;
+              if (rightIdx >= 0) {
+                for (let j = rightIdx; j < sortedChapters.length; j++) {
+                  shiftEntireChapter(sortedChapters[j], shiftNeeded);
+                }
+              }
+              foundCollision = true;
+              break;
+            }
+
+            // Same-chapter collision: shift individual nodes + propagate
+            // Collect shifted row node IDs for ancestor propagation
+            const shiftedRowNodes: string[] = [];
+
+            // Shift ALL remaining nodes on this row + their descendants
+            for (let j = i + 1; j < nodesInRow.length; j++) {
+              const nodeToShift = nodesInRow[j];
+              shiftedRowNodes.push(nodeToShift.id);
+              shiftNodeAndDescendants(nodeToShift.id, shiftNeeded);
+              nodeToShift.x += shiftNeeded;
+            }
+
+            // Propagate upward from each shifted row node
+            const processedAncestors = new Set<string>();
+
+            for (const shiftedNodeId of shiftedRowNodes) {
+              let current = shiftedNodeId;
+              let currentDelta = shiftNeeded;
+
+              while (currentDelta > 0.5) {
+                const parent = hierarchyParent.get(current);
+                if (!parent || parent === 'ROOT' || sortedChaptersSet.has(parent)) break;
+                if (processedAncestors.has(parent)) break;
+                processedAncestors.add(parent);
+
+                const trueChildren = getTrueHierarchyChildren(parent);
+
+                if (trueChildren.length <= 1) {
+                  // Single-chain ancestor: shift to maintain collinearity
+                  const parentPos = positions.get(parent);
+                  if (!parentPos) break;
+                  positions.set(parent, { x: parentPos.x + currentDelta, y: parentPos.y });
+                  // Also shift parent's sevenChrDef targets (collinear)
+                  for (const { targetId } of (sevenChrDefTargetsPerSource.get(parent) || [])) {
+                    const tPos = positions.get(targetId);
+                    if (tPos) positions.set(targetId, { x: tPos.x + currentDelta, y: tPos.y });
+                  }
+                  // Guard: shifted ancestor may now collide with lateral target at same depth
+                  resolveInlineCollision(parent);
+                  current = parent;
+                } else {
+                  // Branching parent: re-center at midpoint of children
+                  const parentPos = positions.get(parent);
+                  if (!parentPos) break;
+                  const oldX = parentPos.x;
+
+                  let minChildX = Infinity;
+                  let maxChildX = -Infinity;
+                  for (const childId of trueChildren) {
+                    const childPos = positions.get(childId);
+                    if (childPos) {
+                      minChildX = Math.min(minChildX, childPos.x);
+                      maxChildX = Math.max(maxChildX, childPos.x);
+                    }
+                  }
+                  if (minChildX === Infinity) break;
+
+                  const newX = (minChildX + maxChildX) / 2;
+                  positions.set(parent, { x: newX, y: parentPos.y });
+                  // Guard: re-centered parent may now collide with lateral target at same depth
+                  resolveInlineCollision(parent);
+
+                  // Only continue propagation if parent moved rightward (monotone)
+                  currentDelta = newX - oldX;
+                  if (currentDelta <= 0.5) break;
+                  current = parent;
+                }
+              }
+            }
+
+            foundCollision = true;
+            break; // Restart row scanning (positions changed)
+          }
+        }
+        if (foundCollision) break; // Restart from first row
+      }
+      if (!foundCollision) break; // Converged — no collisions remain
+    }
+  };
+
+  // ===== PHASE 6: Center all parents =====
+  const centerAllParents = () => {
+    const TIE_TOLERANCE = 5; // pixels - distances within this are considered equal
+
+    // Helper: snap-to-closest-child centering with tie detection
+    const centerNodeOverChildren = (
+      nodeId: string,
+      childXPositions: number[],
+      currentY: number
+    ) => {
+      if (childXPositions.length === 0) return;
+
+      if (childXPositions.length === 1) {
+        positions.set(nodeId, { x: childXPositions[0], y: currentY });
+        return;
+      }
+
+      const minX = Math.min(...childXPositions);
+      const maxX = Math.max(...childXPositions);
+      const midpointX = (minX + maxX) / 2;
+
+      let closestX = minX;
+      let closestDistance = Infinity;
+      let tieCount = 0;
+
+      for (const x of childXPositions) {
+        const distance = Math.abs(x - midpointX);
+        if (distance < closestDistance - TIE_TOLERANCE) {
+          closestDistance = distance;
+          closestX = x;
+          tieCount = 1;
+        } else if (Math.abs(distance - closestDistance) <= TIE_TOLERANCE) {
+          tieCount++;
+        }
+      }
+
+      const targetX = tieCount > 1 ? midpointX : closestX;
+      positions.set(nodeId, { x: targetX, y: currentY });
+    };
+
+    // 1. Center non-chapter parents bottom-up (deepest first)
+    centerParentsBottomUp();
+
+    // 2. Center chapters over their immediate children
+    for (const chapterId of sortedChapters) {
+      const chapterPos = positions.get(chapterId);
+      if (!chapterPos) continue;
+
+      const chapterNode = nodeMap.get(chapterId);
+      const chapterDepth = chapterNode?.depth ?? 1;
+      const immediateChildren = (hierarchyChildren.get(chapterId) || [])
+        .filter(childId => {
+          const childNode = nodeMap.get(childId);
+          return childNode && childNode.depth === chapterDepth + 1;
+        });
+
+      const trueHierarchyChildren = immediateChildren.filter(id => !orphanRescuedNodes.has(id));
+      const childXPositions = trueHierarchyChildren
+        .map(id => positions.get(id)?.x)
+        .filter((x): x is number => x !== undefined);
+
+      centerNodeOverChildren(chapterId, childXPositions, chapterPos.y);
+    }
+
+    // 3. Center ROOT over chapters
+    const rootPos = positions.get('ROOT');
+    if (rootPos && sortedChapters.length > 0) {
+      const chapterXPositions = sortedChapters
+        .map(id => positions.get(id)?.x)
+        .filter((x): x is number => x !== undefined);
+
+      centerNodeOverChildren('ROOT', chapterXPositions, rootPos.y);
+    }
+  };
+  centerAllParents();
+
+  // ===== PHASE 7: Column-aware collision resolution =====
+  // Shifts colliding nodes right + propagates up through single-chain ancestors
+  // (maintaining collinearity), re-centers branching parents at midpoint.
+  // Eliminates the chicken-and-egg between centering and collision resolution.
+  columnAwareCollisionResolution(15);
+
+  // ===== PHASE 8: Final compaction + re-center + realign =====
+  // All centering (Phase 6) and collision resolution (Phase 7) are done in the
+  // spacious pre-compaction layout. Now pack chapters tightly, re-align sevenChrDef
+  // targets, and re-center chapters + ROOT.
+
+  // 1. Recalculate chapter boundaries from actual positions
+  recalculateChapterBoundaries();
+
+  // 2. Pack chapters from left edge (compact → resolve → recompact cycle)
+  // Uses resolveChapterCollisions (whole-chapter shifts) NOT columnAwareCollisionResolution
+  // (individual node shifts) to preserve internal parent centering from Phase 6.
+  let compactTargetLeft = 50;
+  for (const chapterId of sortedChapters) {
+    const boundary = chapterBoundaries.get(chapterId)!;
+    const shift = boundary.left - compactTargetLeft;
+    if (Math.abs(shift) > 0.5) {
+      shiftEntireChapter(chapterId, -shift);
+    }
+    compactTargetLeft = chapterBoundaries.get(chapterId)!.right + CHAPTER_PADDING;
+  }
+
+  // Resolve any chapter-level overlaps created by tight packing
+  for (let pass = 0; pass < 5; pass++) {
+    if (!resolveChapterCollisions()) break;
+  }
+
+  // Recalculate and re-compact after resolution
+  recalculateChapterBoundaries();
+  compactTargetLeft = 50;
+  for (const chapterId of sortedChapters) {
+    const boundary = chapterBoundaries.get(chapterId)!;
+    const shift = boundary.left - compactTargetLeft;
+    if (Math.abs(shift) > 0.5) {
+      shiftEntireChapter(chapterId, -shift);
+    }
+    compactTargetLeft = chapterBoundaries.get(chapterId)!.right + CHAPTER_PADDING;
+  }
+
+  // 3. Re-align sevenChrDef targets after compaction
+  for (const [sourceId, targets] of sevenChrDefTargetsPerSource.entries()) {
+    const sourcePos = positions.get(sourceId);
+    if (!sourcePos) continue;
+    for (const { targetId } of targets) {
+      const targetPos = positions.get(targetId);
+      if (targetPos && Math.abs(targetPos.x - sourcePos.x) > 0.5) {
+        shiftNodeAndDescendants(targetId, sourcePos.x - targetPos.x);
+      }
+    }
+  }
+
+  // 4. Re-center chapters over immediate children (snap-to-closest with tie detection)
+  const TIE_TOLERANCE = 5;
   for (const chapterId of sortedChapters) {
     const chapterPos = positions.get(chapterId);
     if (!chapterPos) continue;
@@ -890,198 +1173,68 @@ export function calculatePositions(
       .filter(childId => {
         const childNode = nodeMap.get(childId);
         return childNode && childNode.depth === chapterDepth + 1;
-      });
+      })
+      .filter(id => !orphanRescuedNodes.has(id));
 
-    const trueHierarchyChildren = immediateChildren.filter(id => !orphanRescuedNodes.has(id));
+    const childXPositions = immediateChildren
+      .map(id => positions.get(id)?.x)
+      .filter((x): x is number => x !== undefined);
 
-    if (trueHierarchyChildren.length >= 2) {
-      let minChildX = Infinity;
-      let maxChildX = -Infinity;
-      for (const childId of trueHierarchyChildren) {
-        const childPos = positions.get(childId);
-        if (childPos) {
-          minChildX = Math.min(minChildX, childPos.x);
-          maxChildX = Math.max(maxChildX, childPos.x);
+    if (childXPositions.length === 0) continue;
+
+    if (childXPositions.length === 1) {
+      positions.set(chapterId, { x: childXPositions[0], y: chapterPos.y });
+      continue;
+    }
+
+    const minX = Math.min(...childXPositions);
+    const maxX = Math.max(...childXPositions);
+    const midpointX = (minX + maxX) / 2;
+
+    let closestX = minX;
+    let closestDistance = Infinity;
+    let tieCount = 0;
+    for (const x of childXPositions) {
+      const distance = Math.abs(x - midpointX);
+      if (distance < closestDistance - TIE_TOLERANCE) {
+        closestDistance = distance;
+        closestX = x;
+        tieCount = 1;
+      } else if (Math.abs(distance - closestDistance) <= TIE_TOLERANCE) {
+        tieCount++;
+      }
+    }
+    const targetX = tieCount > 1 ? midpointX : closestX;
+    positions.set(chapterId, { x: targetX, y: chapterPos.y });
+  }
+
+  // 5. Re-center ROOT over chapters (snap-to-closest with tie detection)
+  const finalRootPos = positions.get('ROOT');
+  if (finalRootPos && sortedChapters.length > 0) {
+    const chapterXPositions = sortedChapters
+      .map(id => positions.get(id)?.x)
+      .filter((x): x is number => x !== undefined);
+    if (chapterXPositions.length === 1) {
+      positions.set('ROOT', { x: chapterXPositions[0], y: finalRootPos.y });
+    } else if (chapterXPositions.length > 1) {
+      const minX = Math.min(...chapterXPositions);
+      const maxX = Math.max(...chapterXPositions);
+      const midpointX = (minX + maxX) / 2;
+
+      let closestX = minX;
+      let closestDistance = Infinity;
+      let tieCount = 0;
+      for (const x of chapterXPositions) {
+        const distance = Math.abs(x - midpointX);
+        if (distance < closestDistance - TIE_TOLERANCE) {
+          closestDistance = distance; closestX = x; tieCount = 1;
+        } else if (Math.abs(distance - closestDistance) <= TIE_TOLERANCE) {
+          tieCount++;
         }
       }
-
-      if (minChildX !== Infinity && maxChildX !== -Infinity) {
-        const targetX = (minChildX + maxChildX) / 2;
-        positions.set(chapterId, { x: targetX, y: chapterPos.y });
-      }
-    } else if (trueHierarchyChildren.length === 1) {
-      const childPos = positions.get(trueHierarchyChildren[0]);
-      if (childPos) {
-        positions.set(chapterId, { x: childPos.x, y: chapterPos.y });
-      }
+      const targetX = tieCount > 1 ? midpointX : closestX;
+      positions.set('ROOT', { x: targetX, y: finalRootPos.y });
     }
-  }
-
-  // ===== FINAL COMPACTION =====
-  const actualChapterBounds = new Map<string, { left: number; right: number }>();
-  for (const chapterId of sortedChapters) {
-    let actualLeft = Infinity;
-    let actualRight = -Infinity;
-
-    for (const [nodeId, pos] of positions.entries()) {
-      if (nodeId === 'ROOT') continue;
-      if (wasPositionedUnderChapter(nodeId, chapterId)) {
-        actualLeft = Math.min(actualLeft, pos.x - layoutWidth / 2);
-        actualRight = Math.max(actualRight, pos.x + layoutWidth / 2);
-      }
-    }
-
-    if (actualLeft !== Infinity && actualRight !== -Infinity) {
-      actualChapterBounds.set(chapterId, { left: actualLeft, right: actualRight });
-    }
-  }
-
-  let targetLeft = 50;
-  const chapterShifts = new Map<string, number>();
-
-  for (const chapterId of sortedChapters) {
-    const bounds = actualChapterBounds.get(chapterId);
-    if (!bounds) continue;
-
-    const shift = bounds.left - targetLeft;
-    chapterShifts.set(chapterId, shift);
-    targetLeft = (bounds.right - shift) + CHAPTER_PADDING;
-  }
-
-  for (const [nodeId, pos] of positions.entries()) {
-    if (nodeId === 'ROOT') continue;
-    const chapterId = nodePositionedUnderChapter.get(nodeId);
-    if (chapterId) {
-      const shift = chapterShifts.get(chapterId);
-      if (shift && Math.abs(shift) > 0.5) {
-        positions.set(nodeId, { x: pos.x - shift, y: pos.y });
-      }
-    }
-  }
-
-  for (const chapterId of sortedChapters) {
-    const bounds = actualChapterBounds.get(chapterId);
-    const shift = chapterShifts.get(chapterId);
-    const boundary = chapterBoundaries.get(chapterId);
-    if (bounds && shift !== undefined && boundary) {
-      boundary.left = bounds.left - shift;
-      boundary.right = bounds.right - shift;
-      boundary.centerX = (boundary.left + boundary.right) / 2;
-    }
-  }
-
-  for (const [sourceId, targets] of sevenChrDefTargetsPerSource.entries()) {
-    const sourcePos = positions.get(sourceId);
-    if (!sourcePos) continue;
-
-    for (const { targetId } of targets) {
-      const targetPos = positions.get(targetId);
-      if (targetPos && Math.abs(targetPos.x - sourcePos.x) > 0.5) {
-        const deltaX = sourcePos.x - targetPos.x;
-        shiftNodeAndDescendants(targetId, deltaX);
-      }
-    }
-  }
-
-  // ===== FINAL: Re-center ROOT =====
-  // Center ROOT over its DIRECT children (Chapter nodes only),
-  // not over their lateral node expansions
-  if (sortedChapters.length > 0) {
-    const chapterPositions = sortedChapters
-      .map(chapterId => positions.get(chapterId))
-      .filter((pos): pos is { x: number; y: number } => pos !== undefined);
-
-    if (chapterPositions.length > 0) {
-      let minChapterX = Infinity;
-      let maxChapterX = -Infinity;
-
-      for (const pos of chapterPositions) {
-        minChapterX = Math.min(minChapterX, pos.x);
-        maxChapterX = Math.max(maxChapterX, pos.x);
-      }
-
-      if (minChapterX !== Infinity && maxChapterX !== -Infinity) {
-        const midpointX = (minChapterX + maxChapterX) / 2;
-        const rootPos = positions.get('ROOT');
-        if (rootPos) {
-          positions.set('ROOT', { x: midpointX, y: rootPos.y });
-        }
-      }
-    }
-  }
-
-  // ===== PHASE 10: Same-row collision resolution =====
-  // After all positioning, check for any nodes at the same Y that overlap horizontally
-  // This handles edge cases where lateral links or rewind operations cause collisions
-  const resolveRowCollisions = () => {
-    // Group nodes by Y position (with small tolerance for floating point)
-    const nodesByRow = new Map<number, Array<{ id: string; x: number }>>();
-
-    for (const [nodeId, pos] of positions.entries()) {
-      if (nodeId === 'ROOT') continue;
-
-      // Round Y to handle floating point precision
-      const rowY = Math.round(pos.y);
-      if (!nodesByRow.has(rowY)) {
-        nodesByRow.set(rowY, []);
-      }
-      nodesByRow.get(rowY)!.push({ id: nodeId, x: pos.x });
-    }
-
-    let anyShifted = false;
-
-    // For each row, sort by X and resolve overlaps
-    for (const [_rowY, nodesInRow] of nodesByRow.entries()) {
-      if (nodesInRow.length < 2) continue;
-
-      // Sort by X position
-      nodesInRow.sort((a, b) => a.x - b.x);
-
-      // Check each pair for collision
-      for (let i = 0; i < nodesInRow.length - 1; i++) {
-        const leftNode = nodesInRow[i];
-        const rightNode = nodesInRow[i + 1];
-
-        // Calculate minimum required gap (node width + padding)
-        const minGapRequired = layoutWidth + nodePadding;
-        const actualGap = rightNode.x - leftNode.x;
-
-        if (actualGap < minGapRequired) {
-          // Collision detected - shift ALL remaining nodes on this row (not just rightNode)
-          // This prevents cascading collisions within the same row
-          const shiftNeeded = minGapRequired - actualGap;
-          anyShifted = true;
-
-          // Shift ALL remaining nodes on this row plus their descendants
-          for (let j = i + 1; j < nodesInRow.length; j++) {
-            const nodeToShift = nodesInRow[j];
-            const currentPos = positions.get(nodeToShift.id)!;
-            positions.set(nodeToShift.id, { x: currentPos.x + shiftNeeded, y: currentPos.y });
-            nodeToShift.x = currentPos.x + shiftNeeded;
-
-            // Also shift all descendants
-            const descendants = getAllDescendants(nodeToShift.id);
-            for (const descId of descendants) {
-              const descPos = positions.get(descId);
-              if (descPos) {
-                positions.set(descId, { x: descPos.x + shiftNeeded, y: descPos.y });
-              }
-            }
-          }
-
-          // After shifting all remaining nodes on this row, no need to check
-          // more pairs in this row - they all moved together maintaining gaps
-          break;
-        }
-      }
-    }
-
-    return anyShifted;
-  };
-
-  // Run collision resolution up to 5 passes (shifts may cascade)
-  for (let pass = 0; pass < 5; pass++) {
-    if (!resolveRowCollisions()) break;
   }
 
   // Log unpositioned nodes
