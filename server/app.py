@@ -464,6 +464,11 @@ async def root() -> FileResponse:
     return FileResponse(index_path)
 
 
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
+
+
 @app.post("/api/graph", response_model=GraphResponse)
 async def get_graph(request: GraphRequest) -> GraphResponse:
     """Build and return the graph data for the given ICD-10 codes."""
