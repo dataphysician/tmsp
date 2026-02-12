@@ -8,13 +8,13 @@ This module provides:
 - Graph construction with nearest-anchor provenance
 """
 
-from ast import literal_eval
+import json
 from pathlib import Path
 
-DATA_PATH = Path(__file__).parent.parent / "static" / "icd10cm.txt"
+DATA_PATH = Path(__file__).parent.parent / "static" / "icd10cm.json"
 
 with open(DATA_PATH, "r") as f:
-    data: dict[str, dict] = literal_eval(f.read())
+    data: dict[str, dict] = json.load(f)
 
 
 def get_parent_code(entry: dict) -> str | None:
