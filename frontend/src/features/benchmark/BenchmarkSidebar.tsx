@@ -29,6 +29,7 @@ interface BenchmarkSidebarProps {
     benchmarkInferPrecursors: boolean;
     onBenchmarkInferPrecursorsChange: (value: boolean) => void;
     benchmarkComplete: boolean;
+    onCollapseSidebar: () => void;
 }
 
 export function BenchmarkSidebar({
@@ -49,6 +50,7 @@ export function BenchmarkSidebar({
     benchmarkInferPrecursors,
     onBenchmarkInferPrecursorsChange,
     benchmarkComplete,
+    onCollapseSidebar,
 }: BenchmarkSidebarProps) {
     // State for clear cache confirmation modal
     const [showClearCacheModal, setShowClearCacheModal] = useState(false);
@@ -56,8 +58,8 @@ export function BenchmarkSidebar({
 
     const handleStartClick = useCallback(() => {
         onStartBenchmark();
-        // Don't auto-collapse for benchmark, users might want to watch progress or adjust settings
-    }, [onStartBenchmark]);
+        onCollapseSidebar();
+    }, [onStartBenchmark, onCollapseSidebar]);
 
     // Show confirmation modal when Clear Cache is clicked
     const handleClearCacheClick = useCallback(() => {

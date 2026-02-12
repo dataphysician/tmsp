@@ -2058,22 +2058,124 @@ input[type="checkbox"]:disabled {
 
 /* Mobile Responsive */
 @media (max-width: 768px) {
+  /* --- Layout --- */
   .app {
     flex-direction: column;
   }
 
+  /* Sidebar: full-screen overlay when expanded */
   .sidebar {
     width: 100%;
     max-width: none;
     min-width: 0;
-    max-height: 40vh;
+    max-height: none;
     border-right: none;
     border-bottom: 1px solid var(--border);
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 200;
+  }
+
+  /* Re-declare collapsed width — otherwise mobile .sidebar { width: 100% } wins by source order */
+  .sidebar.collapsed {
+    width: var(--sidebar-collapsed-width);
+    min-width: var(--sidebar-collapsed-width);
+    max-width: var(--sidebar-collapsed-width);
+    max-height: none;
+    position: absolute;
+    bottom: 0;
+  }
+
+  /* Main content always uses collapsed offset on mobile (sidebar overlays) */
+  .main-header {
+    padding-left: calc(var(--sidebar-collapsed-width) + 1rem);
+  }
+
+  .app:has(.sidebar.collapsed) .main-header {
+    padding-left: calc(var(--sidebar-collapsed-width) + 1rem);
+  }
+
+  .tab-content {
+    margin-left: var(--sidebar-collapsed-width);
+    width: calc(100% - var(--sidebar-collapsed-width));
+  }
+
+  .app:has(.sidebar.collapsed) .tab-content {
+    margin-left: var(--sidebar-collapsed-width);
+    width: calc(100% - var(--sidebar-collapsed-width));
   }
 
   .main-content {
     flex: 1;
     min-height: 60vh;
+  }
+
+  /* --- View Switcher: single toggle showing inactive view --- */
+  .view-label {
+    display: none;
+  }
+
+  .view-btn.active {
+    display: none;
+  }
+
+  /* --- Finalized Codes Bar: wrap label+sort row 1, codes row 2 --- */
+  .finalized-codes-bar {
+    flex-wrap: wrap;
+  }
+
+  .finalized-codes-bar .codes-bar-label {
+    order: 0;
+  }
+
+  .finalized-codes-bar .codes-sort {
+    order: 0;
+    margin-left: auto;
+  }
+
+  .finalized-codes-bar .codes-list {
+    order: 1;
+    flex-basis: 100%;
+    max-height: 4.5rem;
+    overflow-y: auto;
+  }
+
+  /* --- Benchmark Scores: stack vertically --- */
+  .benchmark-scores {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .benchmark-scores .stat-separator {
+    display: none;
+  }
+
+  /* --- Export SVG button collision fix --- */
+  .view-header-bar {
+    position: relative;
+  }
+
+  .view-header-actions {
+    position: absolute;
+    top: 0.5rem;
+    right: 1rem;
+  }
+
+  .view-header-info .status-line + .report-line {
+    margin-top: 0.75rem;
+  }
+
+  /* --- CSS specificity fix: override desktop .view-header-bar .report-line --- */
+  .view-header-bar .report-line {
+    align-items: flex-start;
+  }
+
+  /* --- Benchmark outcome counts: wrap instead of overflow --- */
+  .benchmark-outcome-counts {
+    flex-wrap: wrap;
   }
 }
 

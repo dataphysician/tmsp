@@ -232,6 +232,7 @@ function TraversalUI() {
               benchmarkInferPrecursors={benchmark.state.benchmarkInferPrecursors}
               onBenchmarkInferPrecursorsChange={benchmark.setters.setBenchmarkInferPrecursors}
               benchmarkComplete={benchmark.state.benchmarkStatus === 'complete'}
+              onCollapseSidebar={() => setSidebarCollapsed(true)}
           />
         )}
       </aside>

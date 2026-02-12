@@ -327,9 +327,31 @@ function GraphViewerInner({
     }
   }, [triggerFitToWindow]);
 
-  // NOTE: Automatic fit-to-window (ResizeObserver, periodic interval) disabled.
-  // The initial render positions content correctly; auto-fit was causing issues.
-  // User can manually click the fit-to-window button (⤢) when needed.
+  // Fit-to-window on resize / orientation change (skip during live rewind)
+  useEffect(() => {
+    const svgArea = svgRef.current?.parentElement;
+    if (!svgArea) return;
+
+    let debounceTimer: ReturnType<typeof setTimeout>;
+    const onResize = () => {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        if (!rewindingNodeIdRef.current) {
+          handleFitToWindowRef.current();
+        }
+      }, 200);
+    };
+
+    const ro = new ResizeObserver(onResize);
+    ro.observe(svgArea);
+    window.addEventListener('orientationchange', onResize);
+
+    return () => {
+      clearTimeout(debounceTimer);
+      ro.disconnect();
+      window.removeEventListener('orientationchange', onResize);
+    };
+  }, []);
 
   useEffect(() => {
     if (!svgRef.current || !containerRef.current) {
