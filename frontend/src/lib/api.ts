@@ -1,101 +1,116 @@
 /**
  * AG-UI streaming API client for ICD-10-CM traversal.
  *
- * Implements AG-UI protocol over SSE with JSON Patch (RFC 6902)
- * for incremental graph updates.
+ * Uses the official @ag-ui/client HttpAgent for SSE streaming with
+ * AG-UI protocol compliance. Non-streaming REST endpoints use fetch directly.
  */
 
-// Re-export types for backwards compatibility
-export type {
-  AGUIEventType,
-  JsonPatchOp,
-  GraphStateSnapshot,
-  AGUIEvent,
-  SSEDecisionData,
-  StepFinishedMetadata,
-  RunFinishedMetadata,
-  TraversalConfig,
-  RewindConfig,
-  GraphResponse,
-  DeleteCacheConfig,
-  DeleteCacheResponse,
-  ClearAllCacheResponse,
-  InvalidateCacheConfig,
-  InvalidateCacheResponse,
+// Re-export types for consumers
+export {
+  EventType,
+  type BaseEvent,
+  type RunStartedEvent,
+  type RunFinishedEvent,
+  type RunErrorEvent,
+  type StepStartedEvent,
+  type StepFinishedEvent,
+  type StateSnapshotEvent,
+  type StateDeltaEvent,
+  type ReasoningMessageContentEvent,
+  type CustomEvent,
+  type SSEDecisionData,
+  type StepMetadata,
+  type RunMetadata,
+  type RunResult,
+  type TraversalConfig,
+  type RewindConfig,
+  type GraphResponse,
+  type DeleteCacheConfig,
+  type DeleteCacheResponse,
+  type ClearAllCacheResponse,
+  type InvalidateCacheConfig,
+  type InvalidateCacheResponse,
 } from './api.types';
 
-import type { AGUIEvent, TraversalConfig, RewindConfig, GraphResponse, DeleteCacheResponse, DeleteCacheConfig, ClearAllCacheResponse, InvalidateCacheConfig, InvalidateCacheResponse } from './api.types';
-import { processSSEStream, buildTraversalRequestBody } from './sse';
+import type { BaseEvent, TraversalConfig, RewindConfig, GraphResponse, DeleteCacheResponse, DeleteCacheConfig, ClearAllCacheResponse, InvalidateCacheConfig, InvalidateCacheResponse } from './api.types';
+import { TMSPAgent, type StreamHandle } from './agent';
+
+/**
+ * Create the request body for traversal/rewind API calls.
+ * Handles null coalescing for optional fields.
+ */
+function buildTraversalRequestBody(config: {
+  clinical_note: string;
+  provider?: string;
+  api_key?: string;
+  model?: string | null;
+  selector?: string;
+  max_tokens?: number | null;
+  temperature?: number | null;
+  extra?: Record<string, string> | null;
+  system_prompt?: string | null;
+  scaffolded?: boolean;
+  persist_cache?: boolean;
+  // Additional fields for rewind
+  batch_id?: string;
+  feedback?: string;
+  existing_nodes?: string[];
+}): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    clinical_note: config.clinical_note,
+    provider: config.provider ?? 'openai',
+    api_key: config.api_key ?? '',
+    model: config.model ?? null,
+    selector: config.selector ?? 'llm',
+    max_tokens: config.max_tokens ?? null,
+    temperature: config.temperature ?? null,
+    extra: config.extra ?? null,
+    system_prompt: config.system_prompt ?? null,
+    scaffolded: config.scaffolded ?? true,
+    persist_cache: config.persist_cache ?? true,
+  };
+
+  // Add rewind-specific fields if present
+  if (config.batch_id !== undefined) {
+    body.batch_id = config.batch_id;
+  }
+  if (config.feedback !== undefined) {
+    body.feedback = config.feedback;
+  }
+  if (config.existing_nodes !== undefined) {
+    body.existing_nodes = config.existing_nodes;
+  }
+
+  return body;
+}
 
 /**
  * Stream ICD-10-CM traversal results using AG-UI protocol over SSE.
  *
+ * Uses the official @ag-ui/client HttpAgent for SSE parsing and event streaming.
+ *
  * @param config - Traversal configuration
  * @param onEvent - Called for each AG-UI event
  * @param onError - Called on error
- * @returns AbortController to cancel the stream
- *
- * @example
- * ```tsx
- * const controller = streamTraversal(
- *   { clinical_note: "Patient with diabetes...", provider: "openai", api_key: "sk-..." },
- *   (event) => {
- *     switch (event.type) {
- *       case 'STATE_SNAPSHOT':
- *         setNodes(event.snapshot.nodes);
- *         break;
- *       case 'STATE_DELTA':
- *         applyPatch(graphState, event.delta);
- *         break;
- *       case 'RUN_ERROR':
- *         console.error("Run error:", event.error);
- *         break;
- *     }
- *   },
- *   (error) => console.error("Error:", error)
- * );
- *
- * // To cancel:
- * controller.abort();
- * ```
+ * @returns StreamHandle with abort() to cancel the stream
  */
 export function streamTraversal(
   config: TraversalConfig,
-  onEvent: (event: AGUIEvent) => void,
+  onEvent: (event: BaseEvent) => void,
   onError: (error: Error) => void
-): AbortController {
-  const controller = new AbortController();
-
-  (async () => {
-    try {
-      const response = await fetch('/api/traverse/stream', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-        },
-        body: JSON.stringify(buildTraversalRequestBody(config)),
-        signal: controller.signal,
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error: ${response.status}`);
-      }
-
-      await processSSEStream(response, {
-        onEvent,
-        onError,
-        signal: controller.signal,
-        logPrefix: 'API',
-      });
-    } catch (error) {
-      if (error instanceof Error && error.name !== 'AbortError') {
-        onError(error);
-      }
-    }
-  })();
-
-  return controller;
+): StreamHandle {
+  const agent = new TMSPAgent('/api/traverse/stream');
+  const body = buildTraversalRequestBody(config);
+  const sub = agent.stream(body).subscribe({
+    next: onEvent,
+    error: onError,
+  });
+  return {
+    abort: () => {
+      agent.abortRun();
+      sub.unsubscribe();
+    },
+  };
 }
 
 /**
@@ -131,70 +146,35 @@ export async function runTraversal(
  * @param config - Rewind configuration (batch_id, feedback, LLM settings)
  * @param onEvent - Called for each AG-UI event
  * @param onError - Called on error
- * @returns AbortController to cancel the stream
- *
- * @example
- * ```tsx
- * const controller = streamRewind(
- *   {
- *     batch_id: "E08.3|children",
- *     feedback: "Select E08.32 instead - patient has diabetic retinopathy",
- *     provider: "openai",
- *     api_key: "sk-..."
- *   },
- *   (event) => {
- *     switch (event.type) {
- *       case 'STATE_DELTA':
- *         applyPatch(graphState, event.delta);
- *         break;
- *     }
- *   },
- *   (error) => console.error("Rewind error:", error)
- * );
- * ```
+ * @returns StreamHandle with abort() to cancel the stream
  */
 export function streamRewind(
   config: RewindConfig,
-  onEvent: (event: AGUIEvent) => void,
+  onEvent: (event: BaseEvent) => void,
   onError: (error: Error) => void
-): AbortController {
-  const controller = new AbortController();
-
-  (async () => {
-    try {
-      const response = await fetch('/api/traverse/rewind', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-        },
-        body: JSON.stringify(buildTraversalRequestBody({
-          ...config,
-          batch_id: config.batch_id,
-          feedback: config.feedback,
-        })),
-        signal: controller.signal,
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error: ${response.status}`);
-      }
-
-      await processSSEStream(response, {
-        onEvent,
-        onError,
-        signal: controller.signal,
-        logPrefix: 'API Rewind',
-      });
-    } catch (error) {
-      if (error instanceof Error && error.name !== 'AbortError') {
-        onError(error);
-      }
-    }
-  })();
-
-  return controller;
+): StreamHandle {
+  const agent = new TMSPAgent('/api/traverse/rewind');
+  const body = buildTraversalRequestBody({
+    ...config,
+    batch_id: config.batch_id,
+    feedback: config.feedback,
+  });
+  const sub = agent.stream(body).subscribe({
+    next: onEvent,
+    error: onError,
+  });
+  return {
+    abort: () => {
+      agent.abortRun();
+      sub.unsubscribe();
+    },
+  };
 }
+
+// Re-export StreamHandle type for consumers
+export type { StreamHandle } from './agent';
+
+// ---------- Non-streaming REST API functions ----------
 
 /**
  * Build a graph from ICD-10-CM codes.
@@ -222,11 +202,6 @@ export async function buildGraph(codes: string[], fullPaths = false): Promise<Gr
 
 /**
  * Delete a cached traversal state.
- *
- * Use this when a traversal is cancelled or reset to ensure a fresh run.
- *
- * @param config - The same config used for the traversal (to generate matching partition key)
- * @returns Promise with deletion result
  */
 export async function deleteCacheEntry(config: DeleteCacheConfig): Promise<DeleteCacheResponse> {
   const response = await fetch('/api/cache/delete', {
@@ -253,11 +228,6 @@ export async function deleteCacheEntry(config: DeleteCacheConfig): Promise<Delet
 
 /**
  * Cancel the currently running traversal.
- *
- * Sets cancelled=True in Burr state and deletes partial cache.
- * Call this when user clicks Cancel to ensure clean termination.
- *
- * @returns Promise with cancellation result
  */
 export async function cancelTraversal(): Promise<{ cancelled: boolean }> {
   const response = await fetch('/api/traverse/cancel', {
@@ -274,8 +244,6 @@ export async function cancelTraversal(): Promise<{ cancelled: boolean }> {
 
 /**
  * Clear only the most recent traversal run.
- *
- * @returns Promise with clear result
  */
 export async function clearLastCache(): Promise<ClearAllCacheResponse> {
   const response = await fetch('/api/cache/clear-last', {
@@ -292,10 +260,6 @@ export async function clearLastCache(): Promise<ClearAllCacheResponse> {
 
 /**
  * Clear cached state from this server session only.
- *
- * Preserves older cached runs from previous sessions.
- *
- * @returns Promise with clear result
  */
 export async function clearSessionCache(): Promise<ClearAllCacheResponse> {
   const response = await fetch('/api/cache/clear-session', {
@@ -312,10 +276,6 @@ export async function clearSessionCache(): Promise<ClearAllCacheResponse> {
 
 /**
  * Clear all cached state (database + in-memory cache).
- *
- * Clears everything including older cached runs from previous sessions.
- *
- * @returns Promise with clear result
  */
 export async function clearAllCache(): Promise<ClearAllCacheResponse> {
   const response = await fetch('/api/cache/clear-all', {
@@ -332,13 +292,6 @@ export async function clearAllCache(): Promise<ClearAllCacheResponse> {
 
 /**
  * Invalidate cache for a specific configuration.
- *
- * Soft invalidation: increments the cache version on the server,
- * causing subsequent runs to miss the old cache and create new entries.
- * Old entries are orphaned but not deleted.
- *
- * @param config - Configuration to invalidate cache for
- * @returns Promise with invalidation result
  */
 export async function invalidateCache(
   config: InvalidateCacheConfig

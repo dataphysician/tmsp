@@ -1,86 +1,27 @@
 /**
  * Type definitions for AG-UI streaming API.
+ *
+ * AG-UI protocol types (EventType, BaseEvent, and all typed events) are
+ * imported from the official @ag-ui/core package. Domain-specific types
+ * (step metadata, run result, config types) are defined here.
  */
 
-import type { GraphNode, GraphEdge } from './types';
+// Re-export AG-UI protocol types from official package
+export { EventType } from '@ag-ui/core';
+export type {
+  BaseEvent,
+  RunStartedEvent,
+  RunFinishedEvent,
+  RunErrorEvent,
+  StepStartedEvent,
+  StepFinishedEvent,
+  StateSnapshotEvent,
+  StateDeltaEvent,
+  ReasoningMessageContentEvent,
+  CustomEvent,
+} from '@ag-ui/core';
 
-// AG-UI Event Types (AG-UI protocol v0.1)
-export type AGUIEventType =
-  | 'RUN_STARTED'
-  | 'RUN_FINISHED'
-  | 'RUN_ERROR'
-  | 'STEP_STARTED'
-  | 'STEP_FINISHED'
-  | 'STATE_SNAPSHOT'
-  | 'STATE_DELTA';
-
-// JSON Patch operation (RFC 6902)
-export interface JsonPatchOp {
-  op: 'add' | 'remove' | 'replace';
-  path: string;
-  value?: unknown;
-}
-
-// Graph state for STATE_SNAPSHOT
-export interface GraphStateSnapshot {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
-}
-
-// AG-UI Event base fields
-interface AGUIEventBase {
-  threadId?: string;
-  runId?: string;
-  parentRunId?: string;  // For rewind runs that fork from a previous run
-}
-
-// Discriminated union types for AG-UI events (AG-UI protocol v0.1)
-export interface AGUIRunStartedEvent extends AGUIEventBase {
-  type: 'RUN_STARTED';
-  metadata?: RunStartedMetadata;
-}
-
-export interface AGUIRunFinishedEvent extends AGUIEventBase {
-  type: 'RUN_FINISHED';
-  metadata?: RunFinishedMetadata;
-}
-
-export interface AGUIRunErrorEvent extends AGUIEventBase {
-  type: 'RUN_ERROR';
-  error: string;
-  metadata?: Record<string, unknown>;
-}
-
-export interface AGUIStepStartedEvent {
-  type: 'STEP_STARTED';
-  stepName: string;
-}
-
-export interface AGUIStepFinishedEvent {
-  type: 'STEP_FINISHED';
-  stepName: string;
-  metadata?: StepFinishedMetadata;
-}
-
-export interface AGUIStateSnapshotEvent {
-  type: 'STATE_SNAPSHOT';
-  snapshot: GraphStateSnapshot;
-}
-
-export interface AGUIStateDeltaEvent {
-  type: 'STATE_DELTA';
-  delta: JsonPatchOp[];
-}
-
-// Union type for all AG-UI events (provides type narrowing via switch/case on type)
-export type AGUIEvent =
-  | AGUIRunStartedEvent
-  | AGUIRunFinishedEvent
-  | AGUIRunErrorEvent
-  | AGUIStepStartedEvent
-  | AGUIStepFinishedEvent
-  | AGUIStateSnapshotEvent
-  | AGUIStateDeltaEvent;
+// ----- Domain-specific types (NOT part of AG-UI protocol) -----
 
 /** Decision data from cached STATE_SNAPSHOT (server-side format) */
 export interface SSEDecisionData {
@@ -93,27 +34,35 @@ export interface SSEDecisionData {
   selected_details?: Record<string, { depth?: number; category?: string; billable?: boolean }>;
 }
 
-/** Typed metadata for RUN_STARTED events */
-export interface RunStartedMetadata {
+/**
+ * Domain metadata carried in CustomEvent(name="step_metadata").
+ * Reasoning is now sent via REASONING events (AG-UI standard).
+ */
+export interface StepMetadata {
+  node_id: string;
+  batch_type: 'children' | 'lateral' | 'zero-shot' | string;
+  selected_ids: string[];
+  candidates: Record<string, string>;  // code -> label
+  error?: boolean;
+  selected_details?: Record<string, { depth?: number; category?: string; billable?: boolean }>;
+}
+
+/**
+ * Domain metadata carried in CustomEvent(name="run_metadata").
+ * Previously was on RUN_STARTED.metadata — now a separate CUSTOM event.
+ */
+export interface RunMetadata {
   clinical_note?: string;
   cached?: boolean;
   rewind_from?: string;  // For rewind runs
   feedback?: string;     // For rewind runs
 }
 
-/** Typed metadata for STEP_FINISHED events */
-export interface StepFinishedMetadata {
-  node_id: string;
-  batch_type: 'children' | 'lateral' | 'zero-shot' | string;
-  selected_ids: string[];
-  reasoning: string;
-  candidates: Record<string, string>;  // code -> label
-  error?: boolean;
-  selected_details?: Record<string, { depth?: number; category?: string; billable?: boolean }>;
-}
-
-/** Typed metadata for RUN_FINISHED events */
-export interface RunFinishedMetadata {
+/**
+ * Domain result carried in RunFinishedEvent.result.
+ * Previously was on RUN_FINISHED.metadata — now in the result field.
+ */
+export interface RunResult {
   final_nodes?: string[];
   batch_count?: number;
   mode?: 'scaffolded' | 'zero-shot';
@@ -153,8 +102,8 @@ export interface RewindConfig extends BaseTraversalConfig {
 
 // Graph API response for VISUALIZE tab
 export interface GraphResponse {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
+  nodes: import('./types').GraphNode[];
+  edges: import('./types').GraphEdge[];
   stats: { input_count: number; node_count: number };
   invalid_codes?: string[];  // Codes that were filtered out (not in flat index)
 }

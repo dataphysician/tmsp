@@ -414,7 +414,7 @@ function TraversalUI() {
                     codesBarLabel={
                       benchmark.state.benchmarkStatus === 'complete'
                         ? "Benchmarked Final Codes"
-                        : "Target Codes"
+                        : "Expected Final Codes"
                     }
                     onRemoveExpectedCode={
                       benchmark.state.benchmarkStatus === 'idle'

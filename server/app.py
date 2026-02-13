@@ -8,9 +8,10 @@ Includes:
 
 import asyncio
 import json
+import time
 import uuid
 from pathlib import Path
-from typing import AsyncGenerator, Literal, TypedDict
+from typing import Any, AsyncGenerator, Literal, TypedDict
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
@@ -34,8 +35,96 @@ from graph import (
     resolve_code,
 )
 
-from .agui_enums import AGUIEventType
-from .events import AGUIEvent, GraphState, JsonPatchOp
+from ag_ui.core import (
+    RunAgentInput,
+    RunStartedEvent,
+    RunFinishedEvent,
+    RunErrorEvent,
+    StepStartedEvent,
+    StepFinishedEvent,
+    StateSnapshotEvent,
+    StateDeltaEvent,
+    ReasoningStartEvent,
+    ReasoningMessageStartEvent,
+    ReasoningMessageContentEvent,
+    ReasoningMessageEndEvent,
+    ReasoningEndEvent,
+    CustomEvent,
+)
+from ag_ui.encoder import EventEncoder
+from pydantic import BaseModel as _PydanticBaseModel
+
+
+# AG-UI encoder instance (serializes events to SSE format with camelCase keys)
+_agui_encoder = EventEncoder()
+
+
+from ag_ui.core import BaseEvent as _BaseEvent, EventType as _EventType
+
+
+def encode_event(event: _BaseEvent) -> str:
+    """Encode an AG-UI event to SSE, injecting a millisecond timestamp."""
+    return _agui_encoder.encode(
+        event.model_copy(update={"timestamp": int(time.time() * 1000)})
+    )
+
+
+def _reasoning_message_start(message_id: str) -> ReasoningMessageStartEvent:
+    """Create ReasoningMessageStartEvent with role='reasoning'.
+
+    The TypeScript @ag-ui/core v0.0.45 schema requires role='reasoning',
+    but the Python ag-ui-protocol v0.1.11 model restricts role to Literal['assistant'].
+    Use model_construct() to bypass the Python validation.
+    """
+    return ReasoningMessageStartEvent.model_construct(
+        type=_EventType.REASONING_MESSAGE_START,
+        message_id=message_id,
+        role="reasoning",
+    )
+
+
+def get_icd_parent(code: str) -> str | None:
+    """Get the actual ICD-10 hierarchy parent of a code from the index."""
+    node_info = data.get(code)
+    if not node_info:
+        return None
+    parent = node_info.get("parent")
+    if not parent or not isinstance(parent, dict):
+        return None
+    parent_codes = list(parent.keys())
+    return parent_codes[0] if parent_codes else None
+
+
+def is_hierarchy_edge(parent_id: str, node_id: str) -> bool:
+    """Check if parent_id → node_id is a hierarchy or pseudohierarchy edge.
+
+    Returns True for:
+    - Actual ICD-10 parent-child relationships (from the index)
+    - Placeholder/sevenChrDef paths where node_id is a code descendant
+      of parent_id (e.g. T84.53 → T84.53X, T88.7X → T88.7XX)
+    """
+    # Direct parent match from the index
+    actual_parent = get_icd_parent(node_id)
+    if parent_id == actual_parent:
+        return True
+    # Code-prefix check covers placeholder nodes not in the index
+    parent_norm = parent_id.replace(".", "")
+    node_norm = node_id.replace(".", "")
+    return node_norm.startswith(parent_norm) and len(node_norm) > len(parent_norm)
+
+
+# Helper models for constructing graph state (kept from old events.py)
+class JsonPatchOp(_PydanticBaseModel):
+    """RFC 6902 JSON Patch operation for incremental graph updates."""
+    op: Literal["add", "remove", "replace"]
+    path: str
+    value: dict[str, Any] | list[Any] | str | int | bool | None = None
+
+
+class GraphState(_PydanticBaseModel):
+    """Graph state for STATE_SNAPSHOT events."""
+    nodes: list[GraphNode]
+    edges: list[GraphEdge]
 from .payloads import (
     GraphRequest,
     GraphResponse,
@@ -258,9 +347,11 @@ def build_graph_from_batch_data(
                 edge_key = (parent_id, node_id)
                 if edge_key not in seen_edges:
                     seen_edges.add(edge_key)
+                    is_hier = is_hierarchy_edge(parent_id, node_id)
                     edges.append({
                         "source": parent_id, "target": node_id,
-                        "edge_type": "hierarchy", "rule": None,
+                        "edge_type": "hierarchy" if is_hier else "lateral",
+                        "rule": None,
                     })
 
             # Create 7th character node if selected
@@ -372,9 +463,11 @@ def build_graph_from_batch_data(
                 edge_key = (parent_id, node_id)
                 if edge_key not in seen_edges:
                     seen_edges.add(edge_key)
+                    is_hier = is_hierarchy_edge(parent_id, node_id)
                     edges.append({
                         "source": parent_id, "target": node_id,
-                        "edge_type": "hierarchy", "rule": None,
+                        "edge_type": "hierarchy" if is_hier else "lateral",
+                        "rule": None,
                     })
 
             # Add selected children
@@ -425,6 +518,18 @@ def build_graph_from_batch_data(
                         "source": edge_source, "target": code,
                         "edge_type": edge_type, "rule": rule,
                     })
+
+                # For lateral edges, also create hierarchy edge from actual ICD-10 parent
+                if edge_type == "lateral":
+                    actual_parent = get_icd_parent(code)
+                    if actual_parent and actual_parent in seen_nodes:
+                        parent_edge_key = (actual_parent, code)
+                        if parent_edge_key not in seen_edges:
+                            seen_edges.add(parent_edge_key)
+                            edges.append({
+                                "source": actual_parent, "target": code,
+                                "edge_type": "hierarchy", "rule": None,
+                            })
 
     return nodes, edges, seen_nodes, seen_edges
 
@@ -1104,26 +1209,29 @@ async def clear_all_cache():
 
 
 @app.post("/api/traverse/stream")
-async def stream_traversal(request: TraversalRequest, http_request: Request):
+async def stream_traversal(run_input: RunAgentInput, http_request: Request):
     """Run Burr-based DFS traversal with AG-UI streaming.
 
+    Accepts standard AG-UI RunAgentInput with domain config in the `state` field.
     Uses AG-UI protocol over SSE with JSON Patch (RFC 6902) for incremental updates.
 
     Returns SSE stream with events:
     - RUN_STARTED: Traversal begins
     - STATE_SNAPSHOT: Initial graph with ROOT node
-    - STEP_STARTED: Batch processing begins
-    - STATE_DELTA: JSON Patch ops to add nodes/edges
-    - STEP_FINISHED: Batch complete with reasoning
+    - STEP_STARTED / STATE_DELTA / TEXT_MESSAGE / STEP_FINISHED: Per-batch updates
+    - CUSTOM step_metadata: Domain-specific batch metadata
     - RUN_FINISHED: Traversal complete with final codes
     """
+    # Extract domain config from AG-UI RunAgentInput.state
+    state = run_input.state if isinstance(run_input.state, dict) else {}
+    request = TraversalRequest(**state)
     # Import Burr components
     from agent import build_traversal_app, initialize_persister, cleanup_persister, set_batch_callback
     from candidate_selector.providers import create_config
     import candidate_selector.config as llm_config
 
     # Queue for streaming events
-    event_queue: asyncio.Queue[AGUIEvent | None] = asyncio.Queue()
+    event_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     # Track seen nodes to avoid duplicates - dict maps node_id -> index for updates
     seen_nodes: dict[str, int] = {"ROOT": 0}
@@ -1166,9 +1274,8 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
         batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
 
         # STEP_STARTED
-        event_queue.put_nowait(AGUIEvent(
-            type=AGUIEventType.STEP_STARTED,
-            stepName=batch_id,
+        event_queue.put_nowait(encode_event(
+            StepStartedEvent(step_name=batch_id)
         ))
 
         # STATE_DELTA - add nodes and edges
@@ -1209,14 +1316,16 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
             batch_nodes.append(base_node_data)
 
             # Add edge from parent to this node
+            # Check if parent_id is the actual ICD-10 parent
             if parent_id and parent_id != node_id:
                 edge_key = (parent_id, node_id)
                 if edge_key not in seen_edges:
                     seen_edges.add(edge_key)
+                    is_hier = is_hierarchy_edge(parent_id, node_id)
                     base_edge_data = {
                         "source": parent_id,
                         "target": node_id,
-                        "edge_type": "hierarchy",
+                        "edge_type": "hierarchy" if is_hier else "lateral",
                         "rule": None,
                     }
                     ops.append(JsonPatchOp(op="add", path="/edges/-", value=base_edge_data))
@@ -1462,14 +1571,16 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                 batch_nodes.append(traversed_node_data)
 
                 # Add edge from parent to this node
+                # Check if parent_id is the actual ICD-10 parent
                 if parent_id and parent_id != node_id:
                     edge_key = (parent_id, node_id)
                     if edge_key not in seen_edges:
                         seen_edges.add(edge_key)
+                        is_hier = is_hierarchy_edge(parent_id, node_id)
                         traversed_edge_data = {
                             "source": parent_id,
                             "target": node_id,
-                            "edge_type": "hierarchy",
+                            "edge_type": "hierarchy" if is_hier else "lateral",
                             "rule": None,
                         }
                         ops.append(JsonPatchOp(
@@ -1564,15 +1675,33 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                         }
                     ))
 
+                # For lateral edges, also create hierarchy edge from actual ICD-10 parent
+                if edge_type == "lateral":
+                    actual_parent = get_icd_parent(code)
+                    if actual_parent and actual_parent in seen_nodes:
+                        parent_edge_key = (actual_parent, code)
+                        if parent_edge_key not in seen_edges:
+                            seen_edges.add(parent_edge_key)
+                            ops.append(JsonPatchOp(
+                                op="add",
+                                path="/edges/-",
+                                value={
+                                    "source": actual_parent,
+                                    "target": code,
+                                    "edge_type": "hierarchy",
+                                    "rule": None,
+                                }
+                            ))
+                            print(f"[EDGE] Added hierarchy edge from actual parent: {actual_parent} -> {code}")
+
         # Log ops summary
         node_ops = [op for op in ops if op.path == "/nodes/-"]
         edge_ops = [op for op in ops if op.path == "/edges/-"]
         print(f"[OPS] {batch_id}: {len(node_ops)} nodes, {len(edge_ops)} edges")
 
         if ops:
-            event_queue.put_nowait(AGUIEvent(
-                type=AGUIEventType.STATE_DELTA,
-                delta=ops,
+            event_queue.put_nowait(encode_event(
+                StateDeltaEvent(delta=[op.model_dump() for op in ops])
             ))
             print(f"[STATE_DELTA] Sent {len(ops)} ops for {batch_id}")
         else:
@@ -1610,30 +1739,42 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                 "billable": billable,
             }
 
-        # STEP_FINISHED - include error flag if reasoning indicates API error
+        # REASONING events for LLM reasoning (AG-UI standard)
         is_error = reasoning.startswith("API Error:") if reasoning else False
-        event_queue.put_nowait(AGUIEvent(
-            type=AGUIEventType.STEP_FINISHED,
-            stepName=batch_id,
-            metadata={
+        if reasoning:
+            msg_id = str(uuid.uuid4())
+            event_queue.put_nowait(encode_event(ReasoningStartEvent(message_id=msg_id)))
+            event_queue.put_nowait(encode_event(
+                _reasoning_message_start(msg_id)
+            ))
+            event_queue.put_nowait(encode_event(
+                ReasoningMessageContentEvent(message_id=msg_id, delta=reasoning)
+            ))
+            event_queue.put_nowait(encode_event(ReasoningMessageEndEvent(message_id=msg_id)))
+            event_queue.put_nowait(encode_event(ReasoningEndEvent(message_id=msg_id)))
+        # STEP_FINISHED (protocol-compliant: stepName only)
+        event_queue.put_nowait(encode_event(
+            StepFinishedEvent(step_name=batch_id)
+        ))
+        # Domain metadata as CUSTOM event (AG-UI extension, reasoning in REASONING events)
+        event_queue.put_nowait(encode_event(
+            CustomEvent(name="step_metadata", value={
                 "node_id": node_id,
                 "batch_type": batch_type,
                 "selected_ids": selected_ids,
-                "reasoning": reasoning,
                 "candidates": candidates,
                 "error": is_error,
-                "selected_details": selected_details,  # NEW: ICD properties for reconciliation
-            },
+                "selected_details": selected_details,
+            })
         ))
 
     async def event_generator() -> AsyncGenerator[str, None]:
         """Generate AG-UI SSE events."""
         global CURRENT_APP, RUNNING_TASK
 
-        # Generate unique run ID for this invocation (AG-UI protocol compliance)
-        # threadId will be set to the partition key (stable for same clinical note/settings)
-        run_id = str(uuid.uuid4())
-        thread_id: str = ""  # Will be set to partition key after it's computed
+        # Use client-provided IDs from RunAgentInput (AG-UI protocol compliance)
+        run_id = run_input.run_id
+        thread_id = run_input.thread_id
 
         try:
             # Configure LLM (use create_config for correct provider base URLs)
@@ -1709,8 +1850,6 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                         and cached_state.get("state", {}).get("selected_codes") is not None
                     )
                 print(f"[SERVER] Zero-shot cache check: partition_key={zs_partition_key}, cached={is_cached}")
-                # Use partition key as threadId (stable for same clinical note/settings)
-                thread_id = zs_partition_key
             else:
                 # Scaffolded mode: call build_traversal_app() directly (single source of truth for cache status)
                 # This eliminates the dual cache check issue - build_traversal_app() is the authoritative check
@@ -1735,8 +1874,6 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                 )
                 SESSION_PARTITION_KEYS.add(scaffolded_partition_key)
                 print(f"[SERVER] Scaffolded cache key: {scaffolded_partition_key}")
-                # Use partition key as threadId (stable for same clinical note/settings)
-                thread_id = scaffolded_partition_key
 
                 # Initialize persister (always keep existing data)
                 await initialize_persister(reset=False)
@@ -1757,14 +1894,11 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                 # Set CURRENT_APP for cancel endpoint to access
                 CURRENT_APP = scaffolded_burr_app
 
-            # RUN_STARTED with cache flag
-            run_started_event = AGUIEvent(
-                type=AGUIEventType.RUN_STARTED,
-                threadId=thread_id,
-                runId=run_id,
-                metadata={'clinical_note': request.clinical_note[:100], 'cached': is_cached}
-            )
-            yield f"data: {run_started_event.model_dump_json()}\n\n"
+            # RUN_STARTED + run_metadata custom event
+            yield encode_event(RunStartedEvent(thread_id=thread_id, run_id=run_id, input=run_input))
+            yield encode_event(CustomEvent(name="run_metadata", value={
+                'clinical_note': request.clinical_note[:100], 'cached': is_cached,
+            }))
 
             # STATE_SNAPSHOT with ROOT node
             initial_state = GraphState(
@@ -1778,7 +1912,7 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                 )],
                 edges=[],
             )
-            yield f"data: {AGUIEvent(type=AGUIEventType.STATE_SNAPSHOT, snapshot=initial_state).model_dump_json()}\n\n"
+            yield encode_event(StateSnapshotEvent(snapshot=initial_state.model_dump()))
 
             # Branch based on scaffolded flag
             if not request.scaffolded:
@@ -1812,7 +1946,7 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                 print(f"[SERVER] Zero-shot cache key: {partition_key}")
 
                 # STEP_STARTED for zero-shot batch
-                yield f"data: {AGUIEvent(type=AGUIEventType.STEP_STARTED, stepName='ROOT|zero-shot').model_dump_json()}\n\n"
+                yield encode_event(StepStartedEvent(step_name='ROOT|zero-shot'))
 
                 # Build zero-shot Burr app (checks cache)
                 zs_app, was_cached = await build_zero_shot_app(
@@ -1955,11 +2089,24 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                     ))
 
                 if ops:
-                    yield f"data: {AGUIEvent(type=AGUIEventType.STATE_DELTA, delta=ops).model_dump_json()}\n\n"
+                    yield encode_event(StateDeltaEvent(delta=[op.model_dump() for op in ops]))
 
-                # STEP_FINISHED with populated candidates and selected_details
+                # REASONING events for LLM reasoning, then STEP_FINISHED + CUSTOM
                 is_error = reasoning.startswith("API Error:") if reasoning else False
-                yield f"data: {AGUIEvent(type=AGUIEventType.STEP_FINISHED, stepName='ROOT|zero-shot', metadata={'node_id': 'ROOT', 'batch_type': 'zero-shot', 'selected_ids': selected_codes, 'reasoning': reasoning, 'candidates': candidates, 'error': is_error, 'selected_details': selected_details}).model_dump_json()}\n\n"
+                if reasoning:
+                    msg_id = str(uuid.uuid4())
+                    yield encode_event(ReasoningStartEvent(message_id=msg_id))
+                    yield encode_event(_reasoning_message_start(msg_id))
+                    yield encode_event(ReasoningMessageContentEvent(message_id=msg_id, delta=reasoning))
+                    yield encode_event(ReasoningMessageEndEvent(message_id=msg_id))
+                    yield encode_event(ReasoningEndEvent(message_id=msg_id))
+                yield encode_event(StepFinishedEvent(step_name='ROOT|zero-shot'))
+                yield encode_event(CustomEvent(name="step_metadata", value={
+                    'node_id': 'ROOT', 'batch_type': 'zero-shot',
+                    'selected_ids': selected_codes,
+                    'candidates': candidates, 'error': is_error,
+                    'selected_details': selected_details,
+                }))
 
                 # RUN_FINISHED or RUN_ERROR
                 cache_status = "CACHED" if was_cached else "NEW"
@@ -1967,15 +2114,17 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
 
                 if is_error:
                     # Emit RUN_ERROR for API errors
-                    yield f"data: {AGUIEvent(type=AGUIEventType.RUN_ERROR, threadId=thread_id, runId=run_id, error=reasoning).model_dump_json()}\n\n"
+                    yield encode_event(RunErrorEvent(message=reasoning))
                 else:
-                    run_finished_metadata = {
-                        'final_nodes': selected_codes,
-                        'batch_count': 1,
-                        'mode': 'zero-shot',
-                        'cached': was_cached,
-                    }
-                    yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, threadId=thread_id, runId=run_id, metadata=run_finished_metadata).model_dump_json()}\n\n"
+                    yield encode_event(RunFinishedEvent(
+                        thread_id=thread_id, run_id=run_id,
+                        result={
+                            'final_nodes': selected_codes,
+                            'batch_count': 1,
+                            'mode': 'zero-shot',
+                            'cached': was_cached,
+                        },
+                    ))
                 return  # Exit generator - zero-shot mode complete
 
             # Scaffolded mode: Tree traversal with Burr
@@ -2045,9 +2194,11 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                             edge_key = (parent_id, node_id)
                             if edge_key not in snapshot_seen_edges:
                                 snapshot_seen_edges.add(edge_key)
+                                is_hier = is_hierarchy_edge(parent_id, node_id)
                                 snapshot_edges.append({
                                     "source": parent_id, "target": node_id,
-                                    "edge_type": "hierarchy", "rule": None,
+                                    "edge_type": "hierarchy" if is_hier else "lateral",
+                                    "rule": None,
                                 })
 
                         # Create 7th character node if selected
@@ -2174,9 +2325,11 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                             edge_key = (parent_id, node_id)
                             if edge_key not in snapshot_seen_edges:
                                 snapshot_seen_edges.add(edge_key)
+                                is_hier = is_hierarchy_edge(parent_id, node_id)
                                 snapshot_edges.append({
                                     "source": parent_id, "target": node_id,
-                                    "edge_type": "hierarchy", "rule": None,
+                                    "edge_type": "hierarchy" if is_hier else "lateral",
+                                    "rule": None,
                                 })
 
                         # Add selected children
@@ -2224,6 +2377,18 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                                     "source": edge_source, "target": code,
                                     "edge_type": edge_type, "rule": rule,
                                 })
+
+                            # For lateral edges, also create hierarchy edge from actual ICD-10 parent
+                            if edge_type == "lateral":
+                                actual_parent = get_icd_parent(code)
+                                if actual_parent and actual_parent in snapshot_seen_nodes:
+                                    parent_edge_key = (actual_parent, code)
+                                    if parent_edge_key not in snapshot_seen_edges:
+                                        snapshot_seen_edges.add(parent_edge_key)
+                                        snapshot_edges.append({
+                                            "source": actual_parent, "target": code,
+                                            "edge_type": "hierarchy", "rule": None,
+                                        })
 
                 # Build all decisions for benchmark comparison
                 all_decisions: list[dict] = []
@@ -2290,18 +2455,20 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                     nodes=[GraphNode(**n) for n in snapshot_nodes],
                     edges=[GraphEdge(**e) for e in snapshot_edges]
                 )
-                yield f"data: {AGUIEvent(type=AGUIEventType.STATE_SNAPSHOT, snapshot=snapshot_state).model_dump_json()}\n\n"
+                yield encode_event(StateSnapshotEvent(snapshot=snapshot_state.model_dump()))
 
                 # Emit RUN_FINISHED with final_nodes and all decisions
-                run_finished_metadata = {
-                    'final_nodes': final_nodes,
-                    'batch_count': len(batch_data),
-                    'mode': 'scaffolded',
-                    'cached': True,
-                    'decisions': all_decisions,
-                }
                 print(f"[SERVER] Scaffolded complete (CACHED SNAPSHOT): {len(snapshot_nodes)} nodes, {len(snapshot_edges)} edges, {len(all_decisions)} decisions")
-                yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, threadId=thread_id, runId=run_id, metadata=run_finished_metadata).model_dump_json()}\n\n"
+                yield encode_event(RunFinishedEvent(
+                    thread_id=thread_id, run_id=run_id,
+                    result={
+                        'final_nodes': final_nodes,
+                        'batch_count': len(batch_data),
+                        'mode': 'scaffolded',
+                        'cached': True,
+                        'decisions': all_decisions,
+                    },
+                ))
                 return  # Exit early for cache hit
 
             else:
@@ -2338,9 +2505,9 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                         break
 
                     try:
-                        event = await asyncio.wait_for(event_queue.get(), timeout=0.1)
-                        if event is not None:
-                            yield f"data: {event.model_dump_json()}\n\n"
+                        encoded = await asyncio.wait_for(event_queue.get(), timeout=0.1)
+                        if encoded is not None:
+                            yield encoded  # Already encoded by encode_event()
                     except asyncio.TimeoutError:
                         continue
 
@@ -2351,11 +2518,11 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                 # Get final state
                 final_state = await task
 
-                # Drain remaining events
+                # Drain remaining events (already encoded strings)
                 while not event_queue.empty():
-                    event = event_queue.get_nowait()
-                    if event is not None:
-                        yield f"data: {event.model_dump_json()}\n\n"
+                    encoded = event_queue.get_nowait()
+                    if encoded is not None:
+                        yield encoded
 
             # Update finalized nodes in graph (deduplicate in case parallel batches reached same node)
             final_nodes_raw = final_state.get("final_nodes", [])
@@ -2379,7 +2546,7 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
                     ))
 
             if finalize_ops:
-                yield f"data: {AGUIEvent(type=AGUIEventType.STATE_DELTA, delta=finalize_ops).model_dump_json()}\n\n"
+                yield encode_event(StateDeltaEvent(delta=[op.model_dump() for op in finalize_ops]))
 
             # RUN_FINISHED or RUN_ERROR - check if there was an LLM error
             batch_data = final_state.get("batch_data", {})
@@ -2390,27 +2557,22 @@ async def stream_traversal(request: TraversalRequest, http_request: Request):
             print(f"[SERVER] Scaffolded complete ({cache_status}): final_nodes={final_nodes}, batch_count={len(batch_data)}, error={bool(llm_error)}")
 
             if llm_error:
-                # Emit RUN_ERROR for LLM API errors
-                yield f"data: {AGUIEvent(type=AGUIEventType.RUN_ERROR, threadId=thread_id, runId=run_id, error=llm_error).model_dump_json()}\n\n"
+                yield encode_event(RunErrorEvent(message=llm_error))
             else:
-                run_finished_metadata = {
-                    'final_nodes': final_nodes,
-                    'batch_count': len(batch_data),
-                    'mode': 'scaffolded',
-                    'cached': is_cached,
-                }
-                yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, threadId=thread_id, runId=run_id, metadata=run_finished_metadata).model_dump_json()}\n\n"
+                yield encode_event(RunFinishedEvent(
+                    thread_id=thread_id, run_id=run_id,
+                    result={
+                        'final_nodes': final_nodes,
+                        'batch_count': len(batch_data),
+                        'mode': 'scaffolded',
+                        'cached': is_cached,
+                    },
+                ))
             print("[SERVER] Stream complete")
 
         except Exception as e:
             # Emit RUN_ERROR for unexpected exceptions
-            error_event = AGUIEvent(
-                type=AGUIEventType.RUN_ERROR,
-                threadId=thread_id,
-                runId=run_id,
-                error=str(e),
-            )
-            yield f"data: {error_event.model_dump_json()}\n\n"
+            yield encode_event(RunErrorEvent(message=str(e)))
 
         finally:
             # Cleanup
@@ -2453,9 +2615,10 @@ async def run_traversal_sync(request: TraversalRequest):
 
 
 @app.post("/api/traverse/rewind")
-async def stream_rewind(request: RewindRequest, http_request: Request):
+async def stream_rewind(run_input: RunAgentInput, http_request: Request):
     """Rewind traversal from a specific batch with feedback.
 
+    Accepts standard AG-UI RunAgentInput with domain config in the `state` field.
     Uses Burr's fork pattern to branch from a checkpoint and inject corrective
     feedback. Streams updates via AG-UI SSE (same as /api/traverse/stream).
 
@@ -2469,11 +2632,13 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
     Returns SSE stream with events:
     - RUN_STARTED: Rewind begins (includes rewind_from batch_id)
     - STATE_SNAPSHOT: Pre-rewind graph state (pruned to rewind point)
-    - STEP_STARTED: Batch processing begins
-    - STATE_DELTA: JSON Patch ops to add nodes/edges
-    - STEP_FINISHED: Batch complete with reasoning
+    - STEP_STARTED / STATE_DELTA / TEXT_MESSAGE / STEP_FINISHED: Per-batch updates
+    - CUSTOM step_metadata: Domain-specific batch metadata
     - RUN_FINISHED: Rewind complete with final codes
     """
+    # Extract domain config from AG-UI RunAgentInput.state
+    state = run_input.state if isinstance(run_input.state, dict) else {}
+    request = RewindRequest(**state)
     from agent import retry_node, initialize_persister, cleanup_persister, set_batch_callback
     from agent.traversal import PARTITION_KEY, generate_traversal_cache_key, prune_state_for_rewind
     import agent.traversal as traversal_module
@@ -2481,7 +2646,7 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
     import candidate_selector.config as llm_config
 
     # Queue for streaming events
-    event_queue: asyncio.Queue[AGUIEvent | None] = asyncio.Queue()
+    event_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     # Track seen nodes to avoid duplicates - dict maps node_id -> index for updates
     # Will be populated from pre-rewind snapshot (backend is authoritative source)
@@ -2524,9 +2689,8 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
         batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
 
         # STEP_STARTED
-        event_queue.put_nowait(AGUIEvent(
-            type=AGUIEventType.STEP_STARTED,
-            stepName=batch_id,
+        event_queue.put_nowait(encode_event(
+            StepStartedEvent(step_name=batch_id)
         ))
 
         # STATE_DELTA - add nodes and edges
@@ -2735,10 +2899,11 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
                     edge_key = (parent_id, node_id)
                     if edge_key not in seen_edges:
                         seen_edges.add(edge_key)
+                        is_hier = is_hierarchy_edge(parent_id, node_id)
                         traversed_edge_data = {
                             "source": parent_id,
                             "target": node_id,
-                            "edge_type": "hierarchy",
+                            "edge_type": "hierarchy" if is_hier else "lateral",
                             "rule": None,
                         }
                         ops.append(JsonPatchOp(
@@ -2802,6 +2967,23 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
                             }
                         ))
 
+                    # For lateral edges, also create hierarchy edge from actual ICD-10 parent
+                    actual_parent = get_icd_parent(code)
+                    if actual_parent and actual_parent in seen_nodes:
+                        parent_edge_key = (actual_parent, code)
+                        if parent_edge_key not in seen_edges:
+                            seen_edges.add(parent_edge_key)
+                            ops.append(JsonPatchOp(
+                                op="add",
+                                path="/edges/-",
+                                value={
+                                    "source": actual_parent,
+                                    "target": code,
+                                    "edge_type": "hierarchy",
+                                    "rule": None,
+                                }
+                            ))
+
                 else:
                     # Children batch - regular hierarchy handling
                     if code not in seen_nodes:
@@ -2856,9 +3038,8 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
                         ))
 
         if ops:
-            event_queue.put_nowait(AGUIEvent(
-                type=AGUIEventType.STATE_DELTA,
-                delta=ops,
+            event_queue.put_nowait(encode_event(
+                StateDeltaEvent(delta=[op.model_dump() for op in ops])
             ))
 
         # Compute selected_details for reconciliation
@@ -2888,31 +3069,43 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
                 "billable": billable,
             }
 
+        # REASONING events for LLM reasoning (AG-UI standard)
         is_error = reasoning.startswith("API Error:") if reasoning else False
-        event_queue.put_nowait(AGUIEvent(
-            type=AGUIEventType.STEP_FINISHED,
-            stepName=batch_id,
-            metadata={
+        if reasoning:
+            msg_id = str(uuid.uuid4())
+            event_queue.put_nowait(encode_event(ReasoningStartEvent(message_id=msg_id)))
+            event_queue.put_nowait(encode_event(
+                _reasoning_message_start(msg_id)
+            ))
+            event_queue.put_nowait(encode_event(
+                ReasoningMessageContentEvent(message_id=msg_id, delta=reasoning)
+            ))
+            event_queue.put_nowait(encode_event(ReasoningMessageEndEvent(message_id=msg_id)))
+            event_queue.put_nowait(encode_event(ReasoningEndEvent(message_id=msg_id)))
+        # STEP_FINISHED (protocol-compliant: stepName only)
+        event_queue.put_nowait(encode_event(
+            StepFinishedEvent(step_name=batch_id)
+        ))
+        # Domain metadata as CUSTOM event (AG-UI extension, reasoning in REASONING events)
+        event_queue.put_nowait(encode_event(
+            CustomEvent(name="step_metadata", value={
                 "node_id": node_id,
                 "batch_type": batch_type,
                 "selected_ids": selected_ids,
-                "reasoning": reasoning,
                 "candidates": candidates,
                 "error": is_error,
                 "selected_details": selected_details,
-            },
+            })
         ))
 
     async def event_generator() -> AsyncGenerator[str, None]:
         """Generate AG-UI SSE events for rewind."""
         global RUNNING_TASK
 
-        # Generate unique run ID for this rewind invocation (AG-UI protocol compliance)
-        # threadId will be set to the partition key (stable for same clinical note/settings)
-        run_id = str(uuid.uuid4())
-        thread_id: str = ""  # Will be set to partition key after it's computed
+        # Use client-provided IDs from RunAgentInput (AG-UI protocol compliance)
+        run_id = run_input.run_id
+        thread_id = run_input.thread_id
         # parentRunId indicates this run forks from a previous traversal
-        # We use the batch_id as a reference to the parent run context
         parent_run_id = request.batch_id
 
         try:
@@ -2957,11 +3150,11 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
             # Set global PARTITION_KEY so retry_node can use it for fork
             traversal_module.PARTITION_KEY = partition_key
             print(f"[REWIND] Partition key set: {partition_key}")
-            # Use partition key as threadId (stable for same clinical note/settings)
-            thread_id = partition_key
-
             # RUN_STARTED with rewind metadata
-            yield f"data: {AGUIEvent(type=AGUIEventType.RUN_STARTED, threadId=thread_id, runId=run_id, parentRunId=parent_run_id, metadata={'rewind_from': request.batch_id, 'feedback': request.feedback[:100]}).model_dump_json()}\n\n"
+            yield encode_event(RunStartedEvent(thread_id=thread_id, run_id=run_id, input=run_input))
+            yield encode_event(CustomEvent(name="run_metadata", value={
+                'rewind_from': request.batch_id, 'feedback': request.feedback[:100],
+            }))
 
             # Initialize persister (always keep existing data for rewind to find fork point)
             await initialize_persister(reset=False)
@@ -3000,7 +3193,7 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
                 nodes=[GraphNode(**n) for n in snapshot_nodes],
                 edges=[GraphEdge(**e) for e in snapshot_edges]
             )
-            yield f"data: {AGUIEvent(type=AGUIEventType.STATE_SNAPSHOT, snapshot=snapshot_state).model_dump_json()}\n\n"
+            yield encode_event(StateSnapshotEvent(snapshot=snapshot_state.model_dump()))
             print(f"[REWIND] Emitted STATE_SNAPSHOT: {len(snapshot_nodes)} nodes, {len(snapshot_edges)} edges")
 
             # Populate seen_nodes/seen_edges for incremental updates
@@ -3049,9 +3242,9 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
                     break
 
                 try:
-                    event = await asyncio.wait_for(event_queue.get(), timeout=0.1)
-                    if event is not None:
-                        yield f"data: {event.model_dump_json()}\n\n"
+                    encoded = await asyncio.wait_for(event_queue.get(), timeout=0.1)
+                    if encoded is not None:
+                        yield encoded  # Already encoded by encode_event()
                 except asyncio.TimeoutError:
                     continue
 
@@ -3062,11 +3255,11 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
             # Get final state
             final_state = await task
 
-            # Drain remaining events
+            # Drain remaining events (already encoded strings)
             while not event_queue.empty():
-                event = event_queue.get_nowait()
-                if event is not None:
-                    yield f"data: {event.model_dump_json()}\n\n"
+                encoded = event_queue.get_nowait()
+                if encoded is not None:
+                    yield encoded
 
             # Update finalized nodes
             final_nodes_raw = final_state.get("final_nodes", [])
@@ -3088,7 +3281,7 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
                     ))
 
             if finalize_ops:
-                yield f"data: {AGUIEvent(type=AGUIEventType.STATE_DELTA, delta=finalize_ops).model_dump_json()}\n\n"
+                yield encode_event(StateDeltaEvent(delta=[op.model_dump() for op in finalize_ops]))
 
             # RUN_FINISHED
             batch_data = final_state.get("batch_data", {})
@@ -3161,28 +3354,22 @@ async def stream_rewind(request: RewindRequest, http_request: Request):
             print(f"[REWIND] Complete: final_nodes={final_nodes}, error={bool(llm_error)}")
 
             if llm_error:
-                # Emit RUN_ERROR for LLM API errors
-                yield f"data: {AGUIEvent(type=AGUIEventType.RUN_ERROR, threadId=thread_id, runId=run_id, error=llm_error).model_dump_json()}\n\n"
+                yield encode_event(RunErrorEvent(message=llm_error))
             else:
-                run_finished_metadata = {
-                    'final_nodes': final_nodes,
-                    'batch_count': len(batch_data),
-                    'rewind_from': request.batch_id,
-                    'decisions': all_decisions,
-                }
-                yield f"data: {AGUIEvent(type=AGUIEventType.RUN_FINISHED, threadId=thread_id, runId=run_id, metadata=run_finished_metadata).model_dump_json()}\n\n"
+                yield encode_event(RunFinishedEvent(
+                    thread_id=thread_id, run_id=run_id,
+                    result={
+                        'final_nodes': final_nodes,
+                        'batch_count': len(batch_data),
+                        'rewind_from': request.batch_id,
+                        'decisions': all_decisions,
+                    },
+                ))
             print("[REWIND] Stream complete")
 
         except Exception as e:
             print(f"[REWIND] Error: {e}")
-            # Emit RUN_ERROR for unexpected exceptions
-            error_event = AGUIEvent(
-                type=AGUIEventType.RUN_ERROR,
-                threadId=thread_id,
-                runId=run_id,
-                error=str(e),
-            )
-            yield f"data: {error_event.model_dump_json()}\n\n"
+            yield encode_event(RunErrorEvent(message=str(e)))
 
         finally:
             RUNNING_TASK = None

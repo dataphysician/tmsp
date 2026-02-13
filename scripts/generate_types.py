@@ -20,7 +20,6 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from graph import EdgeType, GraphEdge, GraphNode, GraphStatus, NodeCategory
-from server import AGUIEvent, AGUIEventType, GraphState, JsonPatchOp
 from server import GraphRequest, GraphResponse, GraphStats, NodeDetailResponse, TraversalRequest
 from agent.state_types import CandidateDecision, DecisionPoint, TraversalState
 
@@ -205,10 +204,6 @@ def main() -> None:
         CandidateDecision,
         DecisionPoint,
         TraversalState,
-        # AG-UI types
-        JsonPatchOp,
-        GraphState,
-        AGUIEvent,
         # API types
         GraphRequest,
         GraphStats,

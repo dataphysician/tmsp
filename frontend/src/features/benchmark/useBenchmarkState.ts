@@ -3,9 +3,19 @@ import { useElapsedTime } from '../../hooks/useElapsedTime';
 import {
     streamTraversal,
     buildGraph,
-    type AGUIEvent,
-    type StepFinishedMetadata,
-    type RunFinishedMetadata,
+    EventType,
+    type BaseEvent,
+    type CustomEvent,
+    type ReasoningMessageContentEvent,
+    type RunErrorEvent,
+    type RunFinishedEvent,
+    type StateSnapshotEvent,
+    type StepStartedEvent,
+    type StepMetadata,
+    type RunMetadata,
+    type RunResult,
+    type SSEDecisionData,
+    type StreamHandle,
 } from '../../lib/api';
 import { calculateDepthFromCode } from '../../lib/graphUtils';
 import type {
@@ -19,6 +29,7 @@ import type {
     OvershootMarker,
     EdgeMissMarker,
     LLMConfig,
+    EdgeRule,
 } from '../../lib/types';
 import { type SidebarTab } from '../../lib/constants';
 import {
@@ -69,7 +80,7 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
     } | null>(null);
 
     // Refs
-    const benchmarkControllerRef = useRef<AbortController | null>(null);
+    const benchmarkControllerRef = useRef<StreamHandle | null>(null);
     const benchmarkTraversedNodesRef = useRef<GraphNode[]>([]);
     const benchmarkTraversedEdgesRef = useRef<GraphEdge[]>([]);
     const benchmarkDecisionsRef = useRef<DecisionPoint[]>([]);
@@ -82,6 +93,7 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
     const benchmarkResetRafRef = useRef<number | null>(null);
     const benchmarkIsCachedReplayRef = useRef<boolean>(false);
     const benchmarkWasZeroShotRef = useRef<boolean>(false);
+    const benchmarkReasoningRef = useRef<string>('');
     const lastVisualUpdateTimeRef = useRef<number>(0);
     const benchmarkLastInteractionRef = useRef<number>(0);
 
@@ -142,17 +154,13 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
         benchmarkLastInteractionRef.current = Date.now();
     }, []);
 
-    const handleBenchmarkEvent = useCallback((event: AGUIEvent) => {
+    const handleBenchmarkEvent = useCallback((event: BaseEvent) => {
         switch (event.type) {
-            case 'RUN_STARTED':
+            case EventType.RUN_STARTED:
                 setBenchmarkTimerRunning(true);
 
-                if (event.metadata?.cached) {
-                    console.log('[Benchmark] Cached replay - expecting STATE_SNAPSHOT');
-                    benchmarkIsCachedReplayRef.current = true;
-                } else {
-                    benchmarkIsCachedReplayRef.current = false;
-                }
+                // Cache flag now arrives in CUSTOM run_metadata event
+                benchmarkIsCachedReplayRef.current = false;
 
                 benchmarkWasZeroShotRef.current = !(llmConfig.scaffolded ?? true);
                 setBenchmarkWasZeroShot(benchmarkWasZeroShotRef.current);
@@ -172,50 +180,50 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
                 }
 
                 setBenchmarkStatus('traversing');
-                if (benchmarkIsCachedReplayRef.current) {
-                    setBenchmarkCurrentStep('Loading cached results...');
-                } else if (benchmarkWasZeroShotRef.current) {
-                    setBenchmarkCurrentStep('Zero-Shot');
-                } else {
-                    setBenchmarkCurrentStep('Starting benchmark traversal');
-                }
+                setBenchmarkCurrentStep('Starting benchmark traversal');
                 setBenchmarkIsStarting(false);
+                benchmarkReasoningRef.current = '';
                 break;
 
-            case 'STATE_SNAPSHOT':
-                // Process unconditionally — handler only writes to refs, never setState.
-                // State is applied later in RUN_FINISHED. SSE ordering guarantees no
-                // stale snapshots arrive after RUN_FINISHED.
-                if (event.snapshot) {
-                    const { nodes, edges } = event.snapshot;
-                    benchmarkTraversedNodesRef.current = nodes;
-                    benchmarkTraversedEdgesRef.current = edges;
-
-                    const traversedIds = new Set(nodes.map(n => n.id));
-                    benchmarkStreamedIdsRef.current = traversedIds;
-
-                    console.log(`[STATE_SNAPSHOT] Benchmark complete graph: ${nodes.length} nodes, ${edges.length} edges`);
-                }
+            // REASONING events carry LLM reasoning per step (AG-UI standard)
+            case EventType.REASONING_START:
+                benchmarkReasoningRef.current = '';
                 break;
 
-            case 'STATE_DELTA':
+            case EventType.REASONING_MESSAGE_CONTENT:
+                benchmarkReasoningRef.current += (event as ReasoningMessageContentEvent).delta;
                 break;
 
-            case 'STEP_STARTED':
-                setBenchmarkCurrentStep(event.stepName || 'Processing...');
+            case EventType.REASONING_MESSAGE_START:
+            case EventType.REASONING_MESSAGE_END:
+            case EventType.REASONING_END:
+                // Reasoning accumulated in ref, consumed by CUSTOM step_metadata handler
                 break;
 
-            case 'STEP_FINISHED':
-                benchmarkBatchCountRef.current += 1;
+            case EventType.CUSTOM: {
+                const custom = event as CustomEvent;
+                if (custom.name === 'run_metadata') {
+                    const meta = custom.value as RunMetadata;
+                    if (meta.cached) {
+                        console.log('[Benchmark] Cached replay - expecting STATE_SNAPSHOT');
+                        benchmarkIsCachedReplayRef.current = true;
+                        setBenchmarkCurrentStep('Loading cached results...');
+                    } else if (benchmarkWasZeroShotRef.current) {
+                        setBenchmarkCurrentStep('Zero-Shot');
+                    }
+                } else if (custom.name === 'step_metadata') {
+                    // Domain metadata — benchmark accumulates in Maps (not via STATE_DELTA)
+                    benchmarkBatchCountRef.current += 1;
 
-                if (event.metadata) {
-                    const metadata: StepFinishedMetadata = event.metadata;
+                    const metadata = custom.value as StepMetadata;
                     const candidates: Record<string, string> = metadata.candidates ?? {};
                     const selectedIds = metadata.selected_ids ?? [];
-                    const reasoning = metadata.reasoning ?? '';
-                    const nodeId = metadata.node_id ?? event.stepName;
+                    const nodeId = metadata.node_id ?? '';
                     const batchType = metadata.batch_type ?? 'children';
                     const selectedDetails = metadata.selected_details ?? {};
+
+                    // Reasoning comes from REASONING events (AG-UI standard)
+                    const reasoning = benchmarkReasoningRef.current;
 
                     const edgeSource = nodeId && nodeId !== 'ROOT' ? nodeId : 'ROOT';
                     const isFromRoot = edgeSource === 'ROOT';
@@ -237,7 +245,7 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
                             source: edgeSource,
                             target: code,
                             edge_type: (isFromRoot || batchType === 'children') ? 'hierarchy' as const : 'lateral' as const,
-                            rule: (isFromRoot || batchType === 'children') ? null : batchType,
+                            rule: (isFromRoot || batchType === 'children') ? null : batchType as EdgeRule,
                         });
                     }
 
@@ -254,10 +262,11 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
                         })
                     );
 
+                    const stepName = `${nodeId}|${batchType}`;
                     const decision: DecisionPoint = {
                         current_node: nodeId,
                         current_label: `${batchType} batch`,
-                        depth: (event.stepName?.split('|').length || 1),
+                        depth: (stepName.split('|').length || 1),
                         candidates: candidateDecisions,
                         selected_codes: selectedIds,
                     };
@@ -283,18 +292,47 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
                     }
                 }
                 break;
+            }
 
-            case 'RUN_ERROR':
-                // Handle dedicated error events (AG-UI protocol)
+            case EventType.STATE_SNAPSHOT: {
+                // Process unconditionally — handler only writes to refs, never setState.
+                // State is applied later in RUN_FINISHED. SSE ordering guarantees no
+                // stale snapshots arrive after RUN_FINISHED.
+                const snapshot = (event as StateSnapshotEvent).snapshot as { nodes: GraphNode[]; edges: GraphEdge[] } | undefined;
+                if (snapshot) {
+                    const { nodes, edges } = snapshot;
+                    benchmarkTraversedNodesRef.current = nodes;
+                    benchmarkTraversedEdgesRef.current = edges;
+
+                    const traversedIds = new Set(nodes.map((n: GraphNode) => n.id));
+                    benchmarkStreamedIdsRef.current = traversedIds;
+
+                    console.log(`[STATE_SNAPSHOT] Benchmark complete graph: ${nodes.length} nodes, ${edges.length} edges`);
+                }
+                break;
+            }
+
+            case EventType.STATE_DELTA:
+                break;
+
+            case EventType.STEP_STARTED:
+                setBenchmarkCurrentStep((event as StepStartedEvent).stepName || 'Processing...');
+                break;
+
+            case EventType.STEP_FINISHED:
+                // Protocol-only event — domain data arrives in CUSTOM step_metadata
+                break;
+
+            case EventType.RUN_ERROR:
                 setBenchmarkTimerRunning(false);
                 setBenchmarkStatus('error');
-                setBenchmarkError(event.error);
+                setBenchmarkError((event as RunErrorEvent).message);
                 setBenchmarkCurrentStep('Error');
                 break;
 
-            case 'RUN_FINISHED': {
-                const finishedMeta: RunFinishedMetadata | undefined = event.metadata;
-                const finalNodesRaw = finishedMeta?.final_nodes ?? [];
+            case EventType.RUN_FINISHED: {
+                const result = (event as RunFinishedEvent).result as RunResult | undefined;
+                const finalNodesRaw = result?.final_nodes ?? [];
                 const finalNodes = new Set(finalNodesRaw);
                 const wasZeroShot = benchmarkWasZeroShotRef.current;
 
@@ -303,10 +341,10 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
                     benchmarkResetRafRef.current = null;
                 }
 
-                const snapshotDecisions = finishedMeta?.decisions;
+                const snapshotDecisions = result?.decisions;
 
                     if (snapshotDecisions && snapshotDecisions.length > 0) {
-                        const decisions: DecisionPoint[] = snapshotDecisions.map(d => {
+                        const decisions: DecisionPoint[] = snapshotDecisions.map((d: SSEDecisionData) => {
                             const selectedSet = new Set(d.selected_ids);
                             return {
                                 current_node: d.node_id,
@@ -338,7 +376,7 @@ export function useBenchmarkState({ llmConfig, setSidebarTab }: UseBenchmarkStat
                     setBenchmarkDecisions(benchmarkDecisionsRef.current);
                     setBenchmarkBatchCount(benchmarkBatchCountRef.current);
 
-                    const wasCached = finishedMeta?.cached ?? false;
+                    const wasCached = result?.cached ?? false;
                     if (wasCached) {
                         console.log('[BACKEND CACHE HIT] Using cached results:', finalNodesRaw.length, 'codes');
                     }

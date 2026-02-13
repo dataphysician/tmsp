@@ -58,6 +58,14 @@ interface DFSPositionContext {
   chapterId: string;
 }
 
+/** Return value from positionWithRegion: tracks used bounds with/without lateral targets */
+interface PositionResult {
+  usedLeft: number;
+  usedRight: number;
+  /** Right bound of hierarchy content only (before lateral targets inflate it) */
+  hierarchyUsedRight: number;
+}
+
 // ============================================================================
 // Main Positioning Function
 // ============================================================================
@@ -317,11 +325,11 @@ export function calculatePositions(
   function positionWithRegion(
     nodeId: string,
     context: DFSPositionContext
-  ): { usedLeft: number; usedRight: number } {
+  ): PositionResult {
     if (positionedNodes.has(nodeId)) {
       const existingPos = positions.get(nodeId);
       if (existingPos) {
-        return { usedLeft: existingPos.x - layoutWidth / 2, usedRight: existingPos.x + layoutWidth / 2 };
+        return { usedLeft: existingPos.x - layoutWidth / 2, usedRight: existingPos.x + layoutWidth / 2, hierarchyUsedRight: existingPos.x + layoutWidth / 2 };
       }
     }
     positionedNodes.add(nodeId);
@@ -417,7 +425,7 @@ export function calculatePositions(
       let totalHierarchyWidth = 0;
       for (const childId of renderedChildren) {
         const childBounds = subtreeBounds.get(childId);
-        totalHierarchyWidth += childBounds?.requiredWidth ?? (layoutWidth + nodePadding);
+        totalHierarchyWidth += childBounds?.hierarchyOnlyWidth ?? (layoutWidth + nodePadding);
       }
       totalHierarchyWidth += (renderedChildren.length - 1) * nodePadding;
 
@@ -544,6 +552,9 @@ export function calculatePositions(
       }
     }
 
+    // Capture hierarchy-only used right before lateral positioning inflates it
+    const hierarchyUsedRight = usedRight;
+
     // Position effective lateral targets
     if (effectiveLateralTargets.length > 0) {
       let lateralX = usedRight + nodePadding + layoutWidth / 2;
@@ -625,7 +636,7 @@ export function calculatePositions(
       }
     }
 
-    return { usedLeft, usedRight };
+    return { usedLeft, usedRight, hierarchyUsedRight };
   }
 
   // Position each chapter
@@ -1161,7 +1172,58 @@ export function calculatePositions(
     }
   }
 
-  // 4. Re-center chapters over immediate children (snap-to-closest with tie detection)
+  // 4. Node-level cross-chapter collision resolution — Phase 8 packs chapters with
+  // CHAPTER_PADDING (20px) which is far less than minGap (140px), so nodes from
+  // adjacent chapters at the same depth can overlap. Only shift entire chapters
+  // (no individual node shifts or ancestor propagation) to preserve internal layout.
+  {
+    const minGapRequired = layoutWidth + nodePadding;
+    for (let pass = 0; pass < 5; pass++) {
+      let foundCollision = false;
+
+      const nodesByRow = new Map<number, Array<{ id: string; x: number }>>();
+      for (const [nodeId, pos] of positions.entries()) {
+        if (nodeId === 'ROOT') continue;
+        const rowY = Math.round(pos.y);
+        if (!nodesByRow.has(rowY)) nodesByRow.set(rowY, []);
+        nodesByRow.get(rowY)!.push({ id: nodeId, x: pos.x });
+      }
+
+      for (const [, nodesInRow] of nodesByRow.entries()) {
+        if (nodesInRow.length < 2) continue;
+        nodesInRow.sort((a, b) => a.x - b.x);
+
+        for (let i = 0; i < nodesInRow.length - 1; i++) {
+          const leftNode = nodesInRow[i];
+          const rightNode = nodesInRow[i + 1];
+          const actualGap = rightNode.x - leftNode.x;
+
+          if (actualGap < minGapRequired) {
+            const leftChapterId = nodePositionedUnderChapter.get(leftNode.id);
+            const rightChapterId = nodePositionedUnderChapter.get(rightNode.id);
+
+            // Only handle cross-chapter collisions (same-chapter resolved in Phase 7)
+            if (leftChapterId && rightChapterId && leftChapterId !== rightChapterId) {
+              const shiftNeeded = minGapRequired - actualGap;
+              const rightIdx = chapterIndexMap.get(rightChapterId) ?? -1;
+              if (rightIdx >= 0) {
+                for (let j = rightIdx; j < sortedChapters.length; j++) {
+                  shiftEntireChapter(sortedChapters[j], shiftNeeded);
+                }
+              }
+              foundCollision = true;
+              break;
+            }
+          }
+        }
+        if (foundCollision) break;
+      }
+      if (!foundCollision) break;
+    }
+    recalculateChapterBoundaries();
+  }
+
+  // 5. Re-center chapters over immediate children (snap-to-closest with tie detection)
   const TIE_TOLERANCE = 5;
   for (const chapterId of sortedChapters) {
     const chapterPos = positions.get(chapterId);
@@ -1208,7 +1270,7 @@ export function calculatePositions(
     positions.set(chapterId, { x: targetX, y: chapterPos.y });
   }
 
-  // 5. Re-center ROOT over chapters (snap-to-closest with tie detection)
+  // 6. Re-center ROOT over chapters (snap-to-closest with tie detection)
   const finalRootPos = positions.get('ROOT');
   if (finalRootPos && sortedChapters.length > 0) {
     const chapterXPositions = sortedChapters

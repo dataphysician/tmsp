@@ -137,33 +137,7 @@ The web frontend includes three interactive tabs:
 
 ## Architecture
 
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Clinical Note  │────▶│  Burr/Agent      │◀───▶│  ICD-10-CM      │
-│                 │     │  Orchestrator    │     │  Index          │
-└─────────────────┘     └────────┬─────────┘     └────────┬────────┘
-                                 │                        ▲
-                    ┌────────────┼────────────┐           │
-                    ▼            ▼            ▼           │
-              ┌─────────┐  ┌─────────┐  ┌─────────┐       │
-              │codeFirst│  │ children│  │codeAlso │       │
-              └────┬────┘  └────┬────┘  └────┬────┘       │
-                   │            │            │            │
-                   ▼            ▼            ▼            │
-              ┌─────────────────────────────────┐         │
-              │   Candidate Selector (LLM)      │         │
-              │   - Structured output           │         │
-              │   - Multi-provider support      │         │
-              │   - Reasoning capture           │         │
-              └───────────────┬─────────────────┘         │
-                              │                           │
-                 ┌────────────┴────────────┐              │
-                 ▼                         ▼              │
-   ┌─────────────────────────┐   ┌─────────────────┐      │
-   │ Final Codes +           │   │  Spawn New      │──────┘
-   │ Decision Tree           │   │  Batches        │
-   └─────────────────────────┘   └─────────────────┘
-```
+![Architecture](docs/workflow.png)
 
 ### Components
 

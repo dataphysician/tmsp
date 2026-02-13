@@ -31,11 +31,13 @@ export interface GraphNode {
   billable: boolean;
 }
 
+export type EdgeRule = 'sevenChrDef' | 'codeFirst' | 'codeAlso' | 'useAdditionalCode' | null;
+
 export interface GraphEdge {
   source: string;
   target: string;
   edge_type: 'hierarchy' | 'lateral';
-  rule: string | null;
+  rule: EdgeRule;
 }
 
 export interface TraversalState {

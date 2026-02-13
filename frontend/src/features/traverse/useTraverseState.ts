@@ -4,16 +4,20 @@ import { applyPatch, type Operation } from 'fast-json-patch';
 import {
   streamTraversal,
   streamRewind,
-  type AGUIEvent,
-  type StepFinishedMetadata,
-  type RunFinishedMetadata,
+  EventType,
+  type BaseEvent,
+  type CustomEvent,
+  type ReasoningMessageContentEvent,
+  type RunErrorEvent,
+  type RunFinishedEvent,
+  type StateSnapshotEvent,
+  type StateDeltaEvent,
+  type StepStartedEvent,
+  type StepMetadata,
+  type RunResult,
+  type StreamHandle,
 } from '../../lib/api';
-import {
-  mergeById,
-  mergeByKey,
-  calculateDepthFromCode,
-  extractBatchType,
-} from '../../lib/graphUtils';
+import { extractBatchType } from '../../lib/graphUtils';
 import type {
   TraversalState,
   GraphNode,
@@ -52,8 +56,8 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
   const [rewindError, setRewindError] = useState<string | null>(null);
 
   // Refs
-  const controllerRef = useRef<AbortController | null>(null);
-  const rewindControllerRef = useRef<AbortController | null>(null);
+  const controllerRef = useRef<StreamHandle | null>(null);
+  const rewindControllerRef = useRef<StreamHandle | null>(null);
   const traverseNodesRef = useRef<GraphNode[]>([]);
   const traverseEdgesRef = useRef<GraphEdge[]>([]);
   const traverseDecisionsRef = useRef<DecisionPoint[]>([]);
@@ -62,6 +66,7 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
   const traverseHadNodesRef = useRef(false);
   const wasRewindRef = useRef(false);
   const wasZeroShotRef = useRef(false);
+  const currentReasoningRef = useRef('');
 
   // Fit-to-window logic (skip during rewind)
   useEffect(() => {
@@ -99,12 +104,12 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
     traverseLastInteractionRef.current = Date.now();
   }, []);
 
-  const handleTraverseEvent = useCallback((event: AGUIEvent) => {
+  const handleTraverseEvent = useCallback((event: BaseEvent) => {
     // Note: In strict mode, React invokes this twice.
     // Refs help avoid double-processing issues where possible.
 
     switch (event.type) {
-      case 'RUN_STARTED':
+      case EventType.RUN_STARTED:
         setTraverseTimerRunning(true);
         setState(prev => ({
           ...prev,
@@ -117,25 +122,92 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
         traverseEdgesRef.current = [];
         traverseDecisionsRef.current = [];
         traverseBatchCountRef.current = 0;
+        currentReasoningRef.current = '';
         break;
 
-      case 'STATE_SNAPSHOT':
-        if (event.snapshot) {
-          // GraphStateSnapshot already types nodes/edges correctly
-          const { nodes, edges } = event.snapshot;
+      // REASONING events carry LLM reasoning per step (AG-UI standard)
+      case EventType.REASONING_START:
+        currentReasoningRef.current = '';
+        break;
+
+      case EventType.REASONING_MESSAGE_CONTENT:
+        currentReasoningRef.current += (event as ReasoningMessageContentEvent).delta;
+        break;
+
+      case EventType.REASONING_MESSAGE_START:
+      case EventType.REASONING_MESSAGE_END:
+      case EventType.REASONING_END:
+        // Reasoning accumulated in ref, consumed by CUSTOM step_metadata handler
+        break;
+
+      case EventType.CUSTOM: {
+        const custom = event as CustomEvent;
+        if (custom.name === 'step_metadata') {
+          // Domain metadata — graph state already applied via STATE_DELTA
+          traverseBatchCountRef.current += 1;
+          setBatchCount(traverseBatchCountRef.current);
+
+          const metadata = custom.value as StepMetadata;
+          const candidates: Record<string, string> = metadata.candidates ?? {};
+          const selectedIds = metadata.selected_ids ?? [];
+          const nodeId = metadata.node_id ?? '';
+          const batchType = metadata.batch_type ?? 'children';
+          const selectedDetails = metadata.selected_details ?? {};
+
+          // Reasoning comes from REASONING events (AG-UI standard)
+          const reasoning = currentReasoningRef.current;
+
+          const selectedSet = new Set(selectedIds);
+          const candidateDecisions: CandidateDecision[] = Object.entries(candidates).map(
+            ([code, label]) => ({
+              code,
+              label,
+              selected: selectedSet.has(code),
+              confidence: selectedSet.has(code) ? 1.0 : 0.0,
+              evidence: null,
+              reasoning: selectedSet.has(code) ? reasoning : '',
+              billable: selectedDetails[code]?.billable ?? false,
+            })
+          );
+
+          const stepName = `${nodeId}|${batchType}`;
+          const decision: DecisionPoint = {
+            current_node: nodeId,
+            current_label: `${batchType} batch`,
+            depth: (stepName.split('|').length || 1),
+            candidates: candidateDecisions,
+            selected_codes: selectedIds,
+          };
+
+          traverseDecisionsRef.current.push(decision);
+
+          // Only update decision_history — graph state comes from STATE_DELTA
+          setState(prev => ({
+            ...prev,
+            decision_history: [...prev.decision_history, decision],
+          }));
+        }
+        // run_metadata CUSTOM event: nothing needed for traverse state
+        break;
+      }
+
+      case EventType.STATE_SNAPSHOT: {
+        const snapshot = (event as StateSnapshotEvent).snapshot as { nodes: GraphNode[]; edges: GraphEdge[] } | undefined;
+        if (snapshot) {
+          const { nodes, edges } = snapshot;
 
           traverseNodesRef.current = nodes;
           traverseEdgesRef.current = edges;
 
           // During rewind, prune decision_history and finalized_codes to match snapshot
           if (wasRewindRef.current) {
-            const snapshotNodeIds = new Set(nodes.map(n => n.id));
+            const snapshotNodeIds = new Set(nodes.map((n: GraphNode) => n.id));
             const prunedDecisions = traverseDecisionsRef.current.filter(
               d => snapshotNodeIds.has(d.current_node)
             );
             const prunedFinalized = nodes
-              .filter(n => n.category === 'finalized')
-              .map(n => n.id);
+              .filter((n: GraphNode) => n.category === 'finalized')
+              .map((n: GraphNode) => n.id);
 
             traverseDecisionsRef.current = prunedDecisions;
 
@@ -162,13 +234,11 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
           }
         }
         break;
+      }
 
-      case 'STATE_DELTA':
-        if (event.delta) {
-          // For delta updates, we need the LATEST state which might be in refs or state
-          // But useState is async, so refs are safer for "current world state" if we maintained them fully
-          // Here we use functional update to get latest 'prev' from React
-          // Include finalized array since backend may send patches for /finalized/-
+      case EventType.STATE_DELTA: {
+        const delta = (event as StateDeltaEvent).delta;
+        if (delta) {
           setState(prev => {
             try {
               const doc = {
@@ -176,7 +246,7 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
                 edges: prev.edges,
                 finalized: prev.finalized_codes,
               };
-              const result = applyPatch(doc, event.delta as Operation[], true, false);
+              const result = applyPatch(doc, delta as Operation[], true, false);
               const nextNodes = result.newDocument.nodes;
               const nextEdges = result.newDocument.edges;
               const nextFinalized = result.newDocument.finalized || prev.finalized_codes;
@@ -199,104 +269,38 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
           });
         }
         break;
+      }
 
-      case 'STEP_STARTED':
+      case EventType.STEP_STARTED:
         setState(prev => ({
           ...prev,
-          current_step: event.stepName || '',
+          current_step: (event as StepStartedEvent).stepName || '',
         }));
         break;
 
-      case 'STEP_FINISHED':
-        traverseBatchCountRef.current += 1;
-        setBatchCount(traverseBatchCountRef.current); // Sync for UI
-
-        if (event.metadata) {
-          const metadata: StepFinishedMetadata = event.metadata;
-          const candidates: Record<string, string> = metadata.candidates ?? {};
-          const selectedIds = metadata.selected_ids ?? [];
-          const reasoning = metadata.reasoning ?? '';
-          const nodeId = metadata.node_id ?? event.stepName;
-          const batchType = metadata.batch_type ?? 'children';
-          const selectedDetails = metadata.selected_details ?? {};
-
-          // Reconstruct nodes/edges logic
-          const edgeSource = nodeId && nodeId !== 'ROOT' ? nodeId : 'ROOT';
-          const isFromRoot = edgeSource === 'ROOT';
-
-          const newNodes: GraphNode[] = [];
-          const newEdges: GraphEdge[] = [];
-
-          for (const code of selectedIds) {
-            newNodes.push({
-              id: code,
-              code: code,
-              label: candidates[code] || code,
-              depth: calculateDepthFromCode(code),
-              category: (selectedDetails[code]?.category ?? 'ancestor') as GraphNode['category'],
-              billable: selectedDetails[code]?.billable ?? false,
-            });
-
-            newEdges.push({
-              source: edgeSource,
-              target: code,
-              edge_type: (isFromRoot || batchType === 'children') ? 'hierarchy' as const : 'lateral' as const,
-              rule: (isFromRoot || batchType === 'children') ? null : batchType,
-            });
-          }
-
-          const selectedSet = new Set(selectedIds);
-          const candidateDecisions: CandidateDecision[] = Object.entries(candidates).map(
-            ([code, label]) => ({
-              code,
-              label,
-              selected: selectedSet.has(code),
-              confidence: selectedSet.has(code) ? 1.0 : 0.0,
-              evidence: null,
-              reasoning: selectedSet.has(code) ? reasoning : '',
-              billable: selectedDetails[code]?.billable ?? false,
-            })
-          );
-
-          const decision: DecisionPoint = {
-            current_node: nodeId,
-            current_label: `${batchType} batch`,
-            depth: (event.stepName?.split('|').length || 1),
-            candidates: candidateDecisions,
-            selected_codes: selectedIds,
-          };
-
-          traverseDecisionsRef.current.push(decision);
-
-          setState(prev => ({
-            ...prev,
-            nodes: mergeById(prev.nodes, newNodes),
-            edges: mergeByKey(prev.edges, newEdges),
-            decision_history: [...prev.decision_history, decision],
-          }));
-        }
+      case EventType.STEP_FINISHED:
+        // Protocol-only event — domain data arrives in CUSTOM step_metadata
         break;
 
-      case 'RUN_ERROR':
-        // Handle dedicated error events (AG-UI protocol)
+      case EventType.RUN_ERROR:
         setTraverseTimerRunning(false);
         setState(prev => ({
           ...prev,
           status: 'error',
-          error: event.error,
+          error: (event as RunErrorEvent).message,
           current_step: 'Error',
         }));
         setIsLoading(false);
         break;
 
-      case 'RUN_FINISHED': {
-        const finishedMeta: RunFinishedMetadata | undefined = event.metadata;
-        const finalNodes = finishedMeta?.final_nodes ?? [];
+      case EventType.RUN_FINISHED: {
+        const result = (event as RunFinishedEvent).result as RunResult | undefined;
+        const finalNodes = result?.final_nodes ?? [];
 
         // Handle snapshot decisions if present (cached replays and rewinds)
-        const snapshotDecisions = finishedMeta?.decisions;
+        const snapshotDecisions = result?.decisions;
         if (snapshotDecisions && snapshotDecisions.length > 0) {
-          const decisions: DecisionPoint[] = snapshotDecisions.map(d => {
+          const decisions: DecisionPoint[] = snapshotDecisions.map((d: { node_id: string; batch_type: string; batch_id?: string; selected_ids: string[]; candidates: Record<string, string>; reasoning: string; selected_details?: Record<string, { depth?: number; category?: string; billable?: boolean }> }) => {
             const selectedSet = new Set(d.selected_ids);
             return {
               current_node: d.node_id,
