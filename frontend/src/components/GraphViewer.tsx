@@ -1345,8 +1345,8 @@ function GraphViewerInner({
         {status === 'idle' && nodes.filter(n => n.id !== 'ROOT').length === 0 && (
           <div className="empty-state absolute">
             <span className="empty-icon">📊</span>
-            <span className="empty-text">{benchmarkMode ? 'No benchmark data yet' : 'No traversal data yet'}</span>
-            <span className="empty-hint">{benchmarkMode ? 'Add expected codes and run a benchmark' : 'Enter a clinical note and start traversal'}</span>
+            <span className="empty-text">{benchmarkMode ? 'No benchmark data yet' : isTraversing ? 'No traversal data yet' : 'No ICD-10-CM codes provided'}</span>
+            <span className="empty-hint">{benchmarkMode ? 'Add expected codes and a clinical note, to benchmark a trajectory' : isTraversing ? 'Enter a clinical note and start traversal' : 'Add codes to visualize the diagnosis trajectory'}</span>
           </div>
         )}
         {isTraversing && nodes.filter(n => n.id !== 'ROOT').length === 0 && (

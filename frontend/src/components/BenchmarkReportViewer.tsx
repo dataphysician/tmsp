@@ -462,11 +462,17 @@ export function BenchmarkReportViewer({
 
   // Node lookup for hover labels
   const nodeMap = useMemo(() => {
-    if (!expectedGraph) return new Map<string, GraphNode>();
     const map = new Map<string, GraphNode>();
-    expectedGraph.nodes.forEach(n => map.set(n.id, n));
+    // Include traversed nodes so "Extra" codes have labels
+    if (traversedNodes) {
+      traversedNodes.forEach(n => map.set(n.id, n));
+    }
+    // Expected graph nodes override (higher priority)
+    if (expectedGraph) {
+      expectedGraph.nodes.forEach(n => map.set(n.id, n));
+    }
     return map;
-  }, [expectedGraph]);
+  }, [expectedGraph, traversedNodes]);
 
   const getNodeLabel = (code: string): string => {
     const node = nodeMap.get(code);

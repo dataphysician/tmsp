@@ -58,12 +58,10 @@ interface DFSPositionContext {
   chapterId: string;
 }
 
-/** Return value from positionWithRegion: tracks used bounds with/without lateral targets */
+/** Return value from positionWithRegion: tracks used bounds */
 interface PositionResult {
   usedLeft: number;
   usedRight: number;
-  /** Right bound of hierarchy content only (before lateral targets inflate it) */
-  hierarchyUsedRight: number;
 }
 
 // ============================================================================
@@ -257,10 +255,10 @@ export function calculatePositions(
       computeSubtreeBounds(targetId, new Set(visited));
     }
 
-    let lateralTargetsWidth = 0;
+    // Each lateral target gets one column of space — Phase 7 handles overflow
+    const lateralTargetsWidth = effectiveLateralTargets.length * (layoutWidth + nodePadding);
     for (const targetId of effectiveLateralTargets) {
-      const targetBounds = computeSubtreeBounds(targetId, new Set(visited));
-      lateralTargetsWidth += targetBounds.requiredWidth + nodePadding;
+      computeSubtreeBounds(targetId, new Set(visited));  // still needed for their own DFS regions
     }
 
     const hasEffectiveLaterals = effectiveLateralTargets.length > 0;
@@ -329,7 +327,7 @@ export function calculatePositions(
     if (positionedNodes.has(nodeId)) {
       const existingPos = positions.get(nodeId);
       if (existingPos) {
-        return { usedLeft: existingPos.x - layoutWidth / 2, usedRight: existingPos.x + layoutWidth / 2, hierarchyUsedRight: existingPos.x + layoutWidth / 2 };
+        return { usedLeft: existingPos.x - layoutWidth / 2, usedRight: existingPos.x + layoutWidth / 2 };
       }
     }
     positionedNodes.add(nodeId);
@@ -552,9 +550,6 @@ export function calculatePositions(
       }
     }
 
-    // Capture hierarchy-only used right before lateral positioning inflates it
-    const hierarchyUsedRight = usedRight;
-
     // Position effective lateral targets
     if (effectiveLateralTargets.length > 0) {
       let lateralX = usedRight + nodePadding + layoutWidth / 2;
@@ -636,7 +631,7 @@ export function calculatePositions(
       }
     }
 
-    return { usedLeft, usedRight, hierarchyUsedRight };
+    return { usedLeft, usedRight };
   }
 
   // Position each chapter
@@ -1127,7 +1122,7 @@ export function calculatePositions(
   // spacious pre-compaction layout. Now pack chapters tightly, re-align sevenChrDef
   // targets, and re-center chapters + ROOT.
 
-  // 1. Recalculate chapter boundaries from actual positions
+  // 1. Recalculate chapter boundaries from actual positions (exclude lateral targets for tighter packing)
   recalculateChapterBoundaries();
 
   // 2. Pack chapters from left edge (compact → resolve → recompact cycle)
@@ -1148,7 +1143,7 @@ export function calculatePositions(
     if (!resolveChapterCollisions()) break;
   }
 
-  // Recalculate and re-compact after resolution
+  // Recalculate and re-compact after resolution (exclude lateral targets for tighter packing)
   recalculateChapterBoundaries();
   compactTargetLeft = 50;
   for (const chapterId of sortedChapters) {

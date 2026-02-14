@@ -2457,6 +2457,9 @@ async def stream_traversal(run_input: RunAgentInput, http_request: Request):
                 )
                 yield encode_event(StateSnapshotEvent(snapshot=snapshot_state.model_dump()))
 
+                from agent.actions import print_finished_summary
+                print_finished_summary(batch_data, final_nodes, label="FINISHED! (CACHED)")
+
                 # Emit RUN_FINISHED with final_nodes and all decisions
                 print(f"[SERVER] Scaffolded complete (CACHED SNAPSHOT): {len(snapshot_nodes)} nodes, {len(snapshot_edges)} edges, {len(all_decisions)} decisions")
                 yield encode_event(RunFinishedEvent(
@@ -2551,10 +2554,14 @@ async def stream_traversal(run_input: RunAgentInput, http_request: Request):
             # RUN_FINISHED or RUN_ERROR - check if there was an LLM error
             batch_data = final_state.get("batch_data", {})
             root_reasoning = batch_data.get("ROOT", {}).get("reasoning", "")
-            llm_error = root_reasoning if root_reasoning.startswith("API Error:") else None
+            llm_error = root_reasoning if root_reasoning.startswith("API Error") else None
 
             cache_status = "CACHED" if is_cached else "NEW"
-            print(f"[SERVER] Scaffolded complete ({cache_status}): final_nodes={final_nodes}, batch_count={len(batch_data)}, error={bool(llm_error)}")
+            if llm_error:
+                error_type = llm_error.split("(", 1)[1].split(")", 1)[0] if "(" in llm_error and ")" in llm_error else "Unknown"
+                print(f"[SERVER] Scaffolded complete ({cache_status}): final_nodes={final_nodes}, batch_count={len(batch_data)}, error={error_type}")
+            else:
+                print(f"[SERVER] Scaffolded complete ({cache_status}): final_nodes={final_nodes}, batch_count={len(batch_data)}")
 
             if llm_error:
                 yield encode_event(RunErrorEvent(message=llm_error))
@@ -3349,9 +3356,13 @@ async def stream_rewind(run_input: RunAgentInput, http_request: Request):
 
             # Check for LLM API errors in the rewind batch (same pattern as stream_traversal)
             rewind_batch_reasoning = batch_data.get(request.batch_id, {}).get("reasoning", "")
-            llm_error = rewind_batch_reasoning if rewind_batch_reasoning.startswith("API Error:") else None
+            llm_error = rewind_batch_reasoning if rewind_batch_reasoning.startswith("API Error") else None
 
-            print(f"[REWIND] Complete: final_nodes={final_nodes}, error={bool(llm_error)}")
+            if llm_error:
+                error_type = llm_error.split("(", 1)[1].split(")", 1)[0] if "(" in llm_error and ")" in llm_error else "Unknown"
+                print(f"[REWIND] Complete: final_nodes={final_nodes}, error={error_type}")
+            else:
+                print(f"[REWIND] Complete: final_nodes={final_nodes}")
 
             if llm_error:
                 yield encode_event(RunErrorEvent(message=llm_error))

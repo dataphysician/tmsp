@@ -540,39 +540,76 @@ async def finish_batch(state: State) -> tuple[dict, State]:
     return {}, state.update(batch_data=batch_data, final_nodes=final_nodes)
 
 
-@action(reads=["batch_data", "final_nodes"], writes=[])
-async def finish(state: State) -> tuple[dict, State]:
-    """Terminal state - application ends here after all batches processed.
-
-    Displays cumulative statistics from ICD-10-CM traversal.
-    """
+def print_finished_summary(batch_data: dict, final_nodes: list, *, label: str = "FINISHED!") -> None:
+    """Print traversal summary (used by both live finish() and cached replay)."""
     print(f"\n{'=' * 60}")
-    print("FINISHED!")
+    print(label)
 
-    batch_data = state.get("batch_data", {})
-    final_nodes = state.get("final_nodes", [])
+    import candidate_selector.config as llm_config
+    if llm_config.LLM_CONFIG:
+        cfg = llm_config.LLM_CONFIG
+        extra_part = f", extra={cfg.extra}" if cfg.extra else ""
+        print(f"\nLLM CONFIG: provider={cfg.provider}, model={cfg.model}, temperature={cfg.temperature}, max_tokens={cfg.max_completion_tokens}{extra_part}")
 
     print("\nSTATE SUMMARY:")
     print(f"Total batches executed: {len(batch_data)}")
     print(f"Final leaf nodes: {len(final_nodes)}")
 
-    # Count by status
-    spawned = [
-        bid for bid, data in batch_data.items() if data.get("status") == "selected_candidates"
-    ]
-    terminated = [
-        bid for bid, data in batch_data.items() if data.get("status") == "terminated_by_selector"
-    ]
+    spawned = [bid for bid, data in batch_data.items() if data.get("status") == "selected_candidates"]
+    terminated = [bid for bid, data in batch_data.items() if data.get("status") == "terminated_by_selector"]
     print(f"Spawned children: {len(spawned)}")
     print(f"Terminated by selector: {len(terminated)}")
 
     print("\nBATCH DETAILS:")
-    for batch_id, data in batch_data.items():
-        print(
-            f"  {batch_id}: node_id={data.get('node_id')}, "
-            f"selected={data.get('selected_ids', [])}, "
-            f"status={data.get('status', '_processing_')}"
-        )
+
+    # Build node_id → list of batch entries for DFS traversal
+    node_batches: dict[str, list[tuple[str, dict]]] = {}
+    for bid, data in batch_data.items():
+        nid = data.get("node_id", bid)
+        node_batches.setdefault(nid, []).append((bid, data))
+
+    visited: set[str] = set()
+
+    def print_dfs(node_id: str, depth: int) -> None:
+        for bid, data in node_batches.get(node_id, []):
+            visited.add(bid)
+            indent = "  " * (depth + 1)
+            print(
+                f"{indent}{bid}: node_id={data.get('node_id')}, "
+                f"selected={data.get('selected_ids', [])}, "
+                f"status={data.get('status', '_processing_')}"
+            )
+        # Recurse into children of the `children` batch
+        children_bid = f"{node_id}|children" if node_id != "ROOT" else "ROOT"
+        children_data = batch_data.get(children_bid, {})
+        for child_id in children_data.get("selected_ids", []):
+            print_dfs(child_id, depth + 1)
+
+    print_dfs("ROOT", 0)
+
+    # Print any batches not reachable from ROOT (orphans, if any)
+    orphans = {bid: data for bid, data in batch_data.items() if bid not in visited}
+    if orphans:
+        print("  (unreachable batches):")
+        for bid, data in orphans.items():
+            depth = data.get("depth", 0)
+            indent = "  " * (depth + 1)
+            print(
+                f"{indent}{bid}: node_id={data.get('node_id')}, "
+                f"selected={data.get('selected_ids', [])}, "
+                f"status={data.get('status', '_processing_')}"
+            )
+
+    errors = [
+        (bid, data.get("reasoning", ""))
+        for bid, data in batch_data.items()
+        if data.get("reasoning", "").startswith("API Error")
+    ]
+    if errors:
+        print(f"\nERRORS ({len(errors)}):")
+        for bid, reason in errors:
+            error_type = reason.split("(", 1)[1].split(")", 1)[0] if "(" in reason and ")" in reason else "Unknown"
+            print(f"  {bid}: {error_type}")
 
     if final_nodes:
         print("\nFINAL LEAF NODES (ICD codes):")
@@ -580,4 +617,15 @@ async def finish(state: State) -> tuple[dict, State]:
             print(f"  {node_id}")
 
     print(f"{'=' * 60}\n")
+
+
+@action(reads=["batch_data", "final_nodes"], writes=[])
+async def finish(state: State) -> tuple[dict, State]:
+    """Terminal state - application ends here after all batches processed.
+
+    Displays cumulative statistics from ICD-10-CM traversal.
+    """
+    batch_data = state.get("batch_data", {})
+    final_nodes = state.get("final_nodes", [])
+    print_finished_summary(batch_data, final_nodes)
     return {}, state

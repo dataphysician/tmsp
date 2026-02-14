@@ -737,12 +737,14 @@ async def llm_selector(
     except Exception as e:
         import traceback
         error_message = str(e)
+        root = e.__context__ or e
+        error_type = f"{type(root).__module__}.{type(root).__name__}"
         print(f"[LLM SELECTOR ERROR] {error_message}")
         print("[LLM SELECTOR TRACEBACK]")
         traceback.print_exc()
         print("[LLM SELECTOR] Returning empty selection")
 
-        reasoning = f"API Error: {error_message}. Returned empty selection."
+        reasoning = f"API Error ({error_type}): {error_message}. Returned empty selection."
         return ([], reasoning)
 
 
@@ -801,12 +803,14 @@ async def zero_shot_selector(
     except Exception as e:
         import traceback
         error_message = str(e)
+        root = e.__context__ or e
+        error_type = f"{type(root).__module__}.{type(root).__name__}"
         print(f"[ZERO-SHOT ERROR] {error_message}")
         print("[ZERO-SHOT TRACEBACK]")
         traceback.print_exc()
         print("[ZERO-SHOT] Returning empty result")
 
-        reasoning = f"API Error: {error_message}. Zero-shot generation failed."
+        reasoning = f"API Error ({error_type}): {error_message}. Zero-shot generation failed."
         return ([], reasoning)
 
 
