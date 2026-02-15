@@ -71,7 +71,7 @@ Compare expected codes against traversal results. Metrics include:
 
 ```bash
 npm install      # Install dependencies
-npm run dev      # Start dev server (http://localhost:5173)
+npm run dev      # Start dev server (http://localhost:3000)
 npm run build    # Production build
 npm run lint     # Run ESLint
 ```

@@ -540,6 +540,63 @@ async def finish_batch(state: State) -> tuple[dict, State]:
     return {}, state.update(batch_data=batch_data, final_nodes=final_nodes)
 
 
+def print_batch_dfs(
+    batch_data: dict,
+    *,
+    start_node: str = "ROOT",
+    base_depth: int = 0,
+    scope: dict | None = None,
+) -> None:
+    """Print DFS trace of batch data with depth-based indentation.
+
+    Args:
+        batch_data: Full batch_data dict (needed for DFS traversal via selected_ids).
+        start_node: Node to start DFS from (default ROOT).
+        base_depth: Depth of start_node (used to compute indentation).
+        scope: If provided, only print batches whose batch_id is in this dict.
+               Batches outside scope are still traversed for DFS structure but not printed.
+    """
+    target = scope if scope is not None else batch_data
+
+    # Build node_id → list of batch entries
+    node_batches: dict[str, list[tuple[str, dict]]] = {}
+    for bid, bdata in target.items():
+        nid = bdata.get("node_id", bid)
+        node_batches.setdefault(nid, []).append((bid, bdata))
+
+    visited: set[str] = set()
+
+    def _dfs(node_id: str, depth: int) -> None:
+        for bid, bdata in node_batches.get(node_id, []):
+            visited.add(bid)
+            indent = "  " * (depth - base_depth + 1)
+            print(
+                f"{indent}{bid}: node_id={bdata.get('node_id')}, "
+                f"selected={bdata.get('selected_ids', [])}, "
+                f"status={bdata.get('status', '_processing_')}"
+            )
+        # Recurse into children — use full batch_data for structure
+        children_bid = f"{node_id}|children" if node_id != "ROOT" else "ROOT"
+        children_data = batch_data.get(children_bid, {})
+        for child_id in children_data.get("selected_ids", []):
+            _dfs(child_id, depth + 1)
+
+    _dfs(start_node, base_depth)
+
+    # Orphans: batches in scope not reached by DFS
+    orphans = {bid: bdata for bid, bdata in target.items() if bid not in visited}
+    if orphans:
+        print("  (unreachable batches):")
+        for bid, bdata in orphans.items():
+            depth = bdata.get("depth", 0)
+            indent = "  " * (depth - base_depth + 1)
+            print(
+                f"{indent}{bid}: node_id={bdata.get('node_id')}, "
+                f"selected={bdata.get('selected_ids', [])}, "
+                f"status={bdata.get('status', '_processing_')}"
+            )
+
+
 def print_finished_summary(batch_data: dict, final_nodes: list, *, label: str = "FINISHED!") -> None:
     """Print traversal summary (used by both live finish() and cached replay)."""
     print(f"\n{'=' * 60}")
@@ -561,44 +618,7 @@ def print_finished_summary(batch_data: dict, final_nodes: list, *, label: str = 
     print(f"Terminated by selector: {len(terminated)}")
 
     print("\nBATCH DETAILS:")
-
-    # Build node_id → list of batch entries for DFS traversal
-    node_batches: dict[str, list[tuple[str, dict]]] = {}
-    for bid, data in batch_data.items():
-        nid = data.get("node_id", bid)
-        node_batches.setdefault(nid, []).append((bid, data))
-
-    visited: set[str] = set()
-
-    def print_dfs(node_id: str, depth: int) -> None:
-        for bid, data in node_batches.get(node_id, []):
-            visited.add(bid)
-            indent = "  " * (depth + 1)
-            print(
-                f"{indent}{bid}: node_id={data.get('node_id')}, "
-                f"selected={data.get('selected_ids', [])}, "
-                f"status={data.get('status', '_processing_')}"
-            )
-        # Recurse into children of the `children` batch
-        children_bid = f"{node_id}|children" if node_id != "ROOT" else "ROOT"
-        children_data = batch_data.get(children_bid, {})
-        for child_id in children_data.get("selected_ids", []):
-            print_dfs(child_id, depth + 1)
-
-    print_dfs("ROOT", 0)
-
-    # Print any batches not reachable from ROOT (orphans, if any)
-    orphans = {bid: data for bid, data in batch_data.items() if bid not in visited}
-    if orphans:
-        print("  (unreachable batches):")
-        for bid, data in orphans.items():
-            depth = data.get("depth", 0)
-            indent = "  " * (depth + 1)
-            print(
-                f"{indent}{bid}: node_id={data.get('node_id')}, "
-                f"selected={data.get('selected_ids', [])}, "
-                f"status={data.get('status', '_processing_')}"
-            )
+    print_batch_dfs(batch_data)
 
     errors = [
         (bid, data.get("reasoning", ""))
@@ -616,6 +636,33 @@ def print_finished_summary(batch_data: dict, final_nodes: list, *, label: str = 
         for node_id in final_nodes:
             print(f"  {node_id}")
 
+    print(f"{'=' * 60}\n")
+
+
+def print_rewind_summary(
+    batch_data: dict,
+    final_nodes: list,
+    rewind_batch_id: str,
+    pruned_batch_ids: set[str],
+) -> None:
+    """Print DFS trace of revised batches from a rewind traversal."""
+    revised = {
+        bid: bdata for bid, bdata in batch_data.items()
+        if bid not in pruned_batch_ids or bid == rewind_batch_id
+    }
+    if not revised:
+        print("\n[REWIND] No revised batches")
+        return
+
+    rewind_node = rewind_batch_id.rsplit("|", 1)[0] if "|" in rewind_batch_id else rewind_batch_id
+    rewind_data = batch_data.get(rewind_batch_id, {})
+    base_depth = rewind_data.get("depth", 1)
+
+    print(f"\n{'=' * 60}")
+    print(f"REWIND from {rewind_batch_id}")
+    print(f"Revised batches: {len(revised)}")
+    print("\nREVISED BATCH DETAILS:")
+    print_batch_dfs(batch_data, start_node=rewind_node, base_depth=base_depth, scope=revised)
     print(f"{'=' * 60}\n")
 
 

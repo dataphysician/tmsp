@@ -224,13 +224,6 @@ export function useTraverseState({ llmConfig, setSidebarTab }: UseTraverseStateP
               nodes,
               edges,
             }));
-
-            // Trigger fit-to-window for cached replays (all nodes arrive at once)
-            if (nodes && nodes.length > 0) {
-              setTimeout(() => {
-                setTraverseFitTrigger(prev => prev + 1);
-              }, 350);
-            }
           }
         }
         break;

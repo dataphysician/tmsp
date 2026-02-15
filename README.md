@@ -171,6 +171,8 @@ During a single traversal, identical selection requests return cached results. T
 
 ### Backend
 
+Requires Python 3.12+.
+
 ```bash
 # Core dependencies
 uv sync

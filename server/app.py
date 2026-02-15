@@ -288,22 +288,37 @@ class EdgeDict(TypedDict):
 def build_graph_from_batch_data(
     batch_data: dict[str, dict],
     final_nodes: list[str],
+    *,
+    previous: tuple[list[NodeDict], list[EdgeDict], set[str], set[tuple[str, str]]] | None = None,
+    only_batch_ids: set[str] | None = None,
 ) -> tuple[list[NodeDict], list[EdgeDict], set[str], set[tuple[str, str]]]:
     """Build graph nodes and edges from batch_data.
 
-    Used for both cached replay snapshots and pre-rewind state snapshots.
+    Supports both full builds and incremental appends:
+    - Full build (previous=None): Creates ROOT node, processes all batches.
+    - Incremental (previous=state, only_batch_ids={id}): Appends only new
+      batches to previous state. Dedup via seen_nodes/seen_edges is automatic.
 
     Args:
         batch_data: Dict mapping batch_id -> batch info with node_id, selected_ids, etc.
         final_nodes: List of finalized code IDs.
+        previous: Optional prior state to append to (nodes, edges, seen_nodes, seen_edges).
+        only_batch_ids: If set, only process these batch IDs (skip others).
 
     Returns:
         Tuple of (nodes_list, edges_list, seen_nodes_set, seen_edges_set)
     """
-    nodes: list[NodeDict] = [{"id": "ROOT", "code": "ROOT", "label": "ROOT", "depth": 0, "category": "root", "billable": False}]
-    edges: list[EdgeDict] = []
-    seen_nodes: set[str] = {"ROOT"}
-    seen_edges: set[tuple[str, str]] = set()
+    if previous is not None:
+        prev_nodes, prev_edges, prev_seen_nodes, prev_seen_edges = previous
+        nodes = list(prev_nodes)
+        edges = list(prev_edges)
+        seen_nodes = set(prev_seen_nodes)
+        seen_edges = set(prev_seen_edges)
+    else:
+        nodes = [{"id": "ROOT", "code": "ROOT", "label": "ROOT", "depth": 0, "category": "root", "billable": False}]
+        edges = []
+        seen_nodes = {"ROOT"}
+        seen_edges = set()
     final_nodes_set = set(final_nodes)
 
     # Sort batches by depth to ensure parents are processed before children
@@ -313,6 +328,8 @@ def build_graph_from_batch_data(
     )
 
     for batch_id, batch_info in sorted_batches:
+        if only_batch_ids is not None and batch_id not in only_batch_ids:
+            continue
         node_id = batch_info.get("node_id")
         parent_id = batch_info.get("parent_id")
         depth = batch_info.get("depth", 0)
@@ -432,6 +449,23 @@ def build_graph_from_batch_data(
                         "source": prev_node, "target": full_code,
                         "edge_type": "lateral", "rule": "sevenChrDef",
                     })
+            else:
+                # Empty sevenChrDef selection — create placeholder for missing 7th char
+                missing_code = f"{node_id}?"
+                if missing_code not in seen_nodes:
+                    seen_nodes.add(missing_code)
+                    nodes.append({
+                        "id": missing_code, "code": missing_code,
+                        "label": "Missing Seventh Character Extension",
+                        "depth": 7, "category": "placeholder", "billable": False,
+                    })
+                edge_key = (node_id, missing_code)
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    edges.append({
+                        "source": node_id, "target": missing_code,
+                        "edge_type": "lateral", "rule": "sevenChrDef",
+                    })
 
         # Regular batches (children, codeFirst, codeAlso, etc.)
         elif batch_type != "sevenChrDef":
@@ -532,6 +566,77 @@ def build_graph_from_batch_data(
                             })
 
     return nodes, edges, seen_nodes, seen_edges
+
+
+def build_decisions_from_batch_data(batch_data: dict[str, dict]) -> list[dict]:
+    """Build decision history from batch_data for RUN_FINISHED result.
+
+    Shared by cached replay and rewind endpoints — eliminates duplication.
+
+    Args:
+        batch_data: Dict mapping batch_id -> batch info.
+
+    Returns:
+        List of decision dicts with transformed selected_ids and candidates.
+    """
+    all_decisions: list[dict] = []
+    sorted_batches = sorted(batch_data.items(), key=lambda x: x[1].get("depth", 0))
+
+    for batch_id, batch_info in sorted_batches:
+        node_id = batch_info.get("node_id")
+        candidates = batch_info.get("candidates", {})
+        selected_ids = batch_info.get("selected_ids", [])
+        reasoning = batch_info.get("reasoning", "")
+        seven_chr_authority = batch_info.get("seven_chr_authority")
+        depth = batch_info.get("depth", 0)
+        batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
+
+        # Transform selected_ids for sevenChrDef
+        transformed_selected_ids = selected_ids
+        if batch_type == "sevenChrDef" and node_id and selected_ids:
+            transformed_selected_ids = [format_with_seventh_char(node_id, char) for char in selected_ids]
+
+        # Transform candidates for sevenChrDef
+        step_candidates = candidates
+        if batch_type == "sevenChrDef" and node_id:
+            step_candidates = {}
+            for char, desc in candidates.items():
+                transformed_code = format_with_seventh_char(node_id, char)
+                step_candidates[transformed_code] = f"{char}: {desc}"
+
+        # Compute selected_details
+        selected_details: dict[str, dict] = {}
+        for code in transformed_selected_ids:
+            code_data = data.get(code, {})
+            if node_has_seven_chr_def(code):
+                cat = "activator"
+            elif "X" in code:
+                cat = "placeholder"
+            else:
+                cat = "ancestor"
+
+            code_depth = code_data.get("depth", depth + 1) if code in data else depth + 1
+            has_children = bool(code_data.get("children"))
+            is_activator = cat == "activator"
+            billable = not has_children and not (seven_chr_authority is not None) and not is_activator
+
+            selected_details[code] = {
+                "depth": code_depth,
+                "category": cat,
+                "billable": billable,
+            }
+
+        all_decisions.append({
+            'batch_id': batch_id,
+            'node_id': node_id,
+            'batch_type': batch_type,
+            'candidates': step_candidates,
+            'selected_ids': transformed_selected_ids,
+            'reasoning': reasoning,
+            'selected_details': selected_details,
+        })
+
+    return all_decisions
 
 
 # --- FastAPI App ---
@@ -1233,24 +1338,12 @@ async def stream_traversal(run_input: RunAgentInput, http_request: Request):
     # Queue for streaming events
     event_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-    # Track seen nodes to avoid duplicates - dict maps node_id -> index for updates
-    seen_nodes: dict[str, int] = {"ROOT": 0}
-    node_count = 1  # ROOT is index 0
-    seen_edges: set[tuple[str, str]] = set()
+    # Incremental graph state — build_graph_from_batch_data accumulates here
+    accumulated_batch_data: dict[str, dict] = {}
+    graph_state: tuple[list[NodeDict], list[EdgeDict], set[str], set[tuple[str, str]]] | None = None
     seen_batches: set[str] = set()  # Track processed batches to avoid duplicate events
 
-    # Helper to format 7th character code (same logic as actions.py)
-    def format_with_seventh_char(base_code: str, seventh_char: str) -> str:
-        """Format ICD-10-CM code with 7th character and placeholder padding."""
-        if "." in base_code:
-            category, subcategory = base_code.split(".", 1)
-        else:
-            category = base_code[:3] if len(base_code) >= 3 else base_code
-            subcategory = base_code[3:] if len(base_code) > 3 else ""
-        padded_subcategory = subcategory.ljust(3, "X") + seventh_char
-        return f"{category}.{padded_subcategory}"
-
-    # Batch callback to emit AG-UI events
+    # Batch callback to emit AG-UI events via STATE_SNAPSHOT
     def on_batch_complete(
         batch_id: str,
         node_id: str | None,
@@ -1259,514 +1352,70 @@ async def stream_traversal(run_input: RunAgentInput, http_request: Request):
         candidates: dict[str, str],
         selected_ids: list[str],
         reasoning: str,
-        seven_chr_authority: dict | None = None,  # {"batch_name": str, "resolution_pattern": str}
+        seven_chr_authority: dict | None = None,
     ):
-        nonlocal node_count
+        nonlocal graph_state
         print(f"[CALLBACK] on_batch_complete called: batch_id={batch_id}, selected_ids={selected_ids}")
 
-        # Skip duplicate batch callbacks (can occur when multiple parallel paths reach same node)
+        # Skip duplicate batch callbacks
         if batch_id in seen_batches:
             print(f"[CALLBACK] SKIP DUPLICATE: batch_id={batch_id} already processed")
             return
         seen_batches.add(batch_id)
-
-        # Parse batch_type from batch_id
         batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
 
         # STEP_STARTED
-        event_queue.put_nowait(encode_event(
-            StepStartedEvent(step_name=batch_id)
-        ))
+        event_queue.put_nowait(encode_event(StepStartedEvent(step_name=batch_id)))
 
-        # STATE_DELTA - add nodes and edges
-        ops: list[JsonPatchOp] = []
+        # Accumulate batch data and build graph incrementally → STATE_SNAPSHOT
+        accumulated_batch_data[batch_id] = {
+            "node_id": node_id, "parent_id": parent_id, "depth": depth,
+            "candidates": candidates, "selected_ids": selected_ids,
+            "seven_chr_authority": seven_chr_authority,
+        }
+        graph_state = build_graph_from_batch_data(
+            accumulated_batch_data, [],
+            previous=graph_state, only_batch_ids={batch_id},
+        )
+        snapshot = GraphState(
+            nodes=[GraphNode(**n) for n in graph_state[0]],
+            edges=[GraphEdge(**e) for e in graph_state[1]],
+        )
+        event_queue.put_nowait(encode_event(StateSnapshotEvent(snapshot=snapshot.model_dump())))
 
-        # Collect batch-specific nodes/edges for STEP_FINISHED (reconciliation)
-        # These are collected regardless of deduplication to ensure complete data
-        batch_nodes: list[dict] = []
-        batch_edges: list[dict] = []
-
-        # For sevenChrDef batches, first ensure the base placeholder node itself is in the graph
-        # This handles cases like T84.53X|sevenChrDef where T84.53X is a synthetic placeholder
-        if batch_type == "sevenChrDef" and node_id and node_id not in seen_nodes:
-            # Add the placeholder/activator node itself
-            seen_nodes[node_id] = node_count
-            node_count += 1
-
-            # Determine node properties
-            if node_id in data:
-                node_label = data[node_id].get("label", node_id)
-                node_depth = data[node_id].get("depth", depth)
-                node_category = "activator" if node_has_seven_chr_def(node_id) else "ancestor"
-            else:
-                # Synthetic placeholder node (not in ICD index)
-                node_label = "Placeholder"
-                node_depth = depth
-                node_category = "placeholder"
-
-            base_node_data = {
-                "id": node_id,
-                "code": node_id,
-                "label": node_label,
-                "depth": node_depth,
-                "category": node_category,
-                "billable": False,
-            }
-            ops.append(JsonPatchOp(op="add", path="/nodes/-", value=base_node_data))
-            batch_nodes.append(base_node_data)
-
-            # Add edge from parent to this node
-            # Check if parent_id is the actual ICD-10 parent
-            if parent_id and parent_id != node_id:
-                edge_key = (parent_id, node_id)
-                if edge_key not in seen_edges:
-                    seen_edges.add(edge_key)
-                    is_hier = is_hierarchy_edge(parent_id, node_id)
-                    base_edge_data = {
-                        "source": parent_id,
-                        "target": node_id,
-                        "edge_type": "hierarchy" if is_hier else "lateral",
-                        "rule": None,
-                    }
-                    ops.append(JsonPatchOp(op="add", path="/edges/-", value=base_edge_data))
-                    batch_edges.append(base_edge_data)
-
-        # Special handling for sevenChrDef batches:
-        # - selected_ids contains full codes (e.g., ["T36.1X5A"]) - transformed by actions.py
-        # - For codes at depth 3-5, create placeholder nodes (with X padding) until depth 6
-        # - The 7th char node is added via lateral edge from the depth-6 node
-        if batch_type == "sevenChrDef" and selected_ids and node_id:
-            # Extract the 7th character from selected_ids (last char of full code)
-            seventh_char = selected_ids[0][-1] if selected_ids[0] else ""
-
-            # CRITICAL FIX: Compute full_code from node_id + 7th char
-            # This ensures the code matches the batch's node, preventing cross-batch contamination
-            if "." in node_id:
-                base_category, base_subcategory = node_id.split(".", 1)
-            else:
-                base_category = node_id[:3] if len(node_id) >= 3 else node_id
-                base_subcategory = node_id[3:] if len(node_id) > 3 else ""
-            # Pad subcategory to 3 chars and add 7th character
-            full_code = f"{base_category}.{base_subcategory.ljust(3, 'X')}{seventh_char}"
-
-            # Get base code depth to determine if placeholder nodes are needed
-            base_depth = data.get(node_id, {}).get("depth", depth)
-
-            # Create placeholder nodes if base code is shorter than depth 6
-            # ICD-10-CM format: XXX.XXXX where 7th char is position 4 after dot
-            # Depth 3 = category (T36), depth 4 = 4-char (T36.1), depth 5 = 5-char (T36.1X)
-            # depth 6 = 6-char (T36.1X5), depth 7 = 7-char (T36.1X5A)
-            prev_node = node_id
-            print(f"[SEVENCHRDEF] node_id={node_id}, full_code={full_code}, base_depth={base_depth}, seventh_char={seventh_char}")
-            if base_depth < 6:
-                # Parse base code to determine how many X's to add
-                if "." in node_id:
-                    category, subcategory = node_id.split(".", 1)
-                else:
-                    category = node_id[:3] if len(node_id) >= 3 else node_id
-                    subcategory = node_id[3:] if len(node_id) > 3 else ""
-
-                # Create placeholder nodes from current length to depth 6
-                current_sub = subcategory
-                print(f"[SEVENCHRDEF] Creating placeholders: subcategory={subcategory}, range({len(subcategory)}, 3)")
-                for i in range(len(subcategory), 3):  # Pad to 3 chars (positions 4-6)
-                    current_sub += "X"
-                    placeholder_code = f"{category}.{current_sub}"
-                    placeholder_depth = base_depth + (i - len(subcategory) + 1)
-                    print(f"[SEVENCHRDEF] Creating placeholder: {placeholder_code} at depth {placeholder_depth}, prev_node={prev_node}")
-
-                    # Always collect for batch data (reconciliation)
-                    placeholder_node_data = {
-                        "id": placeholder_code,
-                        "code": placeholder_code,
-                        "label": "Placeholder",
-                        "depth": placeholder_depth,
-                        "category": "placeholder",
-                        "billable": False,
-                    }
-                    batch_nodes.append(placeholder_node_data)
-
-                    # Edges TO placeholder nodes are hierarchy (not lateral)
-                    # Placeholders can still open other parallel pathways
-                    placeholder_edge_data = {
-                        "source": prev_node,
-                        "target": placeholder_code,
-                        "edge_type": "hierarchy",
-                        "rule": None,
-                    }
-                    batch_edges.append(placeholder_edge_data)
-
-                    # STATE_DELTA ops (with deduplication for streaming)
-                    if placeholder_code not in seen_nodes:
-                        seen_nodes[placeholder_code] = node_count
-                        node_count += 1
-                        ops.append(JsonPatchOp(
-                            op="add",
-                            path="/nodes/-",
-                            value=placeholder_node_data,
-                        ))
-
-                    # Edge creation is OUTSIDE node check - edges need to be created
-                    # even if node already exists (e.g., created by placeholder children batch)
-                    edge_key = (prev_node, placeholder_code)
-                    if edge_key not in seen_edges:
-                        seen_edges.add(edge_key)
-                        ops.append(JsonPatchOp(
-                            op="add",
-                            path="/edges/-",
-                            value=placeholder_edge_data,
-                        ))
-
-                    prev_node = placeholder_code
-
-            # Create the final 7th character node
-            # candidates is keyed by full code (transformed by actions.py), e.g. {"T36.1X5A": "description"}
-            label = f"{seventh_char}: {candidates.get(full_code, seventh_char)}"
-
-            # Use prev_node as edge source - it's the depth-6 node computed from node_id
-            # (either the original node_id if already depth 6, or the last placeholder created)
-            # This is now consistent with full_code since both are derived from node_id
-            correct_edge_source = prev_node
-
-            # Ensure the parent node exists in the graph (create placeholder if needed)
-            if correct_edge_source not in seen_nodes:
-                seen_nodes[correct_edge_source] = node_count
-                node_count += 1
-                parent_depth = 6  # 7th char parent is always depth 6
-                parent_node_data = {
-                    "id": correct_edge_source,
-                    "code": correct_edge_source,
-                    "label": "Placeholder" if correct_edge_source.endswith("X") else data.get(correct_edge_source, {}).get("label", correct_edge_source),
-                    "depth": parent_depth,
-                    "category": "placeholder" if correct_edge_source.endswith("X") else "ancestor",
-                    "billable": False,
-                }
-                ops.append(JsonPatchOp(op="add", path="/nodes/-", value=parent_node_data))
-                batch_nodes.append(parent_node_data)
-
-            # Always collect for batch data (reconciliation)
-            final_node_data = {
-                "id": full_code,
-                "code": full_code,
-                "label": label,
-                "depth": 7,
-                "category": "finalized",
-                "billable": True,
-            }
-            batch_nodes.append(final_node_data)
-
-            final_edge_data = {
-                "source": correct_edge_source,
-                "target": full_code,
-                "edge_type": "lateral",
-                "rule": "sevenChrDef",
-            }
-            batch_edges.append(final_edge_data)
-
-            # STATE_DELTA ops (with deduplication for streaming)
-            if full_code not in seen_nodes:
-                seen_nodes[full_code] = node_count
-                node_count += 1
-                ops.append(JsonPatchOp(
-                    op="add",
-                    path="/nodes/-",
-                    value=final_node_data,
-                ))
-                # Note: Don't add to /finalized/- here - authoritative count comes from RUN_FINISHED
-
-                edge_key = (correct_edge_source, full_code)
-                if edge_key not in seen_edges:
-                    seen_edges.add(edge_key)
-                    ops.append(JsonPatchOp(
-                        op="add",
-                        path="/edges/-",
-                        value=final_edge_data,
-                    ))
-
-        elif batch_type == "sevenChrDef" and not selected_ids and node_id:
-            # Create a placeholder node for missing 7th character at depth 7
-            # This IS a placeholder - standing in for the real 7th char code (T84.53XA, etc.)
-            missing_code = f"{node_id}?"  # Use ? suffix for missing 7th char
-            print(f"[SEVENCHRDEF] Empty selection for {node_id}, creating placeholder: {missing_code}")
-
-            if missing_code not in seen_nodes:
-                seen_nodes[missing_code] = node_count
-                node_count += 1
-
-                missing_node_data = {
-                    "id": missing_code,
-                    "code": missing_code,
-                    "label": "Missing Seventh Character Extension",
-                    "depth": 7,  # Always depth 7 for 7th char
-                    "category": "placeholder",  # It IS a placeholder (synthetic node)
-                    "billable": False,
-                }
-                ops.append(JsonPatchOp(op="add", path="/nodes/-", value=missing_node_data))
-                batch_nodes.append(missing_node_data)
-
-            # Edge from depth-6 node to placeholder
-            edge_key = (node_id, missing_code)
-            if edge_key not in seen_edges:
-                seen_edges.add(edge_key)
-                missing_edge_data = {
-                    "source": node_id,
-                    "target": missing_code,
-                    "edge_type": "lateral",
-                    "rule": "sevenChrDef",
-                }
-                ops.append(JsonPatchOp(op="add", path="/edges/-", value=missing_edge_data))
-                batch_edges.append(missing_edge_data)
-
-        else:
-            # Regular batches (children, codeFirst, codeAlso, etc.)
-            print(f"[BATCH] Processing {batch_id}: node_id={node_id}, selected_ids={selected_ids}")
-
-            # Note: Empty children selection means the parent is a terminal node, but
-            # we don't mark it as "finalized" here because terminal ≠ billable/submittable.
-            # The authoritative final_nodes list comes from RUN_FINISHED.
-
-            # For children batches, add the current node_id to the graph as a traversed node.
-            # This ensures the traversal path is recorded, not just the selected children.
-            # This is critical for:
-            # - Placeholder batches spawned by SpawnSevenChr (T36.1X, T36.1XX, etc.)
-            # - Regular nodes where LLM selected nothing but node was still traversed
-            if (
-                batch_type == "children"
-                and node_id
-                and node_id != "ROOT"
-                and node_id not in seen_nodes
-            ):
-                seen_nodes[node_id] = node_count
-                node_count += 1
-
-                # Determine node properties
-                if node_id in data:
-                    node_label = data[node_id].get("label", node_id)
-                    node_depth = data[node_id].get("depth", depth)
-                else:
-                    node_label = "Placeholder" if node_id.endswith("X") else node_id
-                    node_depth = depth
-
-                # Determine category
-                if node_has_seven_chr_def(node_id):
-                    node_category = "activator"
-                elif node_id not in data and node_id.endswith("X"):
-                    node_category = "placeholder"
-                else:
-                    node_category = "ancestor"
-
-                traversed_node_data = {
-                    "id": node_id,
-                    "code": node_id,
-                    "label": node_label,
-                    "depth": node_depth,
-                    "category": node_category,
-                    "billable": False,  # Traversed nodes aren't billable (finalized ones are)
-                }
-                ops.append(JsonPatchOp(
-                    op="add",
-                    path="/nodes/-",
-                    value=traversed_node_data,
-                ))
-                batch_nodes.append(traversed_node_data)
-
-                # Add edge from parent to this node
-                # Check if parent_id is the actual ICD-10 parent
-                if parent_id and parent_id != node_id:
-                    edge_key = (parent_id, node_id)
-                    if edge_key not in seen_edges:
-                        seen_edges.add(edge_key)
-                        is_hier = is_hierarchy_edge(parent_id, node_id)
-                        traversed_edge_data = {
-                            "source": parent_id,
-                            "target": node_id,
-                            "edge_type": "hierarchy" if is_hier else "lateral",
-                            "rule": None,
-                        }
-                        ops.append(JsonPatchOp(
-                            op="add",
-                            path="/edges/-",
-                            value=traversed_edge_data,
-                        ))
-                        batch_edges.append(traversed_edge_data)
-
-                print(f"[TRAVERSED] Added traversed node: {node_id} at depth {node_depth} (category: {node_category})")
-
-            for code in selected_ids:
-                # Add node only if not already seen
-                print(f"[DEDUP] code={code}: in_seen_nodes={code in seen_nodes}")
-                if code not in seen_nodes:
-                    seen_nodes[code] = node_count
-                    node_count += 1
-                    label = candidates.get(code, code)
-
-                    # Always prefer actual ICD depth from data when available
-                    # Fall back to traversal depth + 1 only if not in ICD index
-                    if code in data:
-                        node_depth = data[code].get("depth", depth + 1)
-                    else:
-                        node_depth = depth + 1
-
-                    # Determine category (matches archive styling):
-                    # - "activator" (blue border) for nodes with sevenChrDef metadata
-                    # - "placeholder" (gray dashed) for synthetic codes not in index
-                    # - "ancestor" for all other nodes
-                    if node_has_seven_chr_def(code):
-                        category = "activator"
-                    elif code not in data and code.endswith("X"):
-                        category = "placeholder"
-                    else:
-                        category = "ancestor"
-
-                    # Billable only if:
-                    # - Node has no children in ICD hierarchy
-                    # - Node does NOT have a sevenChrDef authority (nodes with authority need 7th char)
-                    # - Node itself does NOT have sevenChrDef (activator nodes need 7th char selection)
-                    has_children = bool(data.get(code, {}).get("children"))
-                    has_authority = seven_chr_authority is not None
-                    is_activator = category == "activator"
-                    # A node with sevenChrDef authority OR that is an activator is NOT billable
-                    # because the actual billable code will be the 7th character extension
-                    billable = not has_children and not has_authority and not is_activator
-
-                    ops.append(JsonPatchOp(
-                        op="add",
-                        path="/nodes/-",
-                        value={
-                            "id": code,
-                            "code": code,
-                            "label": label,
-                            "depth": node_depth,
-                            "category": category,
-                            "billable": billable,
-                        }
-                    ))
-
-                # Add edge OUTSIDE the node check - allows multiple edges to same node
-                # For children batches: source is the parent node
-                # For lateral batches: source is the node with the metadata
-                edge_source = node_id if node_id and node_id != "ROOT" else "ROOT"
-
-                edge_key = (edge_source, code)
-
-                # Determine edge type:
-                # - "lateral" for non-children batches (codeFirst, codeAlso, etc.)
-                # - "hierarchy" for regular children
-                if batch_type != "children":
-                    edge_type = "lateral"
-                    rule = batch_type
-                else:
-                    edge_type = "hierarchy"
-                    rule = None
-
-                is_seen = edge_key in seen_edges
-                print(f"[EDGE] {edge_source} -> {code}: batch_type={batch_type}, edge_type={edge_type}, seen={is_seen}")
-
-                if not is_seen:
-                    seen_edges.add(edge_key)
-                    ops.append(JsonPatchOp(
-                        op="add",
-                        path="/edges/-",
-                        value={
-                            "source": edge_source,
-                            "target": code,
-                            "edge_type": edge_type,
-                            "rule": rule,
-                        }
-                    ))
-
-                # For lateral edges, also create hierarchy edge from actual ICD-10 parent
-                if edge_type == "lateral":
-                    actual_parent = get_icd_parent(code)
-                    if actual_parent and actual_parent in seen_nodes:
-                        parent_edge_key = (actual_parent, code)
-                        if parent_edge_key not in seen_edges:
-                            seen_edges.add(parent_edge_key)
-                            ops.append(JsonPatchOp(
-                                op="add",
-                                path="/edges/-",
-                                value={
-                                    "source": actual_parent,
-                                    "target": code,
-                                    "edge_type": "hierarchy",
-                                    "rule": None,
-                                }
-                            ))
-                            print(f"[EDGE] Added hierarchy edge from actual parent: {actual_parent} -> {code}")
-
-        # Log ops summary
-        node_ops = [op for op in ops if op.path == "/nodes/-"]
-        edge_ops = [op for op in ops if op.path == "/edges/-"]
-        print(f"[OPS] {batch_id}: {len(node_ops)} nodes, {len(edge_ops)} edges")
-
-        if ops:
-            event_queue.put_nowait(encode_event(
-                StateDeltaEvent(delta=[op.model_dump() for op in ops])
-            ))
-            print(f"[STATE_DELTA] Sent {len(ops)} ops for {batch_id}")
-        else:
-            print(f"[STATE_DELTA] SKIPPED - no ops for {batch_id}")
-
-        # Compute selected_details for reconciliation (O(1) dict lookups, <1ms)
-        # This provides ICD domain data so frontend can derive graph structure
+        # Compute selected_details (independent of graph building)
         selected_details: dict[str, dict] = {}
         for code in selected_ids:
             code_data = data.get(code, {})
-
-            # Determine category
             if node_has_seven_chr_def(code):
                 cat = "activator"
             elif "X" in code:
                 cat = "placeholder"
             else:
                 cat = "ancestor"
-
-            # Always prefer actual ICD depth from data when available
-            # Fall back to traversal depth + 1 only if not in ICD index
-            if code in data:
-                code_depth = code_data.get("depth", depth + 1)
-            else:
-                code_depth = depth + 1
-
-            # Determine billable
+            code_depth = code_data.get("depth", depth + 1) if code in data else depth + 1
             has_children = bool(code_data.get("children"))
             is_activator = cat == "activator"
             billable = not has_children and not (seven_chr_authority is not None) and not is_activator
+            selected_details[code] = {"depth": code_depth, "category": cat, "billable": billable}
 
-            selected_details[code] = {
-                "depth": code_depth,
-                "category": cat,
-                "billable": billable,
-            }
-
-        # REASONING events for LLM reasoning (AG-UI standard)
+        # REASONING events (AG-UI standard)
         is_error = reasoning.startswith("API Error:") if reasoning else False
         if reasoning:
             msg_id = str(uuid.uuid4())
             event_queue.put_nowait(encode_event(ReasoningStartEvent(message_id=msg_id)))
-            event_queue.put_nowait(encode_event(
-                _reasoning_message_start(msg_id)
-            ))
-            event_queue.put_nowait(encode_event(
-                ReasoningMessageContentEvent(message_id=msg_id, delta=reasoning)
-            ))
+            event_queue.put_nowait(encode_event(_reasoning_message_start(msg_id)))
+            event_queue.put_nowait(encode_event(ReasoningMessageContentEvent(message_id=msg_id, delta=reasoning)))
             event_queue.put_nowait(encode_event(ReasoningMessageEndEvent(message_id=msg_id)))
             event_queue.put_nowait(encode_event(ReasoningEndEvent(message_id=msg_id)))
-        # STEP_FINISHED (protocol-compliant: stepName only)
-        event_queue.put_nowait(encode_event(
-            StepFinishedEvent(step_name=batch_id)
-        ))
-        # Domain metadata as CUSTOM event (AG-UI extension, reasoning in REASONING events)
-        event_queue.put_nowait(encode_event(
-            CustomEvent(name="step_metadata", value={
-                "node_id": node_id,
-                "batch_type": batch_type,
-                "selected_ids": selected_ids,
-                "candidates": candidates,
-                "error": is_error,
-                "selected_details": selected_details,
-            })
-        ))
+
+        # STEP_FINISHED + CUSTOM step_metadata
+        event_queue.put_nowait(encode_event(StepFinishedEvent(step_name=batch_id)))
+        event_queue.put_nowait(encode_event(CustomEvent(name="step_metadata", value={
+            "node_id": node_id, "batch_type": batch_type,
+            "selected_ids": selected_ids, "candidates": candidates,
+            "error": is_error, "selected_details": selected_details,
+        })))
 
     async def event_generator() -> AsyncGenerator[str, None]:
         """Generate AG-UI SSE events."""
@@ -2142,313 +1791,9 @@ async def stream_traversal(run_input: RunAgentInput, http_request: Request):
                 final_nodes = final_state.get("final_nodes", [])
                 batch_data = final_state.get("batch_data", {})
 
-                # Build complete graph from cached state (single pass)
-                # Use different variable names to avoid shadowing outer function's seen_nodes/seen_edges
-                # (which are used by the live traversal path for finalization)
-                snapshot_nodes: list[dict] = [{"id": "ROOT", "code": "ROOT", "label": "ROOT", "depth": 0, "category": "root", "billable": False}]
-                snapshot_edges: list[dict] = []
-                snapshot_seen_nodes: set[str] = {"ROOT"}
-                snapshot_seen_edges: set[tuple[str, str]] = set()
-
-                # Sort batches by depth to ensure parents are processed before children
-                sorted_batches = sorted(
-                    [(bid, binfo) for bid, binfo in batch_data.items()],
-                    key=lambda x: (x[1].get("depth", 0), x[0])
-                )
-
-                print(f"[CACHE SNAPSHOT] Building snapshot from {len(sorted_batches)} batches")
-
-                # Build all nodes and edges from cached batch data
-                for batch_id, batch_info in sorted_batches:
-                    node_id = batch_info.get("node_id")
-                    parent_id = batch_info.get("parent_id")
-                    depth = batch_info.get("depth", 0)
-                    candidates = batch_info.get("candidates", {})
-                    selected_ids = batch_info.get("selected_ids", [])
-                    seven_chr_authority = batch_info.get("seven_chr_authority")
-                    batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
-
-                    # Transform selected_ids for sevenChrDef batches
-                    if batch_type == "sevenChrDef" and node_id and selected_ids:
-                        selected_ids = [format_with_seventh_char(node_id, char) for char in selected_ids]
-
-                    # Handle sevenChrDef batches
-                    if batch_type == "sevenChrDef" and node_id:
-                        # Add base node if not seen
-                        if node_id not in snapshot_seen_nodes:
-                            snapshot_seen_nodes.add(node_id)
-                            if node_id in data:
-                                node_label = data[node_id].get("label", node_id)
-                                node_depth = data[node_id].get("depth", depth)
-                                node_category = "activator" if node_has_seven_chr_def(node_id) else "ancestor"
-                            else:
-                                node_label = "Placeholder"
-                                node_depth = depth
-                                node_category = "placeholder"
-                            snapshot_nodes.append({
-                                "id": node_id, "code": node_id, "label": node_label,
-                                "depth": node_depth, "category": node_category, "billable": False,
-                            })
-
-                        if parent_id and parent_id != node_id:
-                            edge_key = (parent_id, node_id)
-                            if edge_key not in snapshot_seen_edges:
-                                snapshot_seen_edges.add(edge_key)
-                                is_hier = is_hierarchy_edge(parent_id, node_id)
-                                snapshot_edges.append({
-                                    "source": parent_id, "target": node_id,
-                                    "edge_type": "hierarchy" if is_hier else "lateral",
-                                    "rule": None,
-                                })
-
-                        # Create 7th character node if selected
-                        if selected_ids:
-                            seventh_char = selected_ids[0][-1] if selected_ids[0] else ""
-                            if "." in node_id:
-                                base_category, base_subcategory = node_id.split(".", 1)
-                            else:
-                                base_category = node_id[:3] if len(node_id) >= 3 else node_id
-                                base_subcategory = node_id[3:] if len(node_id) > 3 else ""
-                            full_code = f"{base_category}.{base_subcategory.ljust(3, 'X')}{seventh_char}"
-
-                            # Transform candidates for label lookup
-                            transformed_candidates = {}
-                            for char, desc in candidates.items():
-                                transformed_code = format_with_seventh_char(node_id, char)
-                                transformed_candidates[transformed_code] = desc
-
-                            base_depth = data.get(node_id, {}).get("depth", depth)
-                            prev_node = node_id
-
-                            # Create placeholder nodes if base is shallower than depth 6
-                            if base_depth < 6:
-                                if "." in node_id:
-                                    category, subcategory = node_id.split(".", 1)
-                                else:
-                                    category = node_id[:3] if len(node_id) >= 3 else node_id
-                                    subcategory = node_id[3:] if len(node_id) > 3 else ""
-
-                                current_sub = subcategory
-                                for i in range(len(subcategory), 3):
-                                    current_sub += "X"
-                                    placeholder_code = f"{category}.{current_sub}"
-                                    placeholder_depth = base_depth + (i - len(subcategory) + 1)
-
-                                    if placeholder_code not in snapshot_seen_nodes:
-                                        snapshot_seen_nodes.add(placeholder_code)
-                                        snapshot_nodes.append({
-                                            "id": placeholder_code, "code": placeholder_code,
-                                            "label": "Placeholder", "depth": placeholder_depth,
-                                            "category": "placeholder", "billable": False,
-                                        })
-
-                                    edge_key = (prev_node, placeholder_code)
-                                    if edge_key not in snapshot_seen_edges:
-                                        snapshot_seen_edges.add(edge_key)
-                                        snapshot_edges.append({
-                                            "source": prev_node, "target": placeholder_code,
-                                            "edge_type": "hierarchy", "rule": None,
-                                        })
-                                    prev_node = placeholder_code
-
-                            # Create depth-6 parent if needed
-                            if prev_node not in snapshot_seen_nodes:
-                                snapshot_seen_nodes.add(prev_node)
-                                snapshot_nodes.append({
-                                    "id": prev_node, "code": prev_node,
-                                    "label": "Placeholder" if prev_node.endswith("X") else data.get(prev_node, {}).get("label", prev_node),
-                                    "depth": 6,
-                                    "category": "placeholder" if prev_node.endswith("X") else "ancestor",
-                                    "billable": False,
-                                })
-
-                            # Create final 7th character node
-                            label = f"{seventh_char}: {transformed_candidates.get(full_code, seventh_char)}"
-                            if full_code not in snapshot_seen_nodes:
-                                snapshot_seen_nodes.add(full_code)
-                                snapshot_nodes.append({
-                                    "id": full_code, "code": full_code, "label": label,
-                                    "depth": 7, "category": "finalized", "billable": True,
-                                })
-
-                            edge_key = (prev_node, full_code)
-                            if edge_key not in snapshot_seen_edges:
-                                snapshot_seen_edges.add(edge_key)
-                                snapshot_edges.append({
-                                    "source": prev_node, "target": full_code,
-                                    "edge_type": "lateral", "rule": "sevenChrDef",
-                                })
-                        else:
-                            # Empty sevenChrDef selection - create placeholder for missing 7th char
-                            missing_code = f"{node_id}?"
-                            if missing_code not in snapshot_seen_nodes:
-                                snapshot_seen_nodes.add(missing_code)
-                                snapshot_nodes.append({
-                                    "id": missing_code, "code": missing_code,
-                                    "label": "Missing Seventh Character Extension",
-                                    "depth": 7, "category": "placeholder", "billable": False,
-                                })
-
-                            edge_key = (node_id, missing_code)
-                            if edge_key not in snapshot_seen_edges:
-                                snapshot_seen_edges.add(edge_key)
-                                snapshot_edges.append({
-                                    "source": node_id, "target": missing_code,
-                                    "edge_type": "lateral", "rule": "sevenChrDef",
-                                })
-
-                    # Regular batches (children, codeFirst, codeAlso, etc.)
-                    elif batch_type != "sevenChrDef":
-                        # Add traversed node
-                        if node_id and node_id != "ROOT" and node_id not in snapshot_seen_nodes:
-                            snapshot_seen_nodes.add(node_id)
-                            if node_id in data:
-                                node_label = data[node_id].get("label", node_id)
-                                node_depth = data[node_id].get("depth", depth)
-                            else:
-                                node_label = "Placeholder" if node_id.endswith("X") else node_id
-                                node_depth = depth
-
-                            if node_has_seven_chr_def(node_id):
-                                node_category = "activator"
-                            elif node_id not in data and node_id.endswith("X"):
-                                node_category = "placeholder"
-                            else:
-                                node_category = "ancestor"
-
-                            snapshot_nodes.append({
-                                "id": node_id, "code": node_id, "label": node_label,
-                                "depth": node_depth, "category": node_category, "billable": False,
-                            })
-
-                        if node_id and parent_id and parent_id != node_id:
-                            edge_key = (parent_id, node_id)
-                            if edge_key not in snapshot_seen_edges:
-                                snapshot_seen_edges.add(edge_key)
-                                is_hier = is_hierarchy_edge(parent_id, node_id)
-                                snapshot_edges.append({
-                                    "source": parent_id, "target": node_id,
-                                    "edge_type": "hierarchy" if is_hier else "lateral",
-                                    "rule": None,
-                                })
-
-                        # Add selected children
-                        for code in selected_ids:
-                            if code not in snapshot_seen_nodes:
-                                snapshot_seen_nodes.add(code)
-                                label = candidates.get(code, code)
-
-                                if code in data:
-                                    code_depth = data[code].get("depth", depth + 1)
-                                else:
-                                    code_depth = depth + 1
-
-                                if node_has_seven_chr_def(code):
-                                    code_category = "activator"
-                                elif code not in data and code.endswith("X"):
-                                    code_category = "placeholder"
-                                else:
-                                    code_category = "ancestor"
-
-                                has_children = bool(data.get(code, {}).get("children"))
-                                has_authority = seven_chr_authority is not None
-                                is_activator = code_category == "activator"
-                                billable = not has_children and not has_authority and not is_activator
-
-                                snapshot_nodes.append({
-                                    "id": code, "code": code, "label": label,
-                                    "depth": code_depth, "category": code_category, "billable": billable,
-                                })
-
-                            # Add edge
-                            edge_source = node_id if node_id and node_id != "ROOT" else "ROOT"
-                            edge_key = (edge_source, code)
-
-                            if batch_type != "children":
-                                edge_type = "lateral"
-                                rule = batch_type
-                            else:
-                                edge_type = "hierarchy"
-                                rule = None
-
-                            if edge_key not in snapshot_seen_edges:
-                                snapshot_seen_edges.add(edge_key)
-                                snapshot_edges.append({
-                                    "source": edge_source, "target": code,
-                                    "edge_type": edge_type, "rule": rule,
-                                })
-
-                            # For lateral edges, also create hierarchy edge from actual ICD-10 parent
-                            if edge_type == "lateral":
-                                actual_parent = get_icd_parent(code)
-                                if actual_parent and actual_parent in snapshot_seen_nodes:
-                                    parent_edge_key = (actual_parent, code)
-                                    if parent_edge_key not in snapshot_seen_edges:
-                                        snapshot_seen_edges.add(parent_edge_key)
-                                        snapshot_edges.append({
-                                            "source": actual_parent, "target": code,
-                                            "edge_type": "hierarchy", "rule": None,
-                                        })
-
-                # Build all decisions for benchmark comparison
-                all_decisions: list[dict] = []
-                for batch_id, batch_info in sorted_batches:
-                    node_id = batch_info.get("node_id")
-                    candidates = batch_info.get("candidates", {})
-                    selected_ids = batch_info.get("selected_ids", [])
-                    reasoning = batch_info.get("reasoning", "[CACHED]")
-                    seven_chr_authority = batch_info.get("seven_chr_authority")
-                    depth = batch_info.get("depth", 0)
-                    batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
-
-                    # Transform selected_ids for sevenChrDef
-                    transformed_selected_ids = selected_ids
-                    if batch_type == "sevenChrDef" and node_id and selected_ids:
-                        transformed_selected_ids = [format_with_seventh_char(node_id, char) for char in selected_ids]
-
-                    # Transform candidates for sevenChrDef
-                    step_candidates = candidates
-                    if batch_type == "sevenChrDef" and node_id:
-                        step_candidates = {}
-                        for char, desc in candidates.items():
-                            transformed_code = format_with_seventh_char(node_id, char)
-                            step_candidates[transformed_code] = f"{char}: {desc}"
-
-                    # Compute selected_details
-                    selected_details: dict[str, dict] = {}
-                    for code in transformed_selected_ids:
-                        code_data = data.get(code, {})
-                        if node_has_seven_chr_def(code):
-                            cat = "activator"
-                        elif "X" in code:
-                            cat = "placeholder"
-                        else:
-                            cat = "ancestor"
-
-                        if code in data:
-                            code_depth = code_data.get("depth", depth + 1)
-                        else:
-                            code_depth = depth + 1
-
-                        has_children = bool(code_data.get("children"))
-                        is_activator = cat == "activator"
-                        billable = not has_children and not (seven_chr_authority is not None) and not is_activator
-
-                        selected_details[code] = {
-                            "depth": code_depth,
-                            "category": cat,
-                            "billable": billable,
-                        }
-
-                    all_decisions.append({
-                        'batch_id': batch_id,
-                        'node_id': node_id,
-                        'batch_type': batch_type,
-                        'candidates': step_candidates,
-                        'selected_ids': transformed_selected_ids,
-                        'reasoning': reasoning,
-                        'selected_details': selected_details,
-                    })
+                # Build complete graph and decisions using shared functions
+                snapshot_nodes, snapshot_edges, _, _ = build_graph_from_batch_data(batch_data, final_nodes)
+                all_decisions = build_decisions_from_batch_data(batch_data)
 
                 # Emit single STATE_SNAPSHOT with complete graph
                 snapshot_state = GraphState(
@@ -2527,32 +1872,19 @@ async def stream_traversal(run_input: RunAgentInput, http_request: Request):
                     if encoded is not None:
                         yield encoded
 
-            # Update finalized nodes in graph (deduplicate in case parallel batches reached same node)
+            # Final STATE_SNAPSHOT with finalized categories
+            batch_data = final_state.get("batch_data", {})
             final_nodes_raw = final_state.get("final_nodes", [])
             final_nodes = list(dict.fromkeys(final_nodes_raw))  # Preserve order, remove duplicates
 
-            finalize_ops: list[JsonPatchOp] = []
-            for node in final_nodes:
-                if node in seen_nodes:
-                    node_index = seen_nodes[node]
-                    # Update category to finalized (harmless if already finalized)
-                    finalize_ops.append(JsonPatchOp(
-                        op="replace",
-                        path=f"/nodes/{node_index}/category",
-                        value="finalized",
-                    ))
-                    # Add to finalized array
-                    finalize_ops.append(JsonPatchOp(
-                        op="add",
-                        path="/finalized/-",
-                        value=node,
-                    ))
-
-            if finalize_ops:
-                yield encode_event(StateDeltaEvent(delta=[op.model_dump() for op in finalize_ops]))
+            final_graph_nodes, final_graph_edges, _, _ = build_graph_from_batch_data(batch_data, final_nodes)
+            final_snapshot = GraphState(
+                nodes=[GraphNode(**n) for n in final_graph_nodes],
+                edges=[GraphEdge(**e) for e in final_graph_edges],
+            )
+            yield encode_event(StateSnapshotEvent(snapshot=final_snapshot.model_dump()))
 
             # RUN_FINISHED or RUN_ERROR - check if there was an LLM error
-            batch_data = final_state.get("batch_data", {})
             root_reasoning = batch_data.get("ROOT", {}).get("reasoning", "")
             llm_error = root_reasoning if root_reasoning.startswith("API Error") else None
 
@@ -2655,25 +1987,12 @@ async def stream_rewind(run_input: RunAgentInput, http_request: Request):
     # Queue for streaming events
     event_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-    # Track seen nodes to avoid duplicates - dict maps node_id -> index for updates
-    # Will be populated from pre-rewind snapshot (backend is authoritative source)
-    seen_nodes: dict[str, int] = {}
-    node_count = 0  # Will be set from pre-rewind snapshot
-    seen_edges: set[tuple[str, str]] = set()
+    # Incremental graph state — build_graph_from_batch_data accumulates here
+    accumulated_batch_data: dict[str, dict] = {}
+    graph_state: tuple[list[NodeDict], list[EdgeDict], set[str], set[tuple[str, str]]] | None = None
     seen_batches: set[str] = set()  # Track processed batches to avoid duplicate events
 
-    # Helper to format 7th character code (same logic as actions.py)
-    def format_with_seventh_char(base_code: str, seventh_char: str) -> str:
-        """Format ICD-10-CM code with 7th character and placeholder padding."""
-        if "." in base_code:
-            category, subcategory = base_code.split(".", 1)
-        else:
-            category = base_code[:3] if len(base_code) >= 3 else base_code
-            subcategory = base_code[3:] if len(base_code) > 3 else ""
-        padded_subcategory = subcategory.ljust(3, "X") + seventh_char
-        return f"{category}.{padded_subcategory}"
-
-    # Batch callback to emit AG-UI events (same as stream_traversal)
+    # Batch callback to emit AG-UI events via STATE_SNAPSHOT (same pattern as stream_traversal)
     def on_batch_complete(
         batch_id: str,
         node_id: str | None,
@@ -2684,436 +2003,77 @@ async def stream_rewind(run_input: RunAgentInput, http_request: Request):
         reasoning: str,
         seven_chr_authority: dict | None = None,
     ):
-        nonlocal node_count
+        nonlocal graph_state
         print(f"[REWIND CALLBACK] on_batch_complete: batch_id={batch_id}, selected_ids={selected_ids}")
 
-        # Skip duplicate batch callbacks (can occur when multiple parallel paths reach same node)
+        # Skip duplicate batch callbacks
         if batch_id in seen_batches:
             print(f"[REWIND CALLBACK] SKIP DUPLICATE: batch_id={batch_id} already processed")
             return
         seen_batches.add(batch_id)
-
         batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
 
         # STEP_STARTED
-        event_queue.put_nowait(encode_event(
-            StepStartedEvent(step_name=batch_id)
-        ))
+        event_queue.put_nowait(encode_event(StepStartedEvent(step_name=batch_id)))
 
-        # STATE_DELTA - add nodes and edges
-        ops: list[JsonPatchOp] = []
-        batch_nodes: list[dict] = []
-        batch_edges: list[dict] = []
+        # Accumulate batch data and build graph incrementally → STATE_SNAPSHOT
+        accumulated_batch_data[batch_id] = {
+            "node_id": node_id, "parent_id": parent_id, "depth": depth,
+            "candidates": candidates, "selected_ids": selected_ids,
+            "seven_chr_authority": seven_chr_authority,
+        }
+        graph_state = build_graph_from_batch_data(
+            accumulated_batch_data, [],
+            previous=graph_state, only_batch_ids={batch_id},
+        )
+        snapshot = GraphState(
+            nodes=[GraphNode(**n) for n in graph_state[0]],
+            edges=[GraphEdge(**e) for e in graph_state[1]],
+        )
+        event_queue.put_nowait(encode_event(StateSnapshotEvent(snapshot=snapshot.model_dump())))
 
-        # Special handling for sevenChrDef batches
-        if batch_type == "sevenChrDef" and selected_ids and node_id:
-            # Extract the 7th character from selected_ids
-            seventh_char = selected_ids[0][-1] if selected_ids[0] else ""
-
-            # CRITICAL FIX: Compute full_code from node_id + 7th char
-            # This ensures the code matches the batch's node
-            if "." in node_id:
-                base_category, base_subcategory = node_id.split(".", 1)
-            else:
-                base_category = node_id[:3] if len(node_id) >= 3 else node_id
-                base_subcategory = node_id[3:] if len(node_id) > 3 else ""
-            full_code = f"{base_category}.{base_subcategory.ljust(3, 'X')}{seventh_char}"
-
-            base_depth = data.get(node_id, {}).get("depth", depth)
-            prev_node = node_id
-
-            if base_depth < 6:
-                if "." in node_id:
-                    category, subcategory = node_id.split(".", 1)
-                else:
-                    category = node_id[:3] if len(node_id) >= 3 else node_id
-                    subcategory = node_id[3:] if len(node_id) > 3 else ""
-
-                current_sub = subcategory
-                for i in range(len(subcategory), 3):
-                    current_sub += "X"
-                    placeholder_code = f"{category}.{current_sub}"
-                    placeholder_depth = base_depth + (i - len(subcategory) + 1)
-
-                    placeholder_node_data = {
-                        "id": placeholder_code,
-                        "code": placeholder_code,
-                        "label": "Placeholder",
-                        "depth": placeholder_depth,
-                        "category": "placeholder",
-                        "billable": False,
-                    }
-                    batch_nodes.append(placeholder_node_data)
-
-                    placeholder_edge_data = {
-                        "source": prev_node,
-                        "target": placeholder_code,
-                        "edge_type": "hierarchy",
-                        "rule": None,
-                    }
-                    batch_edges.append(placeholder_edge_data)
-
-                    if placeholder_code not in seen_nodes:
-                        seen_nodes[placeholder_code] = node_count
-                        node_count += 1
-                        ops.append(JsonPatchOp(
-                            op="add",
-                            path="/nodes/-",
-                            value=placeholder_node_data,
-                        ))
-
-                    # Edge creation OUTSIDE node check
-                    edge_key = (prev_node, placeholder_code)
-                    if edge_key not in seen_edges:
-                        seen_edges.add(edge_key)
-                        ops.append(JsonPatchOp(
-                            op="add",
-                            path="/edges/-",
-                            value=placeholder_edge_data,
-                        ))
-
-                    prev_node = placeholder_code
-
-            label = f"{seventh_char}: {candidates.get(full_code, seventh_char)}"
-            # Use prev_node as edge source - it's derived from node_id
-            correct_edge_source = prev_node
-
-            # Ensure the parent node exists in the graph (create placeholder if needed)
-            if correct_edge_source not in seen_nodes:
-                seen_nodes[correct_edge_source] = node_count
-                node_count += 1
-                parent_depth = 6  # 7th char parent is always depth 6
-                parent_node_data = {
-                    "id": correct_edge_source,
-                    "code": correct_edge_source,
-                    "label": "Placeholder" if correct_edge_source.endswith("X") else data.get(correct_edge_source, {}).get("label", correct_edge_source),
-                    "depth": parent_depth,
-                    "category": "placeholder" if correct_edge_source.endswith("X") else "ancestor",
-                    "billable": False,
-                }
-                ops.append(JsonPatchOp(op="add", path="/nodes/-", value=parent_node_data))
-                batch_nodes.append(parent_node_data)
-
-            final_node_data = {
-                "id": full_code,
-                "code": full_code,
-                "label": label,
-                "depth": 7,
-                "category": "finalized",
-                "billable": True,
-            }
-            batch_nodes.append(final_node_data)
-
-            final_edge_data = {
-                "source": correct_edge_source,
-                "target": full_code,
-                "edge_type": "lateral",
-                "rule": "sevenChrDef",
-            }
-            batch_edges.append(final_edge_data)
-
-            if full_code not in seen_nodes:
-                seen_nodes[full_code] = node_count
-                node_count += 1
-                ops.append(JsonPatchOp(
-                    op="add",
-                    path="/nodes/-",
-                    value=final_node_data,
-                ))
-
-                edge_key = (correct_edge_source, full_code)
-                if edge_key not in seen_edges:
-                    seen_edges.add(edge_key)
-                    ops.append(JsonPatchOp(
-                        op="add",
-                        path="/edges/-",
-                        value=final_edge_data,
-                    ))
-
-        elif batch_type == "sevenChrDef" and not selected_ids and node_id:
-            # Create a placeholder node for missing 7th character at depth 7
-            missing_code = f"{node_id}?"
-            print(f"[REWIND SEVENCHRDEF] Empty selection for {node_id}, creating placeholder: {missing_code}")
-
-            if missing_code not in seen_nodes:
-                seen_nodes[missing_code] = node_count
-                node_count += 1
-
-                missing_node_data = {
-                    "id": missing_code,
-                    "code": missing_code,
-                    "label": "Missing Seventh Character Extension",
-                    "depth": 7,
-                    "category": "placeholder",
-                    "billable": False,
-                }
-                ops.append(JsonPatchOp(op="add", path="/nodes/-", value=missing_node_data))
-                batch_nodes.append(missing_node_data)
-
-            edge_key = (node_id, missing_code)
-            if edge_key not in seen_edges:
-                seen_edges.add(edge_key)
-                missing_edge_data = {
-                    "source": node_id,
-                    "target": missing_code,
-                    "edge_type": "lateral",
-                    "rule": "sevenChrDef",
-                }
-                ops.append(JsonPatchOp(op="add", path="/edges/-", value=missing_edge_data))
-                batch_edges.append(missing_edge_data)
-
-        else:
-            # Regular batches
-            if (
-                batch_type == "children"
-                and node_id
-                and node_id != "ROOT"
-                and node_id not in seen_nodes
-            ):
-                seen_nodes[node_id] = node_count
-                node_count += 1
-
-                if node_id in data:
-                    node_label = data[node_id].get("label", node_id)
-                    node_depth = data[node_id].get("depth", depth)
-                else:
-                    node_label = "Placeholder" if node_id.endswith("X") else node_id
-                    node_depth = depth
-
-                if node_has_seven_chr_def(node_id):
-                    node_category = "activator"
-                elif node_id not in data and node_id.endswith("X"):
-                    node_category = "placeholder"
-                else:
-                    node_category = "ancestor"
-
-                traversed_node_data = {
-                    "id": node_id,
-                    "code": node_id,
-                    "label": node_label,
-                    "depth": node_depth,
-                    "category": node_category,
-                    "billable": False,
-                }
-                ops.append(JsonPatchOp(
-                    op="add",
-                    path="/nodes/-",
-                    value=traversed_node_data,
-                ))
-                batch_nodes.append(traversed_node_data)
-
-                if parent_id and parent_id != node_id:
-                    edge_key = (parent_id, node_id)
-                    if edge_key not in seen_edges:
-                        seen_edges.add(edge_key)
-                        is_hier = is_hierarchy_edge(parent_id, node_id)
-                        traversed_edge_data = {
-                            "source": parent_id,
-                            "target": node_id,
-                            "edge_type": "hierarchy" if is_hier else "lateral",
-                            "rule": None,
-                        }
-                        ops.append(JsonPatchOp(
-                            op="add",
-                            path="/edges/-",
-                            value=traversed_edge_data,
-                        ))
-                        batch_edges.append(traversed_edge_data)
-
-            for code in selected_ids:
-                if batch_type != "children":
-                    # Add the lateral target code itself
-                    if code not in seen_nodes:
-                        seen_nodes[code] = node_count
-                        node_count += 1
-                        label = candidates.get(code, code)
-
-                        if code in data:
-                            node_depth = data[code].get("depth", depth + 1)
-                        else:
-                            node_depth = depth + 1
-
-                        if node_has_seven_chr_def(code):
-                            category = "activator"
-                        elif code not in data and code.endswith("X"):
-                            category = "placeholder"
-                        else:
-                            category = "ancestor"
-
-                        has_children = bool(data.get(code, {}).get("children"))
-                        has_authority = seven_chr_authority is not None
-                        is_activator = category == "activator"
-                        billable = not has_children and not has_authority and not is_activator
-
-                        ops.append(JsonPatchOp(
-                            op="add",
-                            path="/nodes/-",
-                            value={
-                                "id": code,
-                                "code": code,
-                                "label": label,
-                                "depth": node_depth,
-                                "category": category,
-                                "billable": billable,
-                            }
-                        ))
-
-                    # Create the lateral edge from source node to code
-                    edge_source = node_id if node_id and node_id != "ROOT" else "ROOT"
-                    lateral_edge_key = (edge_source, code)
-                    if lateral_edge_key not in seen_edges:
-                        seen_edges.add(lateral_edge_key)
-                        ops.append(JsonPatchOp(
-                            op="add",
-                            path="/edges/-",
-                            value={
-                                "source": edge_source,
-                                "target": code,
-                                "edge_type": "lateral",
-                                "rule": batch_type,
-                            }
-                        ))
-
-                    # For lateral edges, also create hierarchy edge from actual ICD-10 parent
-                    actual_parent = get_icd_parent(code)
-                    if actual_parent and actual_parent in seen_nodes:
-                        parent_edge_key = (actual_parent, code)
-                        if parent_edge_key not in seen_edges:
-                            seen_edges.add(parent_edge_key)
-                            ops.append(JsonPatchOp(
-                                op="add",
-                                path="/edges/-",
-                                value={
-                                    "source": actual_parent,
-                                    "target": code,
-                                    "edge_type": "hierarchy",
-                                    "rule": None,
-                                }
-                            ))
-
-                else:
-                    # Children batch - regular hierarchy handling
-                    if code not in seen_nodes:
-                        seen_nodes[code] = node_count
-                        node_count += 1
-                        label = candidates.get(code, code)
-
-                        if code in data:
-                            node_depth = data[code].get("depth", depth + 1)
-                        else:
-                            node_depth = depth + 1
-
-                        if node_has_seven_chr_def(code):
-                            category = "activator"
-                        elif code not in data and code.endswith("X"):
-                            category = "placeholder"
-                        else:
-                            category = "ancestor"
-
-                        has_children = bool(data.get(code, {}).get("children"))
-                        has_authority = seven_chr_authority is not None
-                        is_activator = category == "activator"
-                        billable = not has_children and not has_authority and not is_activator
-
-                        ops.append(JsonPatchOp(
-                            op="add",
-                            path="/nodes/-",
-                            value={
-                                "id": code,
-                                "code": code,
-                                "label": label,
-                                "depth": node_depth,
-                                "category": category,
-                                "billable": billable,
-                            }
-                        ))
-
-                    edge_source = node_id if node_id and node_id != "ROOT" else "ROOT"
-                    edge_key = (edge_source, code)
-
-                    if edge_key not in seen_edges:
-                        seen_edges.add(edge_key)
-                        ops.append(JsonPatchOp(
-                            op="add",
-                            path="/edges/-",
-                            value={
-                                "source": edge_source,
-                                "target": code,
-                                "edge_type": "hierarchy",
-                                "rule": None,
-                            }
-                        ))
-
-        if ops:
-            event_queue.put_nowait(encode_event(
-                StateDeltaEvent(delta=[op.model_dump() for op in ops])
-            ))
-
-        # Compute selected_details for reconciliation
+        # Compute selected_details (independent of graph building)
         selected_details: dict[str, dict] = {}
         for code in selected_ids:
             code_data = data.get(code, {})
-
             if node_has_seven_chr_def(code):
                 cat = "activator"
             elif "X" in code:
                 cat = "placeholder"
             else:
                 cat = "ancestor"
-
-            if code in data:
-                code_depth = code_data.get("depth", depth + 1)
-            else:
-                code_depth = depth + 1
-
+            code_depth = code_data.get("depth", depth + 1) if code in data else depth + 1
             has_children = bool(code_data.get("children"))
             is_activator = cat == "activator"
             billable = not has_children and not (seven_chr_authority is not None) and not is_activator
+            selected_details[code] = {"depth": code_depth, "category": cat, "billable": billable}
 
-            selected_details[code] = {
-                "depth": code_depth,
-                "category": cat,
-                "billable": billable,
-            }
-
-        # REASONING events for LLM reasoning (AG-UI standard)
+        # REASONING events (AG-UI standard)
         is_error = reasoning.startswith("API Error:") if reasoning else False
         if reasoning:
             msg_id = str(uuid.uuid4())
             event_queue.put_nowait(encode_event(ReasoningStartEvent(message_id=msg_id)))
-            event_queue.put_nowait(encode_event(
-                _reasoning_message_start(msg_id)
-            ))
-            event_queue.put_nowait(encode_event(
-                ReasoningMessageContentEvent(message_id=msg_id, delta=reasoning)
-            ))
+            event_queue.put_nowait(encode_event(_reasoning_message_start(msg_id)))
+            event_queue.put_nowait(encode_event(ReasoningMessageContentEvent(message_id=msg_id, delta=reasoning)))
             event_queue.put_nowait(encode_event(ReasoningMessageEndEvent(message_id=msg_id)))
             event_queue.put_nowait(encode_event(ReasoningEndEvent(message_id=msg_id)))
-        # STEP_FINISHED (protocol-compliant: stepName only)
-        event_queue.put_nowait(encode_event(
-            StepFinishedEvent(step_name=batch_id)
-        ))
-        # Domain metadata as CUSTOM event (AG-UI extension, reasoning in REASONING events)
-        event_queue.put_nowait(encode_event(
-            CustomEvent(name="step_metadata", value={
-                "node_id": node_id,
-                "batch_type": batch_type,
-                "selected_ids": selected_ids,
-                "candidates": candidates,
-                "error": is_error,
-                "selected_details": selected_details,
-            })
-        ))
+
+        # STEP_FINISHED + CUSTOM step_metadata
+        event_queue.put_nowait(encode_event(StepFinishedEvent(step_name=batch_id)))
+        event_queue.put_nowait(encode_event(CustomEvent(name="step_metadata", value={
+            "node_id": node_id, "batch_type": batch_type,
+            "selected_ids": selected_ids, "candidates": candidates,
+            "error": is_error, "selected_details": selected_details,
+        })))
 
     async def event_generator() -> AsyncGenerator[str, None]:
         """Generate AG-UI SSE events for rewind."""
         global RUNNING_TASK
+        nonlocal graph_state
 
         # Use client-provided IDs from RunAgentInput (AG-UI protocol compliance)
         run_id = run_input.run_id
         thread_id = run_input.thread_id
-        # parentRunId indicates this run forks from a previous traversal
-        parent_run_id = request.batch_id
 
         try:
             # Configure LLM
@@ -3190,10 +2150,13 @@ async def stream_rewind(run_input: RunAgentInput, http_request: Request):
 
             print(f"[REWIND] Pruned state: {len(pruned_batch_data)} batches, {len(pruned_final_nodes)} final nodes")
 
-            # Build graph from pruned batch_data
+            # Build graph from pruned batch_data and initialize incremental state
             snapshot_nodes, snapshot_edges, snapshot_seen_nodes, snapshot_seen_edges = build_graph_from_batch_data(
                 pruned_batch_data, pruned_final_nodes
             )
+            # Initialize accumulated state for incremental builds during rewind
+            accumulated_batch_data.update(pruned_batch_data)
+            graph_state = (snapshot_nodes, snapshot_edges, snapshot_seen_nodes, snapshot_seen_edges)
 
             # Emit STATE_SNAPSHOT with pre-rewind graph
             snapshot_state = GraphState(
@@ -3202,12 +2165,6 @@ async def stream_rewind(run_input: RunAgentInput, http_request: Request):
             )
             yield encode_event(StateSnapshotEvent(snapshot=snapshot_state.model_dump()))
             print(f"[REWIND] Emitted STATE_SNAPSHOT: {len(snapshot_nodes)} nodes, {len(snapshot_edges)} edges")
-
-            # Populate seen_nodes/seen_edges for incremental updates
-            # seen_nodes maps node_id -> index in the nodes array
-            for idx, node in enumerate(snapshot_nodes):
-                seen_nodes[node["id"]] = idx
-            seen_edges.update(snapshot_seen_edges)
 
             # Set callback for streaming
             set_batch_callback(on_batch_complete)
@@ -3268,91 +2225,25 @@ async def stream_rewind(run_input: RunAgentInput, http_request: Request):
                 if encoded is not None:
                     yield encoded
 
-            # Update finalized nodes
+            # Final STATE_SNAPSHOT with finalized categories
+            batch_data = final_state.get("batch_data", {})
             final_nodes_raw = final_state.get("final_nodes", [])
             final_nodes = list(dict.fromkeys(final_nodes_raw))
 
-            finalize_ops: list[JsonPatchOp] = []
-            for node in final_nodes:
-                if node in seen_nodes:
-                    node_index = seen_nodes[node]
-                    finalize_ops.append(JsonPatchOp(
-                        op="replace",
-                        path=f"/nodes/{node_index}/category",
-                        value="finalized",
-                    ))
-                    finalize_ops.append(JsonPatchOp(
-                        op="add",
-                        path="/finalized/-",
-                        value=node,
-                    ))
+            # Log DFS trace of revised batches
+            from agent.actions import print_rewind_summary
+            pruned_batch_ids = set(pruned_batch_data.keys())
+            print_rewind_summary(batch_data, final_nodes, request.batch_id, pruned_batch_ids)
 
-            if finalize_ops:
-                yield encode_event(StateDeltaEvent(delta=[op.model_dump() for op in finalize_ops]))
+            final_graph_nodes, final_graph_edges, _, _ = build_graph_from_batch_data(batch_data, final_nodes)
+            final_snapshot = GraphState(
+                nodes=[GraphNode(**n) for n in final_graph_nodes],
+                edges=[GraphEdge(**e) for e in final_graph_edges],
+            )
+            yield encode_event(StateSnapshotEvent(snapshot=final_snapshot.model_dump()))
 
-            # RUN_FINISHED
-            batch_data = final_state.get("batch_data", {})
-
-            # Build all decisions from batch_data (matches cached replay pattern)
-            all_decisions: list[dict] = []
-            sorted_batches = sorted(batch_data.items(), key=lambda x: x[1].get("depth", 0))
-            for batch_id, batch_info in sorted_batches:
-                node_id = batch_info.get("node_id")
-                candidates = batch_info.get("candidates", {})
-                selected_ids = batch_info.get("selected_ids", [])
-                reasoning = batch_info.get("reasoning", "")
-                seven_chr_authority = batch_info.get("seven_chr_authority")
-                depth = batch_info.get("depth", 0)
-                batch_type = batch_id.rsplit("|", 1)[1] if "|" in batch_id else "children"
-
-                # Transform selected_ids for sevenChrDef
-                transformed_selected_ids = selected_ids
-                if batch_type == "sevenChrDef" and node_id and selected_ids:
-                    transformed_selected_ids = [format_with_seventh_char(node_id, char) for char in selected_ids]
-
-                # Transform candidates for sevenChrDef
-                step_candidates = candidates
-                if batch_type == "sevenChrDef" and node_id:
-                    step_candidates = {}
-                    for char, desc in candidates.items():
-                        transformed_code = format_with_seventh_char(node_id, char)
-                        step_candidates[transformed_code] = f"{char}: {desc}"
-
-                # Compute selected_details
-                selected_details: dict[str, dict] = {}
-                for code in transformed_selected_ids:
-                    code_data = data.get(code, {})
-                    if node_has_seven_chr_def(code):
-                        cat = "activator"
-                    elif "X" in code:
-                        cat = "placeholder"
-                    else:
-                        cat = "ancestor"
-
-                    if code in data:
-                        code_depth = code_data.get("depth", depth + 1)
-                    else:
-                        code_depth = depth + 1
-
-                    has_children = bool(code_data.get("children"))
-                    is_activator = cat == "activator"
-                    billable = not has_children and not (seven_chr_authority is not None) and not is_activator
-
-                    selected_details[code] = {
-                        "depth": code_depth,
-                        "category": cat,
-                        "billable": billable,
-                    }
-
-                all_decisions.append({
-                    'batch_id': batch_id,
-                    'node_id': node_id,
-                    'batch_type': batch_type,
-                    'candidates': step_candidates,
-                    'selected_ids': transformed_selected_ids,
-                    'reasoning': reasoning,
-                    'selected_details': selected_details,
-                })
+            # Build decisions using shared helper
+            all_decisions = build_decisions_from_batch_data(batch_data)
 
             # Check for LLM API errors in the rewind batch (same pattern as stream_traversal)
             rewind_batch_reasoning = batch_data.get(request.batch_id, {}).get("reasoning", "")
